@@ -34,7 +34,16 @@ use super::protocol::{MAX_FRAME, read_frame, write_frame};
 /// refusing to kill a server it has nothing to replace with — can be exercised
 /// against the v6 servers already deployed. A number is the only way to reach
 /// that path, and a mismatch nobody can reproduce is a mismatch nobody can fix.
-pub const CONTROL_VERSION: u32 = 7;
+///
+/// v8 added the project verbs; v9 takes them back out. The dialect this build
+/// speaks is v7's again, message for message, but the number does not go back
+/// to 7 with it: v8 is deployed, and a number that moves backwards stops being
+/// an identity and becomes a coincidence. A 7 on the wire would then mean
+/// either "before projects" or "after them" depending on which build put it
+/// there, and the handshake — which has nothing but the number — cannot tell
+/// the two apart. A v8 peer meeting this one must be turned away, and only a
+/// number it has never seen does that.
+pub const CONTROL_VERSION: u32 = 9;
 
 const DIALECT_MARKER: &str = "speaks control v";
 
