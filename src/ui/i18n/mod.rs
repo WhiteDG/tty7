@@ -998,6 +998,7 @@ l10n_keys! {
     TabTooltipHideSidebar,
     TabTooltipHideDetailPanel,
     TabTooltipShowDetailPanel,
+    TabTooltipZoomed,
     TabMenuLocalShells,
     TabMenuAddHost,
     TabMenuAllHosts,
