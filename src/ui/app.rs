@@ -9491,14 +9491,13 @@ pub(crate) mod test_window {
     }
 
     /// A window carrying `n` quiet tabs, active on the first.
-    #[cfg(unix)]
     pub(crate) fn harness_with_tabs(
         cx: &mut TestAppContext,
         n: usize,
     ) -> (
         Entity<Tty7App>,
         VisualTestContext,
-        Vec<std::os::unix::net::UnixStream>,
+        Vec<crate::daemon::transport::Stream>,
     ) {
         use crate::terminal::view::quiet_test_pane;
         use crate::ui::pane::{Pane, PaneSlot};
@@ -9525,13 +9524,12 @@ pub(crate) mod test_window {
         (app, vcx, streams)
     }
 
-    #[cfg(unix)]
     pub(crate) fn harness_with_pane(
         cx: &mut TestAppContext,
     ) -> (
         Entity<Tty7App>,
         VisualTestContext,
-        std::os::unix::net::UnixStream,
+        crate::daemon::transport::Stream,
     ) {
         use crate::terminal::view::quiet_test_pane;
         use crate::ui::pane::{Pane, PaneSlot};
@@ -9580,7 +9578,6 @@ pub(crate) mod test_window {
     /// another frame 250ms later. So the sleep below is load-bearing too, and
     /// a round that drew nothing is not on its own enough to stop on — a burst
     /// still open is a frame already owed.
-    #[cfg(unix)]
     pub(crate) fn quiesce(vcx: &mut VisualTestContext, cwd: Option<&std::path::Path>) {
         use crate::terminal::git_data::ScmData;
         use crate::terminal::git_status::GitStatusCache;
@@ -9692,7 +9689,7 @@ mod cursor_blink_gpui_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod ssh_rebuild_gpui_tests {
     use super::test_window::harness_with_pane;
     use crate::core::session::{
@@ -10129,9 +10126,7 @@ mod shell_menu_gpui_tests {
     }
 }
 
-// `harness_with_tabs` hands back the panes' `UnixStream`s, so it exists only
-// on unix — same as `ssh_rebuild_gpui_tests` below it.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod rename_gpui_tests {
     use gpui::TestAppContext;
 
@@ -10215,7 +10210,7 @@ mod rename_gpui_tests {
 // everything else hidden; a pane nobody has declared — or whose id nobody
 // registered — must err toward displayed, because the failure direction that
 // matters is a visible pane that stops repainting.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod displayed_gpui_tests {
     use gpui::TestAppContext;
 
@@ -10316,7 +10311,7 @@ mod displayed_gpui_tests {
 
 // Zoom is a tab's view state: it rides with the tab across a switch, while a
 // layout change (drag, split, close) still clears it.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod zoom_gpui_tests {
     use gpui::TestAppContext;
 
@@ -10444,7 +10439,7 @@ mod zoom_gpui_tests {
 // test config dir and nothing is listening on it — so every forward request
 // fails. That is exactly the case these are about: what the panel and the form
 // are left holding when the far side does not answer.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod managed_forward_gpui_tests {
     use gpui::TestAppContext;
     use gpui_component::input::InputState;
