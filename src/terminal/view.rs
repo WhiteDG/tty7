@@ -2370,6 +2370,7 @@ impl TerminalView {
         let key = ks.key.as_str();
         self.cursor_visible = true;
         self.jump_to_prompt();
+        self.adopt_typeahead();
 
         let aliased;
         let ks = if m.control && !m.platform && !m.alt && matches!(key, "p" | "n") {
@@ -4050,12 +4051,36 @@ impl TerminalView {
     }
 
     fn flush_typeahead(&mut self) {
+        let pasted = self.typeahead.pasted();
         let Some(seed) = self.typeahead.drain() else {
             return;
         };
         self.terminal.write(vec![0x15]);
         if !seed.is_empty() {
-            self.cmd.prepend_str(&seed);
+            self.prepend_into_editor(&seed, pasted);
+        }
+    }
+
+    /// Take the record into the editor without paying the wipe yet. Every door
+    /// into the editor opens with this.
+    ///
+    /// `at_prompt` comes back on the `D` mark, a whole prompt draw ahead of the
+    /// `B` that arms `zle_reading`, and this editor is live for that whole
+    /// window. Everything it offers rewrites the line — history recall and the
+    /// ghost suggestion replace it wholesale, ⌃U empties it, completion filters
+    /// on it — so the line has to be whole *before* those run, not stitched
+    /// back together at submit time in front of whatever replaced it. Folding
+    /// it in that late made `↑` then Enter run the recalled entry with the gap
+    /// text glued to its front, and ⌃U then Enter bring back the text ⌃U had
+    /// just cleared.
+    ///
+    /// The `^U` stays owed until `flush_typeahead`, which keeps it where it has
+    /// always been on the wire: immediately before the line. Sending it here
+    /// instead would put it out before the shell's own editor is reading.
+    fn adopt_typeahead(&mut self) {
+        let pasted = self.typeahead.pasted();
+        if let Some(seed) = self.typeahead.adopt() {
+            self.prepend_into_editor(&seed, pasted);
         }
     }
 
@@ -4096,7 +4121,7 @@ impl TerminalView {
             self.release_hold();
         }
         self.terminal.write(bytes);
-        self.observe_typeahead(RawInput::Text(text));
+        self.observe_gap_text(text, pasted);
     }
 
     /// Move whatever the gap hold collected into the editor's buffer, keeping
@@ -4112,17 +4137,36 @@ impl TerminalView {
         let Some(net) = self.hold.engage() else {
             return;
         };
+        self.prepend_into_editor(&net, pasted);
+    }
+
+    /// Put text in front of the editor's line that the editor did not receive
+    /// through its own keys, keeping the provenance that decides how the line
+    /// is submitted (#660). Both routes that do this — the gap hold and the
+    /// typeahead record — carry a `pasted()` to read before they hand over.
+    fn prepend_into_editor(&mut self, text: &str, pasted: bool) {
         if pasted {
-            self.cmd.prepend_pasted(&net);
+            self.cmd.prepend_pasted(text);
         } else {
-            self.cmd.prepend_str(&net);
+            self.cmd.prepend_str(text);
         }
     }
 
+    /// A gap's text on its way to the record, which replays it into the editor
+    /// later — so a paste has to be recorded as one.
+    fn observe_gap_text(&mut self, text: &str, pasted: bool) {
+        self.observe_typeahead(if pasted {
+            RawInput::Pasted(text)
+        } else {
+            RawInput::Text(text)
+        });
+    }
+
     fn release_hold(&mut self) {
+        let pasted = self.hold.pasted();
         if let Some((net, bytes)) = self.hold.release() {
             self.terminal.write(bytes);
-            self.observe_typeahead(RawInput::Text(&net));
+            self.observe_gap_text(&net, pasted);
         }
     }
 
@@ -4139,9 +4183,10 @@ impl TerminalView {
             let _ = self.hold.timeout(epoch);
             return;
         }
+        let pasted = self.hold.pasted();
         if let Some((net, bytes)) = self.hold.timeout(epoch) {
             self.terminal.write(bytes);
-            self.observe_typeahead(RawInput::Text(&net));
+            self.observe_gap_text(&net, pasted);
             cx.notify();
         }
     }
@@ -4192,6 +4237,16 @@ impl TerminalView {
             return;
         }
         self.engage_hold_into_editor();
+        // The shell is still holding the recorded text on its own line, and the
+        // ^U that erases it has not gone out yet: `at_prompt` comes back on the
+        // `D` mark, before the prompt is even drawn, while the wipe waits for
+        // `B`. The key that got here has folded the seed into the line already,
+        // so this is usually just paying the wipe that left owed; where nothing
+        // has, the drain still puts the seed back the way every other drain
+        // does. Dropping it submitted only what was typed after the handover,
+        // and an empty command when that was nothing, which is the blank line
+        // #433 reports.
+        self.flush_typeahead();
         let line = self.cmd.text();
         if !line.trim().is_empty() {
             let cwd = self.cwd();
@@ -4227,7 +4282,6 @@ impl TerminalView {
         self.history_prefix.clear();
         self.close_completion();
 
-        self.wipe_pending_typeahead();
         let bracketed = self
             .terminal
             .term
@@ -4463,13 +4517,18 @@ impl TerminalView {
             return;
         }
         self.engage_hold_into_editor();
+        // Same reason as `submit_command`: what the record holds is on the
+        // shell's own line, so it belongs in front of the line handed back.
+        // The wipe waits until past the multi-line bail, which hands nothing
+        // over and so must put nothing on the wire either.
+        self.adopt_typeahead();
         let line = self.cmd.text();
         if line.contains('\n') {
             cx.notify();
             return;
         }
         self.close_completion();
-        self.wipe_pending_typeahead();
+        self.flush_typeahead();
         let tail = line.chars().count().saturating_sub(self.cmd.cursor());
         if !line.is_empty() {
             self.terminal.write(line.into_bytes());
@@ -4944,6 +5003,7 @@ impl TerminalView {
             return;
         }
         if self.input_active() {
+            self.adopt_typeahead();
             self.cmd.insert_str(text);
             self.history_nav = None;
             self.editor_goal_col = None;
@@ -14205,5 +14265,352 @@ mod gpui_tests {
                 );
             })
             .unwrap();
+    }
+}
+
+/// The window between the shell reporting a prompt and its line editor
+/// actually reading, which is where a fast typist's line goes missing (#433).
+///
+/// These drive a real `TerminalView` over a pane link on every platform, so
+/// they are not gated to unix the way `gpui_tests` is.
+#[cfg(test)]
+mod prompt_handover_tests {
+    use super::*;
+    use crate::daemon::protocol::{ClientMsg, DaemonMsg};
+    use crate::daemon::transport::Stream;
+    use gpui::TestAppContext;
+
+    fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {
+        crate::core::config::pin_test_config_dir();
+        cx.executor().allow_parking();
+        let (client_side, daemon_side) = test_stream_pair();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
+                .expect("link-backed terminal");
+            TerminalView::with_terminal(terminal, 1, window, cx)
+        });
+        (window, daemon_side)
+    }
+
+    /// Everything the pane has written to the PTY, in order.
+    fn drain(daemon: &mut Stream) -> Vec<u8> {
+        daemon
+            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        let mut out = Vec::new();
+        loop {
+            match ClientMsg::read(daemon) {
+                Ok(ClientMsg::Input(bytes)) => out.extend_from_slice(&bytes),
+                Ok(_) => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => panic!("pane link failed: {e}"),
+            }
+        }
+        out
+    }
+
+    fn settle(
+        cx: &mut TestAppContext,
+        window: &gpui::WindowHandle<TerminalView>,
+        what: &str,
+        f: impl Fn(&TerminalView) -> bool,
+    ) {
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if window.update(cx, |view, _, _| f(view)).unwrap() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("never settled: {what}");
+    }
+
+    /// Printable text arrives the way the platform delivers it — through the
+    /// text-input path, which is what the gap hold and the typeahead record see.
+    fn type_text(window: &gpui::WindowHandle<TerminalView>, cx: &mut TestAppContext, text: &str) {
+        for ch in text.chars() {
+            window
+                .update(cx, |view, _, cx| view.commit_text(&ch.to_string(), cx))
+                .unwrap();
+        }
+    }
+
+    fn press(window: &gpui::WindowHandle<TerminalView>, cx: &mut TestAppContext, key: &str) {
+        window
+            .update(cx, |view, window, cx| {
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse(key).unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+    }
+
+    fn prompt(daemon: &mut Stream, at_prompt: bool) {
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt,
+            last_exit: None,
+        }
+        .encode(daemon)
+        .unwrap();
+    }
+
+    /// Types `text` into the gap of a running command and lets the hold window
+    /// expire, so the bytes go to the PTY and are recorded for replay. Then
+    /// puts the pane back at a prompt the way the `D` mark does — before the
+    /// prompt is drawn, so the shell's line editor is not reading yet.
+    fn typed_into_the_gap_then_handed_back(
+        cx: &mut TestAppContext,
+        window: &gpui::WindowHandle<TerminalView>,
+        daemon: &mut Stream,
+        text: &str,
+    ) {
+        prompt(daemon, true);
+        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
+            .encode(daemon)
+            .unwrap();
+        settle(cx, window, "the editor takes the first prompt", |view| {
+            view.input_active() && view.terminal.zle_reading()
+        });
+
+        prompt(daemon, false);
+        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
+            .encode(daemon)
+            .unwrap();
+        settle(cx, window, "a command takes the pane", |view| {
+            !view.input_active()
+        });
+
+        type_text(window, cx, text);
+        cx.executor().advance_clock(HOLD_WINDOW * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            drain(daemon),
+            text.as_bytes(),
+            "the hold window gives up and dumps what it held"
+        );
+
+        prompt(daemon, true);
+        settle(cx, window, "the editor takes the prompt back", |view| {
+            view.input_active()
+        });
+        assert!(
+            !window
+                .update(cx, |view, _, _| view.terminal.zle_reading())
+                .unwrap(),
+            "this is the D-to-B window: the shell is not reading its line yet"
+        );
+    }
+
+    #[gpui::test]
+    fn a_line_typed_into_the_gap_survives_a_prompt_that_is_not_reading_yet(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, mut daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo hi");
+
+        press(&window, cx, "enter");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x15echo hi\r".to_vec(),
+            "the line the shell is holding must be erased and submitted whole, \
+             not erased and replaced by an empty command"
+        );
+    }
+
+    #[gpui::test]
+    fn a_prompt_handover_keeps_the_held_text_in_front_of_what_follows_it(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+
+        // Typing carries straight on into the editor that just took the prompt.
+        type_text(&window, cx, " hi");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            Vec::<u8>::new(),
+            "the editor owns these keys, so none of them reach the PTY"
+        );
+
+        press(&window, cx, "enter");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x15echo hi\r".to_vec(),
+            "what the shell was holding leads the line, not the tail alone"
+        );
+    }
+
+    /// The editor takes the held line over the moment it is touched, before it
+    /// edits anything — and takes it over without putting the wipe on the wire,
+    /// which is still the shell's line editor's to receive when it starts
+    /// reading.
+    #[gpui::test]
+    fn the_editor_takes_the_held_line_over_before_it_edits_it(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+
+        // `home` moves the caret and nothing else: any editor key is enough.
+        press(&window, cx, "home");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.cmd.text(),
+                    "echo",
+                    "the line the shell is sitting on is the editor's line now"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            drain(&mut daemon),
+            Vec::<u8>::new(),
+            "taking the line over owes the wipe, it does not send it early"
+        );
+
+        press(&window, cx, "enter");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x15echo\r".to_vec(),
+            "the owed wipe is paid on submit, still in front of the line"
+        );
+    }
+
+    /// The half of the window the seed alone does not cover: the editor is
+    /// live, so the user can *replace* the line before submitting it. Recalling
+    /// history and pressing Enter has to run the entry recalled — not that
+    /// entry with the text the shell was holding glued to its front.
+    #[gpui::test]
+    fn recalling_history_in_the_gap_window_replaces_the_held_line(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+        window
+            .update(cx, |view, _, _| {
+                view.history.push("echo from history".to_string());
+            })
+            .unwrap();
+
+        press(&window, cx, "up");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.cmd.text(),
+                    "echo from history",
+                    "the recall searches on the whole line, held text included"
+                );
+            })
+            .unwrap();
+
+        press(&window, cx, "enter");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x15echo from history\r".to_vec(),
+            "the recalled entry runs on its own, with the held text replaced \
+             rather than prefixed to it"
+        );
+    }
+
+    /// A paste that landed in the gap is still a paste after the handover. The
+    /// record replays it into the editor, and a line that arrives there looking
+    /// typed is submitted raw through the shell's binding table (#660) — the
+    /// hole `GapHold::pasted` closed for the hold's own route.
+    #[gpui::test]
+    fn a_paste_held_in_the_gap_is_still_a_paste_after_the_handover(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        // Bracketed paste is what a live prompt advertises; without it there is
+        // no framing to lose in the first place.
+        DaemonMsg::Output(b"\x1b[?2004h".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        settle(cx, &window, "the shell turns bracketed paste on", |view| {
+            view.terminal
+                .term
+                .lock()
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE)
+        });
+
+        prompt(&mut daemon, true);
+        DaemonMsg::Output(b"\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        settle(cx, &window, "the editor takes the first prompt", |view| {
+            view.input_active() && view.terminal.zle_reading()
+        });
+        prompt(&mut daemon, false);
+        DaemonMsg::Output(b"\x1b]133;C\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        settle(cx, &window, "a command takes the pane", |view| {
+            !view.input_active()
+        });
+
+        window
+            .update(cx, |view, _, cx| view.paste("echo hi".to_string(), cx))
+            .unwrap();
+        cx.executor().advance_clock(HOLD_WINDOW * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x1b[200~echo hi\x1b[201~".to_vec(),
+            "the hold window gives up and dumps the paste as a paste"
+        );
+
+        prompt(&mut daemon, true);
+        settle(cx, &window, "the editor takes the prompt back", |view| {
+            view.input_active()
+        });
+
+        press(&window, cx, "enter");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x15\x1b[200~echo hi\x1b[201~\r".to_vec(),
+            "the replayed line keeps its framing instead of being typed at the \
+             shell's binding table"
+        );
+    }
+
+    /// The same for an emptied line: ⌃U clears what the editor is holding, and
+    /// the shell's copy of it goes too instead of coming back at submit.
+    #[gpui::test]
+    fn clearing_the_line_in_the_gap_window_clears_the_held_text_too(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        typed_into_the_gap_then_handed_back(cx, &window, &mut daemon, "echo");
+
+        press(&window, cx, "ctrl-u");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| assert_eq!(view.cmd.text(), ""))
+            .unwrap();
+
+        press(&window, cx, "enter");
+        cx.run_until_parked();
+        assert_eq!(
+            drain(&mut daemon),
+            b"\x15\r".to_vec(),
+            "an emptied line submits empty: the wipe is still owed, the seed is not"
+        );
     }
 }
