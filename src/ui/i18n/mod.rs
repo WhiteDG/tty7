@@ -1125,6 +1125,7 @@ l10n_keys! {
     CmdGroupAgents,
     CmdGroupApplication,
     CmdNewTab,
+    CmdNewWindow,
     CmdNewWorktreeTab,
     CmdNewWorktreeTabSubtitle,
     CmdRenameTab,
