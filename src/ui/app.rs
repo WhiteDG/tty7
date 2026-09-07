@@ -6768,10 +6768,15 @@ impl Tty7App {
     }
 
     fn assign_keybinding(&mut self, action: String, spec: String, cx: &mut Context<Self>) {
+        // Compared as chords, not as spellings: a recorded `secondary-}` and a
+        // config's `secondary-shift-]` are one keystroke written two ways, and
+        // only `same_chord` sees it. Compared as text, the displacement never
+        // fires and both bindings survive onto that keystroke, where which one
+        // wins is arbitrary (#750).
         let displaced = crate::ui::keymap::effective_bindings(cx)
             .into_iter()
             .chain(crate::ui::keymap::extra_bindings(cx))
-            .find(|(a, k)| *k == spec && *a != action)
+            .find(|(a, k)| *a != action && crate::ui::keymap::same_chord(k, &spec))
             .map(|(a, _)| a);
         // A trailing "…" on an action name marks a command that opens
         // something; it is not punctuation, and inside a sentence it reads as
