@@ -1014,7 +1014,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::PanelTurnNoScrollback => "这一轮画在 alt screen 上，scrollback 里没有留下它。",
         L10nKey::PanelProcessesSubtitle => "进程",
         L10nKey::PanelPortsSubtitle => "端口",
-        L10nKey::PanelPortsUnsupported => "这台机器的 tty7-server 太旧，列不出端口。",
+        L10nKey::PanelPortsUnsupported => "对端的 tty7-server 太旧，列不出端口。",
         L10nKey::PortAutoForwarded => "远程 :{port} 现在是 http://localhost:{local}",
         L10nKey::PanelCwd => "工作目录",
         L10nKey::PanelShell => "shell",

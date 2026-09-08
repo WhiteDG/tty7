@@ -1061,7 +1061,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::PanelProcessesSubtitle => "Processes",
         L10nKey::PanelPortsSubtitle => "Ports",
-        L10nKey::PanelPortsUnsupported => "This machine's tty7-server is too old to list ports.",
+        L10nKey::PanelPortsUnsupported => "That machine's tty7-server is too old to list ports.",
         L10nKey::PortAutoForwarded => "Remote :{port} is now http://localhost:{local}",
         L10nKey::PanelCwd => "cwd",
         L10nKey::PanelShell => "shell",

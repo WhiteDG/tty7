@@ -91,6 +91,17 @@ pub(crate) const ROW_GLYPH: f32 = crate::ui::app::TILE_GLYPH;
 /// 6px under Info is a panel whose rows visibly do not belong to each other.
 pub(crate) const ROW_INSET: f32 = 4.;
 
+/// Whether this forward is the one that reaches `port` on the far side.
+///
+/// Local forwards only, and only those aimed at the far host's own loopback:
+/// a forward to some third machine happens to carry the same number, and
+/// pairing it with the port row would claim it leads somewhere it does not.
+pub(crate) fn forwards_port(m: &ManagedForward, port: u16) -> bool {
+    m.kind == crate::daemon::protocol::SshForwardKind::Local
+        && m.target_port == port
+        && crate::daemon::protocol::PortEntry::reaches_loopback(&m.target_host)
+}
+
 /// The strip the row and group action buttons live in, revealed by hovering
 /// `row`.
 ///
@@ -114,17 +125,6 @@ pub(crate) const ROW_INSET: f32 = 4.;
 /// Stopping propagation buys the same "this click is ours, not the row's"
 /// without lying to the hit test: children register their handlers after this
 /// one and gpui bubbles back to front, so a button still gets its click first.
-/// Whether this forward is the one that reaches `port` on the far side.
-///
-/// Local forwards only, and only those aimed at the far host's own loopback:
-/// a forward to some third machine happens to carry the same number, and
-/// pairing it with the port row would claim it leads somewhere it does not.
-pub(crate) fn forwards_port(m: &ManagedForward, port: u16) -> bool {
-    m.kind == crate::daemon::protocol::SshForwardKind::Local
-        && m.target_port == port
-        && crate::daemon::protocol::PortEntry::reaches_loopback(&m.target_host)
-}
-
 pub(crate) fn action_strip(row: &gpui::SharedString, backing: u32) -> gpui::Div {
     h_flex()
         .absolute()

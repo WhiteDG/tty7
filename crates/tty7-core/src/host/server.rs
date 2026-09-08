@@ -1788,7 +1788,6 @@ mod aggregate_tests {
         assert_eq!(states[0].state.session_id.as_deref(), Some("sess-7"));
     }
 
-    #[test]
     /// A remote workspace's pane runs on the peer, so the peer is the only
     /// one that can walk its process tree — the client's own daemon has never
     /// heard of the pane. Without this request its ports were simply invisible.

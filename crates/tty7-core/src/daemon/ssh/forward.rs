@@ -237,8 +237,6 @@ fn loop_exit_status(exit: LoopExit) -> ForwardStatus {
     )
 }
 
-/// A forward that never got as far as a listening socket. It has no task, so
-/// nothing will ever move it off this status.
 /// The reason a just-started forward is not listening, if it is not.
 ///
 /// Only ever a bind failure at this point: everything else that can stop a
@@ -250,6 +248,8 @@ fn bind_error(status: &SharedStatus) -> Option<String> {
     }
 }
 
+/// A forward that never got as far as a listening socket. It has no task, so
+/// nothing will ever move it off this status.
 fn bind_failed(rule: &SshForwardRule, e: io::Error) -> SharedStatus {
     Arc::new(Mutex::new(ForwardStatus::Error(format!(
         "bind {}:{} failed: {e}",
