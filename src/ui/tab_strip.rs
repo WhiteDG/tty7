@@ -1074,13 +1074,18 @@ impl Tty7App {
         )
     }
 
+    /// The trailing chrome tiles. `shown` is the pointer being over the bar
+    /// they sit in: they are laid out either way, and only painted while it
+    /// holds, so revealing them never shifts anything beside them.
     pub(crate) fn window_chrome(
         &self,
+        shown: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let panel_open = self.right_panel_open(cx);
         h_flex()
+            .when(!shown, |row| row.invisible())
             .flex_shrink_0()
             .items_center()
             .gap(px(2.))
@@ -2036,6 +2041,9 @@ impl Tty7App {
             .flex_shrink_0()
             .child(self.new_tab_button("tab-add", cx));
 
+        // Same bargain the sidebar's own tiles keep: present in the layout,
+        // painted only while the pointer is on the bar.
+        let strip_chrome_shown = self.strip_chrome_hover.get();
         let rail_collapsed = !show_chips && !self.left_panel_open(cx);
         let left_group = rail_collapsed.then(|| {
             h_flex()
@@ -2053,37 +2061,48 @@ impl Tty7App {
                             .child(mark),
                     )
                 })
+                // The logo above stays put: it is the window's mark, not a
+                // control, and a window that loses its identity when nobody is
+                // pointing at it reads as a different window.
                 .child(
                     div()
                         .occlude()
                         .flex_shrink_0()
+                        .when(!strip_chrome_shown, |tile| tile.invisible())
                         .child(self.new_tab_button("titlebar-add-collapsed", cx)),
                 )
                 .child(
-                    div().occlude().flex_shrink_0().child(
-                        chrome_tile(
-                            Button::new("titlebar-expand-sidebar")
-                                .icon(Icon::empty().path("icons/panel-left.svg")),
-                            false,
-                            cx,
-                        )
-                        .rounded_lg()
-                        .tooltip_element(chord_tooltip(
-                            t(L10nKey::TabTooltipShowSidebar),
-                            "ToggleLeftPanel",
-                            cx,
-                        ))
-                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
-                    ),
+                    div()
+                        .occlude()
+                        .flex_shrink_0()
+                        .when(!strip_chrome_shown, |tile| tile.invisible())
+                        .child(
+                            chrome_tile(
+                                Button::new("titlebar-expand-sidebar")
+                                    .icon(Icon::empty().path("icons/panel-left.svg")),
+                                false,
+                                cx,
+                            )
+                            .rounded_lg()
+                            .tooltip_element(chord_tooltip(
+                                t(L10nKey::TabTooltipShowSidebar),
+                                "ToggleLeftPanel",
+                                cx,
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx)),
+                            ),
+                        ),
                 )
         });
 
         let panel_open = self.right_panel_open(cx);
-        let right_chrome =
-            (!panel_open || !cfg!(target_os = "macos")).then(|| self.window_chrome(window, cx));
+        let right_chrome = (!panel_open || !cfg!(target_os = "macos"))
+            .then(|| self.window_chrome(strip_chrome_shown, window, cx));
 
         h_flex()
             .id("tab-strip")
+            .relative()
             .items_center()
             .gap_1p5()
             .when(show_chips, |this| this.w(strip_w))
@@ -2105,6 +2124,10 @@ impl Tty7App {
                 ),
                 None => this.child(chrome),
             })
+            .child(crate::ui::app::hover_sheet(
+                "strip-chrome-hover",
+                &self.strip_chrome_hover,
+            ))
     }
 }
 

@@ -337,6 +337,34 @@ fn strip_band(viewport: Size<Pixels>, pad: Edges<Pixels>) -> Bounds<Pixels> {
 
 pub(crate) const WINDOW_MARK_SIZE: f32 = 20.;
 
+/// A transparent sheet that answers one question: is the pointer inside the
+/// box it covers. Lay it over a region as that region's *last* child and read
+/// the flag to reveal chrome only while the pointer is there.
+///
+/// The obvious way to write this is `group_hover` on the region itself, and it
+/// does not work. Group hover asks whether the group's *hitbox* is the one
+/// under the pointer, and gpui's hit test stops at the first `occlude()`d
+/// element it meets on the way down. Tab chips and the chrome tiles are all
+/// occluding, so the region stopped counting as hovered the instant the
+/// pointer reached the very button it was revealing, and the button vanished
+/// from under the cursor. Painted last, this sheet's own hitbox sits in front
+/// of all of them, and it blocks nothing — it is not opaque, so the rows,
+/// chips and tiles underneath keep their clicks, cursors and tooltips.
+pub(crate) fn hover_sheet(id: &'static str, flag: &Rc<Cell<bool>>) -> gpui::Stateful<gpui::Div> {
+    use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
+    let flag = flag.clone();
+    gpui::div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .on_hover(move |over, window, _cx| {
+            if flag.get() != *over {
+                flag.set(*over);
+                window.refresh();
+            }
+        })
+}
+
 pub(crate) fn title_bar_drag(
     row: gpui::Stateful<gpui::Div>,
     key: &'static str,
@@ -835,6 +863,13 @@ pub struct Tty7App {
     pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     pub(crate) sidebar_width: Rc<Cell<f32>>,
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
+    /// Whether the pointer is over the sidebar, the tab strip and the right
+    /// panel's own title bar. The chrome tiles in each — new tab, the two
+    /// panel toggles, the app menu — are drawn only while its own flag is set,
+    /// so a window nobody is pointing at carries no buttons at all.
+    pub(crate) sidebar_chrome_hover: Rc<Cell<bool>>,
+    pub(crate) strip_chrome_hover: Rc<Cell<bool>>,
+    pub(crate) panel_chrome_hover: Rc<Cell<bool>>,
     /// How much width a settings row will actually get, measured once per
     /// render. `settings_row` is called from page builders that never see the
     /// window, and the answer differs per page — the SSH page spends a host
@@ -1452,6 +1487,9 @@ impl Tty7App {
             editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
+            sidebar_chrome_hover: Rc::new(Cell::new(false)),
+            strip_chrome_hover: Rc::new(Cell::new(false)),
+            panel_chrome_hover: Rc::new(Cell::new(false)),
             settings_row_width: Cell::new(f32::MAX),
             settings_viewport_w: Cell::new(f32::MAX),
             settings_hit_anchored: Cell::new(false),
