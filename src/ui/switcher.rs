@@ -313,6 +313,11 @@ pub(crate) struct Switcher {
     /// The modifiers held down when Ctrl+Tab opened the panel. Releasing them
     /// commits the highlighted tab, IDEA-style.
     hold: Option<gpui::Modifiers>,
+    /// Where the pointer is: inside the card at all, and inside the tab column
+    /// specifically. Both are set by hover listeners, so they only mean
+    /// anything once the mouse has moved since the panel came up.
+    hover_card: bool,
+    hover_tabs: bool,
     left_scroll: gpui::ScrollHandle,
     right_scroll: gpui::ScrollHandle,
     /// Anchors on the two scrolls, worn by whichever row is selected. Both
@@ -328,6 +333,14 @@ pub(crate) struct Switcher {
 impl Switcher {
     fn text(&self, cx: &App) -> String {
         self.query.read(cx).value().trim().to_lowercase()
+    }
+
+    /// The pointer is parked in the card but off the tab column — on a
+    /// workspace row, the search box, a banner. Letting go of Ctrl there is
+    /// not a commit: the user is reaching for the mouse, and closing the panel
+    /// out from under them makes the workspace list unreachable by hand.
+    fn hover_keeps_open(&self) -> bool {
+        self.hover_card && !self.hover_tabs
     }
 }
 
@@ -437,9 +450,17 @@ impl Tty7App {
         remote_connect::register(cx);
         remote_connect::sweep_wsl(cx);
         let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::ui::i18n::t(
-                crate::ui::i18n::L10nKey::SearchWorkspacesAndMachines,
-            ))
+            InputState::new(window, cx)
+                .placeholder(crate::ui::i18n::t(
+                    crate::ui::i18n::L10nKey::SearchWorkspacesAndMachines,
+                ))
+                // On macOS a held Ctrl turns every click into a right click,
+                // and the input answers a right click with Cut/Copy/Paste —
+                // so reaching for this box mid-Ctrl+Tab popped a menu instead
+                // of placing a caret. The rows already dodge this by dropping
+                // their own menus while the gesture is on; this box has no
+                // menu worth keeping either, and Cmd+V still pastes.
+                .context_menu(false)
         });
         query.update(cx, |state, cx| state.focus(window, cx));
         let subs = vec![cx.subscribe_in(
@@ -469,6 +490,8 @@ impl Tty7App {
             right_sel: 0,
             mru,
             hold,
+            hover_card: false,
+            hover_tabs: false,
             left_scroll: left_scroll.clone(),
             right_scroll: right_scroll.clone(),
             left_anchor: gpui::ScrollAnchor::for_handle(left_scroll),
@@ -601,9 +624,21 @@ impl Tty7App {
         let Some(hold) = self.switcher.as_ref().and_then(|sw| sw.hold) else {
             return;
         };
-        if !now.modified() || !hold.is_subset_of(now) {
-            self.switcher_commit_hold(window, cx);
+        if now.modified() && hold.is_subset_of(now) {
+            return;
         }
+        // The pointer is already on the workspace list or the search box, so
+        // the release is the user's hand leaving the keyboard, not a pick.
+        // Drop the hold and leave the panel up for the mouse to finish in.
+        if self
+            .switcher
+            .as_ref()
+            .is_some_and(Switcher::hover_keeps_open)
+        {
+            self.switcher_release_hold(cx);
+            return;
+        }
+        self.switcher_commit_hold(window, cx);
     }
 
     /// Called when the modifier that raised the panel comes back up.
@@ -1655,7 +1690,17 @@ impl Tty7App {
                         this.close_switcher(window, cx)
                     }),
                 )
-                .child(div().occlude().child(card))
+                .child(
+                    div()
+                        .id("switcher-card")
+                        .occlude()
+                        .on_hover(cx.listener(|this, hovered: &bool, _window, _cx| {
+                            if let Some(sw) = this.switcher.as_mut() {
+                                sw.hover_card = *hovered;
+                            }
+                        }))
+                        .child(card),
+                )
                 .into_any_element(),
         )
     }
@@ -1735,8 +1780,14 @@ impl Tty7App {
             )
             .child(
                 v_flex()
+                    .id("switcher-tab-column")
                     .flex_1()
                     .min_w_0()
+                    .on_hover(cx.listener(|this, hovered: &bool, _window, _cx| {
+                        if let Some(sw) = this.switcher.as_mut() {
+                            sw.hover_tabs = *hovered;
+                        }
+                    }))
                     .child(crate::ui::scrollbar::with_vertical_scrollbar(
                         "switcher-tabs-scrollbar",
                         div()
@@ -4043,6 +4094,127 @@ mod gpui_tests {
                 .as_ref()
                 .expect("still up — Esc backs out one step");
             assert!(matches!(sw.page, super::Page::List));
+        });
+    }
+
+    /// One of the three places on the card a test wants to put the pointer.
+    #[derive(Clone, Copy)]
+    enum Spot {
+        Workspaces,
+        Tabs,
+        Search,
+    }
+
+    /// Where that part of the card lands on screen. The card is centred and
+    /// its columns are laid out from `CARD_W` / `LEFT_W`, so the geometry is
+    /// worth recomputing here rather than hard-coding pixels that move with
+    /// the window size.
+    fn card_point(vcx: &mut gpui::VisualTestContext, spot: Spot) -> gpui::Point<gpui::Pixels> {
+        use gpui::{point, px};
+
+        let viewport = vcx.update(|window, _| window.viewport_size());
+        let card_w = super::CARD_W
+            .min(viewport.width.as_f32() - 2. * super::CARD_MARGIN)
+            .max(320.);
+        let left_w = super::LEFT_W.min(card_w * 0.5);
+        let card_left = (viewport.width.as_f32() - card_w) / 2.;
+        let (dx, dy) = match spot {
+            // The search row is the first thing in the card; both columns
+            // start below it.
+            Spot::Search => (100., 20.),
+            Spot::Workspaces => (20., 60.),
+            // Past the tab column's own header row, onto its first tab.
+            Spot::Tabs => (left_w + 40., 42. + 6. + super::HOST_H + super::ROW_H / 2.),
+        };
+        point(px(card_left + dx), px(super::CARD_TOP + dy))
+    }
+
+    /// Ctrl+Tab, then reach for the mouse: the pointer leaves the tab column
+    /// for the workspace list, and letting go of Ctrl there must not slam the
+    /// panel shut — switching workspaces by hand is exactly what the user is
+    /// in the middle of doing.
+    #[gpui::test]
+    fn releasing_ctrl_over_the_workspace_list_keeps_the_panel_up(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+        vcx.simulate_modifiers_change(Modifiers::control());
+        app.update_in(&mut vcx, |app, window, cx| app.tab_switch(true, window, cx));
+        vcx.run_until_parked();
+
+        let at = card_point(&mut vcx, Spot::Workspaces);
+        vcx.simulate_mouse_move(at, None, Modifiers::control());
+        vcx.simulate_modifiers_change(Modifiers::none());
+
+        app.update(cx, |app, _| {
+            let sw = app
+                .switcher
+                .as_ref()
+                .expect("the panel stays up for the mouse to finish in");
+            assert!(sw.hold.is_none(), "the hold is spent, not re-armed");
+            assert_eq!(app.active, 0, "the release picked nothing");
+        });
+    }
+
+    /// The pointer over the tab column is the ordinary gesture: release still
+    /// commits.
+    #[gpui::test]
+    fn releasing_ctrl_over_the_tab_column_still_commits(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+        vcx.simulate_modifiers_change(Modifiers::control());
+        app.update_in(&mut vcx, |app, window, cx| app.tab_switch(true, window, cx));
+        vcx.run_until_parked();
+
+        let at = card_point(&mut vcx, Spot::Tabs);
+        vcx.simulate_mouse_move(at, None, Modifiers::control());
+        vcx.simulate_modifiers_change(Modifiers::none());
+
+        app.update(cx, |app, _| {
+            assert!(app.switcher.is_none(), "the panel comes down on release");
+            assert_eq!(app.active, 1, "the highlighted tab is now the active one");
+        });
+    }
+
+    /// macOS reports Ctrl+click as a right click, so a tab row picked with
+    /// the mouse mid-gesture arrives on the right button. The row takes that
+    /// press as the pick; nothing between it and the window may swallow it
+    /// first.
+    #[gpui::test]
+    fn ctrl_clicking_a_tab_row_mid_gesture_picks_it(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+        vcx.simulate_modifiers_change(Modifiers::control());
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.tab_switch(true, window, cx);
+            // Two steps down, so the row the pointer lands on below is not
+            // the one the keyboard had already reached.
+            app.tab_switch(true, window, cx);
+        });
+        vcx.run_until_parked();
+        app.update(cx, |app, _| {
+            assert_eq!(app.switcher.as_ref().expect("up").right_sel, 2);
+        });
+
+        let at = card_point(&mut vcx, Spot::Tabs);
+        vcx.simulate_mouse_move(at, None, Modifiers::control());
+        vcx.simulate_mouse_down(at, gpui::MouseButton::Right, Modifiers::control());
+
+        app.update(cx, |app, _| {
+            let sw = app.switcher.as_ref().expect("the panel stays up");
+            assert_eq!(
+                sw.right_sel, 0,
+                "the row under the pointer took the press, not the keyboard's row 2"
+            );
+            assert!(
+                sw.hold.is_some(),
+                "the gesture is still on until Ctrl is up"
+            );
+        });
+
+        vcx.simulate_modifiers_change(Modifiers::none());
+        app.update(cx, |app, _| {
+            assert!(app.switcher.is_none(), "release commits and closes");
+            assert_eq!(
+                app.active, 0,
+                "the first row of a most-recently-used column is this very tab"
+            );
         });
     }
 

@@ -749,6 +749,10 @@ pub(crate) struct LoopbackForwardPanelState {
     /// Why the last Add or Save did not take, in the far side's own words.
     /// Cleared the moment the form is closed or the edit is abandoned.
     pub(crate) mf_error: Option<String>,
+    /// Return, on each of the five boxes. Held here for the same reason the
+    /// sftp form holds its own: a live subscription on a box nothing is
+    /// showing would answer Return for a form that is gone.
+    pub(crate) mf_subs: Vec<Subscription>,
 }
 
 pub struct Tty7App {
@@ -1401,6 +1405,7 @@ impl Tty7App {
                 mf_description,
                 mf_editing: None,
                 mf_error: None,
+                mf_subs: Vec::new(),
             },
             sftp_panel,
             right_panel: Default::default(),
@@ -2968,6 +2973,49 @@ impl Tty7App {
         self.loopback_panel.form_pane_id = Some(pane_id);
         self.cancel_managed_forward_edit(window, cx);
         self.refresh_managed_forwards(pane_id, cx);
+        self.arm_managed_forward_form(pane_id, window, cx);
+    }
+
+    /// Opens the form focused and listening for Return.
+    ///
+    /// It had neither. Every other form in the app opens with the caret in the
+    /// first field and answers Return — this one opened cold, so adding a rule
+    /// meant clicking into Bind first, and once you were there the only way to
+    /// commit was the mouse again. Escape did nothing either, which is handled
+    /// on the form itself in `forwards.rs`; a key event only reaches it while
+    /// something inside it holds focus, so the focus below is what makes that
+    /// work too.
+    fn arm_managed_forward_form(
+        &mut self,
+        pane_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inputs = [
+            self.loopback_panel.mf_bind_host.clone(),
+            self.loopback_panel.mf_bind_port.clone(),
+            self.loopback_panel.mf_target_host.clone(),
+            self.loopback_panel.mf_target_port.clone(),
+            self.loopback_panel.mf_description.clone(),
+        ];
+        self.loopback_panel.mf_subs = inputs
+            .iter()
+            .map(|input| {
+                cx.subscribe_in(
+                    input,
+                    window,
+                    move |this, _input, ev: &InputEvent, window, cx| {
+                        if let InputEvent::PressEnter { .. } = ev {
+                            // A no-op when the fields do not make a rule yet:
+                            // `add_managed_forward` already guards on that and
+                            // the form already says what is missing.
+                            this.add_managed_forward(pane_id, window, cx);
+                        }
+                    },
+                )
+            })
+            .collect();
+        inputs[0].update(cx, |s, cx| s.focus(window, cx));
     }
 
     pub(crate) fn close_managed_forward_form(
@@ -2975,8 +3023,14 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.loopback_panel.form_pane_id = None;
+        let was_open = self.loopback_panel.form_pane_id.take().is_some();
+        self.loopback_panel.mf_subs.clear();
         self.cancel_managed_forward_edit(window, cx);
+        if was_open {
+            // The form held the focus, so taking it down has to hand it back —
+            // otherwise the next keystroke goes nowhere until the user clicks.
+            self.focus_active(window, cx);
+        }
     }
 
     fn open_typed_ssh_connect(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -7056,31 +7110,11 @@ impl Tty7App {
             return None;
         }
         let notice = self.remote_status(cx)?.input_notice()?;
-        let theme = cx.theme();
+        // The pill only. `body_area` anchors it, together with whatever else
+        // is floating down there — see `ui::notice`.
         Some(
-            div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_4()
-                .flex()
-                .justify_center()
-                .child(
-                    gpui_component::h_flex()
-                        .occlude()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .rounded_lg()
-                        .bg(theme.popover)
-                        .border_1()
-                        .border_color(theme.warning.opacity(0.4))
-                        .shadow_md()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(notice),
-                )
+            crate::ui::notice::pill(cx.theme().warning, cx)
+                .child(notice)
                 .into_any_element(),
         )
     }
@@ -7291,13 +7325,23 @@ impl Render for Tty7App {
             .child(body)
             .when_some(self.pane_landing(window, cx), |this, el| this.child(el))
             .when_some(tab_landing, |this, el| this.child(el))
-            .when_some(ssh_status, |this, el| this.child(el))
             .when_some(self.render_remote_workspace_strip(cx), |this, el| {
                 this.child(el)
             })
-            .when_some(self.render_remote_input_notice(cx), |this, el| {
-                this.child(el)
-            });
+            // Both of these used to anchor themselves at `bottom_4` and centre
+            // themselves, as siblings here — so a remote workspace whose ssh
+            // link had also dropped drew them one on top of the other. One
+            // anchor now, and it stacks. The ssh strip goes last because it is
+            // the one carrying buttons.
+            .when_some(
+                crate::ui::notice::anchor(
+                    [self.render_remote_input_notice(cx), ssh_status]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                ),
+                |this, el| this.child(el),
+            );
 
         // One decision for the whole document surface. Docked, exactly one of
         // the two surfaces is drawn — a column has one child, and two `flex_1`
@@ -10441,7 +10485,7 @@ mod zoom_gpui_tests {
 // are left holding when the far side does not answer.
 #[cfg(test)]
 mod managed_forward_gpui_tests {
-    use gpui::TestAppContext;
+    use gpui::{Focusable as _, TestAppContext};
     use gpui_component::input::InputState;
 
     use crate::daemon::protocol::{ForwardStatus, ManagedForward, SshForwardKind};
@@ -10459,6 +10503,57 @@ mod managed_forward_gpui_tests {
             description: None,
             status: ForwardStatus::Listening,
         }
+    }
+
+    /// The form had no keyboard contract at all: no Return, no Escape, and it
+    /// opened cold, with the caret still in the terminal behind it. Every
+    /// sibling form in the app has all three.
+    ///
+    /// Escape is a `on_key_down` on the form itself and only fires while
+    /// something inside it holds focus, so the focus below is what makes both
+    /// halves work; the subscriptions are what answer Return. Asserting on
+    /// both together is the point — arming one without the other is the state
+    /// this test exists to catch.
+    #[gpui::test]
+    fn opening_the_forward_form_arms_the_keyboard_and_closing_disarms_it(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            assert!(
+                app.loopback_panel.mf_subs.is_empty(),
+                "nothing is listening before the form is up"
+            );
+
+            app.toggle_managed_forward_form(1, window, cx);
+
+            assert_eq!(
+                app.loopback_panel.form_pane_id,
+                Some(1),
+                "the form is up for the pane that asked"
+            );
+            assert_eq!(
+                app.loopback_panel.mf_subs.len(),
+                5,
+                "Return has to be answered on every box, not just the first"
+            );
+            assert!(
+                app.loopback_panel
+                    .mf_bind_host
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "the form opens with the caret in Bind, so Escape reaches it too"
+            );
+
+            app.close_managed_forward_form(window, cx);
+
+            assert_eq!(app.loopback_panel.form_pane_id, None);
+            assert!(
+                app.loopback_panel.mf_subs.is_empty(),
+                "a live subscription on a box nothing is showing would answer \
+                 Return for a form that is gone"
+            );
+        });
     }
 
     #[gpui::test]

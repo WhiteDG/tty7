@@ -148,28 +148,13 @@ impl Tty7App {
             .and_then(|id| uuid::Uuid::parse_str(&id).ok());
 
         let theme = cx.theme();
+        let (danger, foreground) = (theme.danger, theme.foreground);
 
-        let bar = h_flex()
-            .occlude()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_1p5()
-            .rounded_lg()
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.danger.opacity(0.4))
-            .shadow_md()
-            // Off the right panel's ramp on purpose: this bar floats over the
-            // terminal, not inside the panel, and it is sized against the
-            // terminal's own text. `app.rs` draws it, `render_panel_info` does
-            // not.
-            .text_xs()
-            .text_color(theme.muted_foreground)
+        let bar = crate::ui::notice::pill(danger, cx)
             .child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
+                    .text_color(foreground)
                     .child(if host.is_empty() {
                         t(L10nKey::ForwardDisconnected).to_string()
                     } else {
@@ -186,7 +171,7 @@ impl Tty7App {
                     .id("ssh-strip-reason")
                     .max_w(px(360.))
                     .truncate()
-                    .text_color(theme.danger)
+                    .text_color(danger)
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
                     })
@@ -219,17 +204,10 @@ impl Tty7App {
                         this.open_ssh_profile_in_settings(id, window, cx)
                     }))
             }));
-        Some(
-            div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_4()
-                .flex()
-                .justify_center()
-                .child(bar)
-                .into_any_element(),
-        )
+        // The bar only. `body_area` anchors it, together with whatever else is
+        // floating down there — this used to place itself at `bottom_4` and so
+        // did the remote input notice, on the same container.
+        Some(bar.into_any_element())
     }
 
     pub(crate) fn forwards_section(
@@ -456,6 +434,17 @@ impl Tty7App {
             .pt(px(6.))
             .pb(px(2.))
             .gap(px(5.))
+            // Escape backs out of the form, the way it backs out of the sftp
+            // edit box and every sheet the app puts up. Return is answered by
+            // the boxes themselves — see `arm_managed_forward_form` — because
+            // an Input takes Return before it can bubble to here.
+            .on_key_down(
+                cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.close_managed_forward_form(window, cx);
+                    }
+                }),
+            )
             .child(self.segmented_on(
                 sf,
                 "ssh-managed-forward-kind",
