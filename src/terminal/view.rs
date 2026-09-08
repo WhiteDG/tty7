@@ -16,7 +16,7 @@ use gpui_component::{ActiveTheme as _, Icon, IconName, WindowExt as _, h_flex};
 use super::TermSize;
 use super::cmd_editor::CmdEditor;
 use super::completion::{self, CandidateKind, CompletionSession};
-use super::element::TerminalElement;
+use super::element::{GridSnapshot, RenderCell, TerminalElement};
 use super::highlight::{self, TokenKind};
 use super::hold::{GapHold, Verdict};
 use super::remote::RemoteTerminal;
@@ -288,6 +288,22 @@ pub struct TerminalView {
     pub line_height_mul: f32,
     pub cell_width: Pixels,
     pub(super) line_height: Pixels,
+    /// The grid the last frame painted, and the snapshot that went with it.
+    /// A frame that cannot have the terminal lock repaints this rather than
+    /// waiting on the pane's reader — see [`TerminalElement::build_grid`].
+    /// Owned per pane rather than kept in one shared scratch buffer, because
+    /// what makes it reusable is that it is still the *previous frame of this
+    /// pane* when the next one starts.
+    pub(super) grid_buf: Vec<RenderCell>,
+    pub(super) grid_snap: Option<GridSnapshot>,
+    /// Terminal mode and selection as of the last frame that got the lock.
+    /// What the *frame* declares — the keymap context it publishes, whether it
+    /// draws a selection — is read from here, so drawing never queues behind
+    /// the pane's reader for two bits it can be one frame late about.
+    /// Everything with a decision to make (a keystroke asking whether a
+    /// full-screen program owns the screen) still asks the terminal itself.
+    frame_alt_screen: bool,
+    frame_has_selection: bool,
     selecting: bool,
     drag_scroll: Option<DragScroll>,
     drag_scroll_epoch: u64,
@@ -1446,6 +1462,10 @@ impl TerminalView {
             line_height_mul,
             cell_width: px(8.),
             line_height: px(17.),
+            grid_buf: Vec::new(),
+            grid_snap: None,
+            frame_alt_screen: false,
+            frame_has_selection: false,
             selecting: false,
             drag_scroll: None,
             drag_scroll_epoch: 0,
@@ -2784,8 +2804,12 @@ impl TerminalView {
         self.terminal.term.lock().selection.is_some()
     }
 
+    /// Whether *this frame* draws a selection. The grid half comes from
+    /// [`Self::sync_frame_facts`] rather than the terminal, which is what keeps
+    /// the draw off the lock; a selection that appears while the reader holds
+    /// it is drawn one frame later.
     fn any_selection(&self) -> bool {
-        self.has_selection() || (self.input_active() && self.cmd.selected_text().is_some())
+        self.frame_has_selection || (self.input_active() && self.cmd.selected_text().is_some())
     }
 
     /// The keymap context this pane declares each frame.
@@ -2797,7 +2821,13 @@ impl TerminalView {
     pub(super) fn key_context(&self) -> gpui::KeyContext {
         let mut context = gpui::KeyContext::new_with_defaults();
         context.add("Terminal");
-        if self.on_alt_screen() {
+        // The frame's own answer, not the terminal's. gpui matches keystrokes
+        // against the context the last painted frame published, so this was
+        // already a frame-old reading of the mode even when it locked; the
+        // chord that must not be a frame late (`AlternatePaste`) asks the
+        // terminal again in `alternate_paste`, which is what that comment
+        // below is about.
+        if self.frame_alt_screen {
             context.add("alt_screen");
         }
         context
@@ -5398,7 +5428,12 @@ impl TerminalView {
             // paint the grid shifted off the row the thumb just picked.
             self.scroll_frac = 0.;
         }
-        let term = self.terminal.term.lock();
+        // Not worth a wait: the scrollbar is a picture of where the grid is,
+        // and a frame that cannot have the lock keeps the picture it drew last
+        // time rather than parking the whole window to refresh a thumb.
+        let Some(term) = self.terminal.term.try_lock_unfair() else {
+            return;
+        };
         let grid = GridScroll {
             history: term.grid().history_size(),
             display_offset: term.grid().display_offset(),
@@ -5407,6 +5442,23 @@ impl TerminalView {
         };
         drop(term);
         self.scroll_handle.sync(grid);
+    }
+
+    /// Re-read the two things the frame itself declares — the terminal mode its
+    /// keymap context is built from, and whether there is a selection to draw.
+    ///
+    /// One `try_lock` at the top of the frame, not one per reader: every
+    /// caller inside `render` would otherwise take the lock separately, and
+    /// each of those is another chance to sit behind the pane's reader with the
+    /// whole window's frame in hand. Failing to get it leaves the previous
+    /// frame's answers in place, which is the same bargain the grid makes in
+    /// [`TerminalElement::build_grid`].
+    fn sync_frame_facts(&mut self) {
+        let Some(term) = self.terminal.term.try_lock_unfair() else {
+            return;
+        };
+        self.frame_alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+        self.frame_has_selection = term.selection.is_some();
     }
 
     /// The scrollback bar, laid down the right edge of the grid.
@@ -6537,6 +6589,7 @@ impl Drop for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_frame_facts();
         self.sync_typeahead_owner();
         self.sync_scrollbar();
         if self.shell_owns_prompt() {
@@ -13364,6 +13417,74 @@ mod gpui_tests {
                 });
             })
             .unwrap();
+    }
+
+    /// Drawing must never queue for the grid lock.
+    ///
+    /// One UI thread paints every pane in every window, and the thread holding
+    /// this lock is the pane's own reader part-way through feeding a batch of
+    /// output into the emulator. A draw that waited for it would wire one
+    /// pane's write speed to the frame rate of the whole window — the read-side
+    /// twin of #709, which was this same thread parked in `write(2)`.
+    ///
+    /// No second thread and no timing: `try_lock` fails against a lock this
+    /// thread already holds, so "the reader has it" is reproduced exactly, with
+    /// nothing to race. The cost of that trade is what a regression looks like
+    /// — put `lock()` back and this test hangs on the re-entry rather than
+    /// failing, which reads as a CI timeout on exactly this name.
+    #[gpui::test]
+    fn a_frame_that_cannot_have_the_grid_leaves_the_previous_one_alone(cx: &mut TestAppContext) {
+        use super::super::element::PaintColors;
+
+        let (_window, view, _daemon) = rooted_harness(cx);
+        let element = TerminalElement::new(view.clone());
+        let mut buf = Vec::new();
+        let build = |cx: &mut TestAppContext, buf: &mut Vec<RenderCell>, must_block: bool| {
+            cx.update(|cx| {
+                let colors = PaintColors::resolve(cx.theme(), cx);
+                element.build_grid(
+                    &colors,
+                    buf,
+                    24,
+                    80,
+                    false,
+                    cx,
+                    1.,
+                    gpui::Rgba::default(),
+                    must_block,
+                )
+            })
+        };
+
+        assert!(
+            build(cx, &mut buf, true).is_some(),
+            "the first frame has no previous grid to stand in for it, so it waits and builds"
+        );
+        assert_eq!(buf.len(), 24 * 80);
+
+        // Shortened so the next call cannot touch the buffer without saying so:
+        // building would `clear` and `resize` it back to a full grid.
+        buf.truncate(3);
+        let term = cx.update(|cx| view.read(cx).terminal.term.clone());
+        let held = term.lock();
+        let refused = build(cx, &mut buf, false);
+        drop(held);
+
+        assert!(
+            refused.is_none(),
+            "a frame that cannot have the lock says so instead of waiting for it"
+        );
+        assert_eq!(
+            buf.len(),
+            3,
+            "the previous frame's cells have to survive for that frame to be painted again"
+        );
+
+        assert!(
+            build(cx, &mut buf, false).is_some(),
+            "with the lock free, a frame builds without being told to wait"
+        );
+        assert_eq!(buf.len(), 24 * 80);
     }
 
     #[gpui::test]
