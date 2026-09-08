@@ -735,6 +735,18 @@ pub(crate) struct WorkspaceRename {
     _subs: Vec<Subscription>,
 }
 
+pub(crate) struct GroupRename {
+    /// The group being renamed, by the key it had when the box opened.
+    ///
+    /// A custom group *is* its name — there is no group record anywhere for
+    /// an id to point at, only the tabs that claim it. So renaming one means
+    /// rewriting every tab that says the old name, and this is what says
+    /// which those are.
+    pub(crate) key: crate::core::group_key::GroupKey,
+    pub(crate) input: Entity<InputState>,
+    pub(crate) _subs: Vec<Subscription>,
+}
+
 pub(crate) struct LoopbackForwardPanelState {
     pub(crate) form_pane_id: Option<u64>,
     pub(crate) managed: Vec<crate::daemon::protocol::ManagedForward>,
@@ -881,6 +893,7 @@ pub struct Tty7App {
     window_bounds: Bounds<Pixels>,
     pub(crate) workspace: WorkspaceId,
     pub(crate) workspace_rename: Option<WorkspaceRename>,
+    pub(crate) group_rename: Option<GroupRename>,
     window_title: std::cell::RefCell<String>,
     pub(crate) connect: Option<crate::ui::remote_workspace::ConnectFlow>,
     pub(crate) switcher: Option<crate::ui::switcher::Switcher>,
@@ -1448,6 +1461,7 @@ impl Tty7App {
             window_bounds: window_bounds_to_remember(window),
             workspace,
             workspace_rename: None,
+            group_rename: None,
             window_title: std::cell::RefCell::new(String::new()),
             connect: None,
             switcher: None,

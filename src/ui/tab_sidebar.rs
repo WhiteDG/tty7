@@ -4,8 +4,8 @@ use gpui::{
     deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::Input;
-use gpui_component::menu::{ContextMenu, ContextMenuExt as _};
+use gpui_component::input::{Input, InputEvent};
+use gpui_component::menu::{ContextMenu, ContextMenuExt as _, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -921,9 +921,20 @@ impl Tty7App {
                         .into_any_element(),
                 })
                 .collect();
+            // A custom group carries a pin. It is the only thing separating
+            // it on sight from a derived one — they behave differently (a
+            // `cd` moves a tab out of a repo group and never out of this
+            // one), and a custom group named after a real repo would
+            // otherwise print a header identical to that repo's.
+            let pinned = group_key.as_ref().is_some_and(GroupKey::is_custom);
+            let renaming_group = self
+                .group_rename
+                .as_ref()
+                .filter(|r| Some(&r.key) == group_key.as_ref())
+                .map(|r| r.input.clone());
             let header = section.name.clone().map(|name| {
                 let label: SharedString = name.to_uppercase().into();
-                h_flex()
+                let bar = h_flex()
                     .id(("sidebar-group", group_ix))
                     .w_full()
                     .items_center()
@@ -966,20 +977,68 @@ impl Tty7App {
                             .xsmall(),
                         ),
                     )
-                    .child(
-                        div()
+                    .when(pinned, |header| {
+                        header.child(
+                            div()
+                                .flex_shrink_0()
+                                .child(Icon::new(IconName::Asterisk).xsmall()),
+                        )
+                    })
+                    .child(match renaming_group {
+                        Some(input) => div()
+                            .id(("sidebar-group-rename", group_ix))
+                            .flex_1()
+                            .min_w_0()
+                            // The header folds the group on click, so a click
+                            // landing in the field would shut the very group
+                            // whose name is being typed — and take the focus
+                            // with it.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(Input::new(&input).appearance(false))
+                            .into_any_element(),
+                        None => div()
                             .flex_shrink(1.)
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(label),
-                    )
+                            .child(label)
+                            .into_any_element(),
+                    })
                     .child(
                         div()
                             .flex_shrink_0()
                             .text_color(cx.theme().muted_foreground.opacity(0.7))
                             .child(row_count.to_string()),
-                    )
+                    );
+                // Renaming is offered on a menu rather than a double click:
+                // the first click of a double would fold the group, so the
+                // name would be edited on a box that just shut. A repo group
+                // gets no menu — it is named after its root, and a rename
+                // there could only lie about where its tabs are.
+                //
+                // Attached last and erased to `AnyElement`, because the menu
+                // wrapper changes the element's type and the two arms have to
+                // agree.
+                match (pinned, group_key.clone()) {
+                    (true, Some(key)) => {
+                        let app = cx.entity().downgrade();
+                        bar.context_menu(move |menu, _window, _cx| {
+                            let app = app.clone();
+                            let key = key.clone();
+                            menu.item(PopupMenuItem::new(t(L10nKey::SidebarRenameGroup)).on_click(
+                                move |_, window, cx| {
+                                    let key = key.clone();
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.start_group_rename(key, window, cx)
+                                    });
+                                },
+                            ))
+                        })
+                        .into_any_element()
+                    }
+                    _ => bar.into_any_element(),
+                }
             });
 
             let block = v_flex()
@@ -1313,6 +1372,149 @@ impl Tty7App {
     /// Fold the sidebar group `key` names, or unfold it if it is already
     /// shut. Persisted: a group folded away is a statement about a repo you
     /// are done with for now, and it should still be shut tomorrow.
+    /// The custom groups that exist right now, in sidebar order.
+    ///
+    /// A group exists only while a tab says it does — there is no list of
+    /// groups anywhere else. That is what makes "move the last tab out" the
+    /// same gesture as "delete the group", and it is the same rule a repo
+    /// group already lives by.
+    ///
+    /// Read off the tabs rather than off [`Self::sidebar_group_keys`] so
+    /// that building a menu never runs the cwd probe, which writes back.
+    pub(crate) fn custom_group_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            if let Some(GroupKey::Custom(name)) = tab.sidebar_group.borrow().as_ref()
+                && !out.iter().any(|n| n == name)
+            {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    /// Put tab `index` in `key`, or hand it back to the cwd probe when `key`
+    /// is `None`.
+    ///
+    /// Clearing is the only way back. A stated group locks the probe out of
+    /// that tab for good, so without a way to clear it a tab moved into a
+    /// custom group could never follow its cwd again — and the user has no
+    /// way to tell that is what they just did.
+    pub(crate) fn set_tab_group(
+        &mut self,
+        index: usize,
+        key: Option<GroupKey>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        *tab.sidebar_group.borrow_mut() = key;
+        // Carries the move to the daemon as a `TabSetGroup`, so another
+        // window on the same workspace sees it too.
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    /// Make a new custom group, put tab `index` in it, and open its header
+    /// for renaming.
+    ///
+    /// No dialog: the tab is in the group before a character is typed, so
+    /// what the name is being given to is on screen while it is chosen. The
+    /// placeholder only has to be unique — the box opens selected, so the
+    /// first keystroke replaces it.
+    pub(crate) fn new_tab_group(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let taken = self.custom_group_names();
+        let base = t(L10nKey::SidebarNewGroupName).to_string();
+        let name = (1..)
+            .map(|n| match n {
+                1 => base.clone(),
+                n => format!("{base} {n}"),
+            })
+            .find(|candidate| !taken.contains(candidate))
+            .expect("an unbounded range always reaches an untaken name");
+        let Some(key) = GroupKey::custom(&name) else {
+            return;
+        };
+        self.set_tab_group(index, Some(key.clone()), cx);
+        self.start_group_rename(key, window, cx);
+    }
+
+    /// Open the header of custom group `key` for renaming.
+    pub(crate) fn start_group_rename(
+        &mut self,
+        key: GroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let GroupKey::Custom(current) = &key else {
+            // A repo group is named after its root. There is nothing to
+            // rename that would not be a lie about where the tabs are.
+            return;
+        };
+        let input = Self::rename_box(current.clone(), window, cx);
+        let subs = vec![cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_group_rename(window, cx)
+                }
+                _ => {}
+            },
+        )];
+        self.group_rename = Some(crate::ui::app::GroupRename {
+            key,
+            input,
+            _subs: subs,
+        });
+        cx.notify();
+    }
+
+    /// Write the typed name onto every tab that claims the old one.
+    ///
+    /// All in one pass. A group is only the set of tabs that name it, so a
+    /// rename that reached half of them would not be a half-renamed group —
+    /// it would be two groups.
+    pub(crate) fn commit_group_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.group_rename.take() else {
+            return;
+        };
+        let value = rename.input.read(cx).value().trim().to_string();
+        // A blank name is not a group. Taking it would drop every tab in it
+        // into Scratch, which is a lot to happen because a box was cleared
+        // and dismissed — so an empty name means "keep the name you had".
+        if let Some(new_key) = GroupKey::custom(&value)
+            && new_key != rename.key
+        {
+            for tab in &self.tabs {
+                let mut group = tab.sidebar_group.borrow_mut();
+                if group.as_ref() == Some(&rename.key) {
+                    *group = Some(new_key.clone());
+                }
+            }
+            // The fold list is keyed by name too, so a shut group that is
+            // renamed would spring open under a key nothing folds any more.
+            let (was, now) = (
+                collapse_key(Some(&rename.key)),
+                collapse_key(Some(&new_key)),
+            );
+            self.update_config(cx, |cfg| {
+                if let Some(at) = cfg.sidebar_collapsed_groups.iter().position(|p| *p == was) {
+                    cfg.sidebar_collapsed_groups[at] = now.clone();
+                }
+            });
+            self.save_session(cx);
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn toggle_sidebar_group(&mut self, key: Option<&GroupKey>, cx: &mut Context<Self>) {
         let id = collapse_key(key);
         self.update_config(cx, |cfg| {
@@ -1401,6 +1603,23 @@ impl Tty7App {
         cwd: Option<&Path>,
         cx: &gpui::App,
     ) -> Option<Option<GroupKey>> {
+        // A tab spawned from one sitting in a custom group joins it, and does
+        // so before the cwd is consulted at all — the cwd says nothing about
+        // a group the user stated by hand.
+        //
+        // Every caller here spawns from the active tab (the two that start
+        // from a named tab activate it first), so that is the one to inherit
+        // from. Without this, ⌘T inside a folded custom group would draw
+        // nothing but the header's count going up by one: the new tab would
+        // land in a repo group somewhere else, and the fold would hide it.
+        if let Some(stated) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.sidebar_group.borrow().clone())
+            .filter(GroupKey::is_custom)
+        {
+            return Some(Some(stated));
+        }
         let cwd = cwd?;
         let host = self
             .window_workspace(cx)
@@ -1691,6 +1910,165 @@ mod fold_tests {
                 GroupKey::custom("work"),
                 "the tab itself was not written over either"
             );
+        });
+    }
+
+    /// The way out. A stated group locks the probe out of that tab, so if
+    /// clearing it did not hand the tab back, a tab moved into a custom
+    /// group could never follow its cwd again.
+    #[gpui::test]
+    fn clearing_a_stated_group_hands_the_tab_back_to_the_probe(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+
+        app.update(&mut vcx, |app, cx| {
+            plant_repo(app, 0, "/w/probed/sub", "/w/probed", cx);
+            app.set_tab_group(0, GroupKey::custom("work"), cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.sidebar_group_keys(cx)[0],
+                GroupKey::custom("work"),
+                "stated, so the probe is locked out"
+            );
+        });
+
+        app.update(&mut vcx, |app, cx| app.set_tab_group(0, None, cx));
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.sidebar_group_keys(cx)[0],
+                Some(GroupKey::Repo(PathBuf::from("/w/probed"))),
+                "cleared, so the probe takes the tab back over"
+            );
+        });
+    }
+
+    /// ⌘T inside a custom group has to land in it. Otherwise the new tab
+    /// goes wherever its cwd says, and if the group it was opened from is
+    /// folded, the only thing that happens on screen is the header's count
+    /// going up by one — the symptom #804 fixed for repo groups.
+    #[gpui::test]
+    fn a_tab_spawned_inside_a_custom_group_joins_it(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+
+        app.update(&mut vcx, |app, cx| {
+            // A probe that would send the tab somewhere else if it were
+            // consulted, so this cannot pass by there being no answer.
+            plant_repo(app, 0, "/w/probed/sub", "/w/probed", cx);
+            app.set_tab_group(0, GroupKey::custom("work"), cx);
+            app.active = 0;
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.spawn_group(Some(&PathBuf::from("/w/probed/sub")), cx),
+                Some(GroupKey::custom("work")),
+                "the stated group is inherited ahead of anything the cwd says"
+            );
+        });
+
+        app.update(&mut vcx, |app, cx| app.set_tab_group(0, None, cx));
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.spawn_group(Some(&PathBuf::from("/w/probed/sub")), cx),
+                Some(Some(GroupKey::Repo(PathBuf::from("/w/probed")))),
+                "and with nothing stated the cwd decides again"
+            );
+        });
+    }
+
+    /// A group is only the set of tabs that name it, so a rename reaching
+    /// half of them would not leave a half-renamed group — it would leave
+    /// two groups.
+    #[gpui::test]
+    fn renaming_a_group_moves_every_tab_in_it_at_once(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+        let work = GroupKey::custom("work").expect("non-blank");
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.set_tab_group(0, Some(work.clone()), cx);
+            app.set_tab_group(1, Some(work.clone()), cx);
+            app.set_tab_group(2, GroupKey::custom("other"), cx);
+            // Shut it, so the fold state has somewhere to be carried from.
+            app.toggle_sidebar_group(Some(&work), cx);
+            app.start_group_rename(work.clone(), window, cx);
+            app.group_rename
+                .as_ref()
+                .expect("the box is up")
+                .input
+                .update(cx, |state, cx| state.set_value("urgent", window, cx));
+            app.commit_group_rename(window, cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            let renamed = GroupKey::custom("urgent");
+            assert_eq!(*app.tabs[0].sidebar_group.borrow(), renamed);
+            assert_eq!(*app.tabs[1].sidebar_group.borrow(), renamed, "both, in one");
+            assert_eq!(
+                *app.tabs[2].sidebar_group.borrow(),
+                GroupKey::custom("other"),
+                "and nothing outside the group moved"
+            );
+            assert_eq!(
+                cx.global::<Config>().sidebar_collapsed_groups,
+                vec!["custom:urgent".to_string()],
+                "a shut group that is renamed stays shut, under its new key"
+            );
+        });
+    }
+
+    /// Clearing the box and dismissing it must not drop a whole group's
+    /// worth of tabs into Scratch.
+    #[gpui::test]
+    fn a_blank_rename_leaves_the_group_alone(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+        let work = GroupKey::custom("work").expect("non-blank");
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.set_tab_group(0, Some(work.clone()), cx);
+            app.start_group_rename(work.clone(), window, cx);
+            app.group_rename
+                .as_ref()
+                .expect("the box is up")
+                .input
+                .update(cx, |state, cx| state.set_value("   ", window, cx));
+            app.commit_group_rename(window, cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, _| {
+            assert_eq!(
+                *app.tabs[0].sidebar_group.borrow(),
+                Some(work),
+                "an empty name means 'keep the one you had'"
+            );
+        });
+    }
+
+    /// The placeholder only has to be unique — the box opens selected, so
+    /// the first keystroke replaces it. But two groups with one name are one
+    /// group, so a second new group must not land on top of the first.
+    #[gpui::test]
+    fn a_second_new_group_does_not_land_on_the_first(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.new_tab_group(0, window, cx);
+            app.new_tab_group(1, window, cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, _| {
+            let names = app.custom_group_names();
+            assert_eq!(names.len(), 2, "two groups, not one shared by both tabs");
+            assert_ne!(names[0], names[1]);
         });
     }
 
