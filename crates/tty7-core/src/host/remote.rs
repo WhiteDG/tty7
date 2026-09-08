@@ -253,6 +253,30 @@ impl Host for RemoteHost {
         })
     }
 
+    /// The peer owns these panes' PTYs, so it is the one that can walk their
+    /// process trees. A peer that does not announce the feature is not asked:
+    /// it would answer `Err` and the caller cannot tell that apart from a pane
+    /// serving nothing.
+    fn pane_procs(&self, pane_id: u64) -> Option<crate::daemon::protocol::PaneProcs> {
+        if !self
+            .peer()
+            .has_feature(crate::daemon::control::feature::PANE_PROCS)
+        {
+            return None;
+        }
+        match self.call(ControlRequest::PaneProcs { pane_id }) {
+            Ok(ReplyOk::PaneProcs(procs)) => Some(procs),
+            Ok(other) => {
+                log::warn!("PaneProcs answered with {other:?}");
+                None
+            }
+            Err(e) => {
+                log::debug!("could not read pane {pane_id}'s processes: {e}");
+                None
+            }
+        }
+    }
+
     fn remove(&self, p: &Path, recursive: bool) -> io::Result<()> {
         self.expect_unit(ControlRequest::Remove {
             path: wire_path(p),

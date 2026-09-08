@@ -28,6 +28,12 @@ pub trait PaneDirectory: Send + Sync {
     fn pane_count(&self) -> u64;
     fn panes(&self) -> Vec<PaneInfo>;
     fn agent_states(&self) -> Vec<PaneAgentState>;
+    /// What is running inside one pane, and what it is listening on.
+    ///
+    /// Answered by whoever owns the pane's PTY, which for a remote workspace
+    /// is this process and not the client's own daemon: the client asks over
+    /// the control link precisely because the processes are here.
+    fn pane_procs(&self, pane_id: u64) -> crate::daemon::protocol::PaneProcs;
 }
 
 #[derive(Clone, Default)]
@@ -368,6 +374,12 @@ fn handshake<R: Read>(
         feature::HOST_RPC.to_string(),
         feature::STDIO_BRIDGE.to_string(),
     ];
+    // Only where there are panes to ask about. A control peer serving no panes
+    // would answer every ask with an empty list, which reads to a client as
+    // "nothing is listening" rather than as "I cannot tell you".
+    if services.panes.is_some() {
+        features.push(feature::PANE_PROCS.to_string());
+    }
     if services.machine.is_some() {
         features.push(feature::MACHINE_TREE.to_string());
     }
@@ -827,6 +839,15 @@ fn run_request(
                 conn.panes
                     .as_ref()
                     .map(|p| p.agent_states())
+                    .unwrap_or_default(),
+            ),
+            Vec::new(),
+        ),
+        ControlRequest::PaneProcs { pane_id } => (
+            ReplyOk::PaneProcs(
+                conn.panes
+                    .as_ref()
+                    .map(|p| p.pane_procs(pane_id))
                     .unwrap_or_default(),
             ),
             Vec::new(),
@@ -1676,6 +1697,23 @@ mod aggregate_tests {
             self.panes.clone()
         }
 
+        fn pane_procs(&self, pane_id: u64) -> crate::daemon::protocol::PaneProcs {
+            crate::daemon::protocol::PaneProcs {
+                procs: vec![crate::daemon::protocol::ProcEntry {
+                    pid: 900 + pane_id as u32,
+                    name: "node".into(),
+                    depth: 0,
+                    foreground: true,
+                }],
+                ports: vec![crate::daemon::protocol::PortEntry {
+                    port: 3000,
+                    pid: 900 + pane_id as u32,
+                    name: "node".into(),
+                    addr: "*".into(),
+                }],
+            }
+        }
+
         fn agent_states(&self) -> Vec<PaneAgentState> {
             vec![PaneAgentState {
                 pane_id: 7,
@@ -1748,6 +1786,45 @@ mod aggregate_tests {
         assert_eq!(states[0].agent, Some(CLIAgent::Claude));
         assert_eq!(states[0].state.status, AgentStatus::Working);
         assert_eq!(states[0].state.session_id.as_deref(), Some("sess-7"));
+    }
+
+    /// A remote workspace's pane runs on the peer, so the peer is the only
+    /// one that can walk its process tree — the client's own daemon has never
+    /// heard of the pane. Without this request its ports were simply invisible.
+    #[test]
+    fn a_peer_says_what_is_listening_inside_one_of_its_panes() {
+        let services = Services {
+            panes: Some(Arc::new(ThreePanesOneAgent { panes: Vec::new() })),
+            ..Services::none()
+        };
+        let client = client_with(services);
+
+        assert!(
+            client.hello().has_feature(feature::PANE_PROCS),
+            "a peer that serves panes has to say it can describe them"
+        );
+        let ReplyOk::PaneProcs(procs) = client
+            .call(ControlRequest::PaneProcs { pane_id: 4 })
+            .unwrap()
+        else {
+            panic!("PaneProcs must answer with ReplyOk::PaneProcs");
+        };
+        assert_eq!(procs.ports.len(), 1);
+        assert_eq!(procs.ports[0].port, 3000);
+        assert_eq!(
+            procs.ports[0].pid, 904,
+            "the answer is about the pane that was asked for"
+        );
+    }
+
+    /// The feature is the client's only way to tell "nothing is listening"
+    /// from "nobody here can tell you", and a process serving no panes is the
+    /// second. Announcing it anyway would draw an empty Ports list over a
+    /// question that was never answered.
+    #[test]
+    fn a_process_with_no_panes_does_not_claim_it_can_list_ports() {
+        let client = client_with(Services::none());
+        assert!(!client.hello().has_feature(feature::PANE_PROCS));
     }
 
     #[test]
