@@ -1828,6 +1828,15 @@ impl TerminalView {
         self.git_status_cwd.as_deref()
     }
 
+    /// Plant the cwd the git-status poll would have found. For tests that
+    /// need a pane to look like it is sitting somewhere known — a real poll
+    /// needs a live shell reporting a directory, which a quiet test pane has
+    /// no way to do.
+    #[cfg(test)]
+    pub(crate) fn set_git_status_cwd_for_test(&mut self, cwd: Option<std::path::PathBuf>) {
+        self.git_status_cwd = cwd;
+    }
+
     /// The directory this pane's *work* is happening in — what every panel
     /// that answers "where am I?" should show.
     ///

@@ -424,7 +424,7 @@ pub struct Tab {
     pub(crate) zoomed: Option<Entity<TerminalView>>,
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
     pub(crate) code: Option<Box<crate::ui::code_editor::TabCode>>,
-    pub(crate) sidebar_group: std::cell::RefCell<Option<std::path::PathBuf>>,
+    pub(crate) sidebar_group: std::cell::RefCell<Option<crate::core::group_key::GroupKey>>,
     pub(crate) overlay_top: OverlayTop,
     /// Whether this tab's document fills the workspace or docks beside the
     /// terminal, once the tab has been told. `None` follows `document_layout`
@@ -496,7 +496,9 @@ impl Tab {
             overlay_top: OverlayTop::default(),
             document_layout: None,
             sidebar_group: std::cell::RefCell::new(
-                tree.sidebar_group.clone().map(std::path::PathBuf::from),
+                tree.sidebar_group
+                    .as_deref()
+                    .and_then(crate::core::group_key::GroupKey::decode),
             ),
             tree_id: std::cell::Cell::new(tree.id),
             last_used: std::cell::Cell::new(0),

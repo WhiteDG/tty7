@@ -1,7 +1,7 @@
 use gpui::{Axis, Bounds, Pixels, Point, Styled, px};
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::rc::Rc;
+use tty7_core::core::group_key::GroupKey;
 use tty7_core::core::machine::TabId;
 
 pub(crate) type ReorderState = Rc<RefCell<Option<Reorder>>>;
@@ -95,7 +95,7 @@ pub(crate) fn suspend(state: &ReorderState, yes: bool) {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Surface {
     Strip,
-    SidebarRows(Option<PathBuf>),
+    SidebarRows(Option<GroupKey>),
     SidebarGroups,
 }
 
