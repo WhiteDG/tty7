@@ -877,6 +877,12 @@ pub struct Tty7App {
     /// the sidebar — and takes no part in the reading.
     pub(crate) strip_slots: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     pub(crate) sidebar_slots: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// Where each custom group's block was drawn last frame, so a tab held
+    /// over one can be told which group it is over. Only custom groups are
+    /// here: a repo group's membership is decided by cwd, so dropping a tab
+    /// into one has no meaning to record.
+    pub(crate) sidebar_group_slots:
+        Rc<RefCell<Vec<(crate::core::group_key::GroupKey, Bounds<Pixels>)>>>,
     /// Where the active tab's panes were last drawn, which is the frame of
     /// reference a drag's landing is worked out in.
     pub(crate) pane_area: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -1450,6 +1456,7 @@ impl Tty7App {
             pane_detach: Cell::new(None),
             strip_slots: Rc::new(RefCell::new(Vec::new())),
             sidebar_slots: Rc::new(RefCell::new(Vec::new())),
+            sidebar_group_slots: Rc::new(RefCell::new(Vec::new())),
             pane_area: Rc::new(Cell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
@@ -7205,10 +7212,16 @@ impl Render for Tty7App {
         } else {
             // Taken first either way: this is what ends the drag, and the merge
             // below must not find the tab it just moved still in the air.
-            let order = crate::ui::reorder::take_pending(&self.reorder);
+            let landed = crate::ui::reorder::take_landed(&self.reorder);
             if let Some((tab, zone)) = self.tab_merge.take() {
                 self.merge_tab(tab, zone, window, cx);
-            } else if let Some(order) = order {
+            } else if let Some((tab, key)) = landed.regroup {
+                // A drop into another group outranks the reordering the drag
+                // did on its way out of the one it came from. The pointer
+                // left that group; the shuffle it caused before leaving is
+                // not what was being asked for.
+                self.regroup_tab(tab, key, cx);
+            } else if let Some(order) = landed.order {
                 self.apply_tab_order(&order, cx);
             }
             // Also what ends the pane drag, so it is taken whichever of the two

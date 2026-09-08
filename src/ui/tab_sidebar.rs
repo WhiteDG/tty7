@@ -148,6 +148,19 @@ impl Tty7App {
         // search — or hidden with its collapsed group — must leave no rectangle
         // behind for a pane to be dropped between.
         *self.sidebar_slots.borrow_mut() = vec![Bounds::default(); self.tabs.len()];
+        // Read before it is blanked: the rectangles a tab held over the
+        // sidebar is measured against are the ones drawn last frame, the
+        // same way a pane dropped here is. Blanked and written again below
+        // so a group that folds or filters away stops accepting drops.
+        let over_group = self.sidebar_regroup_target(window);
+        let lifting_row = crate::ui::reorder::dragged_sidebar_tab(&self.reorder).is_some();
+        // Offered every frame the pointer is over a group, and cleared with
+        // the rest of the drag's pending state on the frames it is not — so
+        // letting go anywhere else drops on nothing.
+        if let Some(key) = over_group.clone() {
+            crate::ui::reorder::set_regroup(&self.reorder, key);
+        }
+        self.sidebar_group_slots.borrow_mut().clear();
         // Every group drops itself when its rows filter out, so a query that
         // matches nothing left the sidebar showing only its own search box.
         let mut any_rows = false;
@@ -1041,6 +1054,12 @@ impl Tty7App {
                 }
             });
 
+            // A tab in the air makes the difference between the two kinds of
+            // group visible: the ones that can take it stay lit, the ones
+            // that cannot fade back. Until a drag is under way they look
+            // alike, and this is where a user finds out which is which
+            // without being told.
+            let takes_drops = group_key.as_ref().is_some_and(GroupKey::is_custom);
             let block = v_flex()
                 .w_full()
                 .gap(px(ROW_GAP))
@@ -1050,6 +1069,10 @@ impl Tty7App {
                         .is_some_and(|p| Some(p.from) == group_slot),
                     |b| b.opacity(0.75),
                 )
+                .when(lifting_row && !takes_drops, |b| b.opacity(0.4))
+                .when(over_group.is_some() && over_group == group_key, |b| {
+                    b.rounded_md().bg(cx.theme().drag_border.opacity(0.15))
+                })
                 .children(header)
                 .children(rows)
                 .when_some(group_slot, |block, slot| {
@@ -1057,9 +1080,17 @@ impl Tty7App {
                         canvas(
                             {
                                 let slots = group_slots.clone();
+                                let landing = self.sidebar_group_slots.clone();
+                                // Only a custom group is recorded, so a drag
+                                // looking for somewhere to land finds nothing
+                                // over a repo group or over Scratch.
+                                let key = group_key.clone().filter(GroupKey::is_custom);
                                 move |bounds, _window, _cx| {
                                     if let Some(s) = slots.borrow_mut().get_mut(slot) {
                                         *s = bounds;
+                                    }
+                                    if let Some(key) = key.clone() {
+                                        landing.borrow_mut().push((key, bounds));
                                     }
                                 }
                             },
@@ -1372,6 +1403,34 @@ impl Tty7App {
     /// Fold the sidebar group `key` names, or unfold it if it is already
     /// shut. Persisted: a group folded away is a statement about a repo you
     /// are done with for now, and it should still be shut tomorrow.
+    /// The custom group a tab being dragged is currently held over, if any.
+    ///
+    /// Answers `None` unless a tab is in the air, the pointer is inside a
+    /// custom group's block, and that is not the group the tab is already in
+    /// — a drag that would change nothing offers nothing, so it falls back
+    /// to plain reordering.
+    ///
+    /// Only custom groups are candidates. A repo group's membership is
+    /// decided by its tabs' cwds, so "put this tab in tty7" is a request the
+    /// sidebar has no honest way to honour; those blocks are never recorded,
+    /// so the pointer finds nothing over them. The same goes for Scratch,
+    /// which is where tabs land when no group claims them.
+    fn sidebar_regroup_target(&self, window: &Window) -> Option<GroupKey> {
+        let dragged = crate::ui::reorder::dragged_sidebar_tab(&self.reorder)?;
+        let here = self
+            .tabs
+            .iter()
+            .find(|t| t.tree_id.get() == dragged)
+            .and_then(|t| t.sidebar_group.borrow().clone());
+        let pointer = window.mouse_position();
+        self.sidebar_group_slots
+            .borrow()
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&pointer))
+            .map(|(key, _)| key.clone())
+            .filter(|key| Some(key) != here.as_ref())
+    }
+
     /// The custom groups that exist right now, in sidebar order.
     ///
     /// A group exists only while a tab says it does — there is no list of
@@ -1391,6 +1450,22 @@ impl Tty7App {
             }
         }
         out
+    }
+
+    /// Put the dragged tab in the group it was dropped on.
+    ///
+    /// By id rather than index: a drag is several frames long, and a tab
+    /// closing anywhere else in that time would shift every index after it.
+    pub(crate) fn regroup_tab(
+        &mut self,
+        tab: tty7_core::core::machine::TabId,
+        key: GroupKey,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|t| t.tree_id.get() == tab) else {
+            return;
+        };
+        self.set_tab_group(index, Some(key), cx);
     }
 
     /// Put tab `index` in `key`, or hand it back to the cwd probe when `key`
@@ -1660,7 +1735,7 @@ struct Section {
 fn sidebar_sections(keys: &[Option<GroupKey>]) -> Vec<Section> {
     let mut group_order: Vec<&GroupKey> = Vec::new();
     for k in keys.iter().flatten() {
-        if !group_order.iter().any(|g| *g == k) {
+        if !group_order.contains(&k) {
             group_order.push(k);
         }
     }
@@ -1731,7 +1806,7 @@ fn regrouped_order(
     }
     let mut order: Vec<&GroupKey> = Vec::new();
     for k in keys.iter().flatten() {
-        if !order.iter().any(|g| *g == k) {
+        if !order.contains(&k) {
             order.push(k);
         }
     }
@@ -1942,6 +2017,42 @@ mod fold_tests {
                 app.sidebar_group_keys(cx)[0],
                 Some(GroupKey::Repo(PathBuf::from("/w/probed"))),
                 "cleared, so the probe takes the tab back over"
+            );
+        });
+    }
+
+    /// A drag is several frames long, so the tab it is carrying is named by
+    /// id. Were it an index, any tab closing before the drop — in another
+    /// window on the same workspace, or by a shell exiting — would shift it,
+    /// and the drop would land on whichever tab slid into that slot.
+    #[gpui::test]
+    fn a_drop_finds_its_tab_after_the_indexes_shift(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+
+        let dragged = app.update(&mut vcx, |app, _| app.tabs[2].tree_id.get());
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.close_tab(0, window, cx);
+            app.regroup_tab(dragged, GroupKey::custom("work").expect("non-blank"), cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, _| {
+            let moved = app
+                .tabs
+                .iter()
+                .find(|t| t.tree_id.get() == dragged)
+                .expect("the dragged tab is still open");
+            assert_eq!(
+                *moved.sidebar_group.borrow(),
+                GroupKey::custom("work"),
+                "the tab that was picked up is the tab that moved"
+            );
+            assert!(
+                app.tabs
+                    .iter()
+                    .filter(|t| t.tree_id.get() != dragged)
+                    .all(|t| t.sidebar_group.borrow().is_none()),
+                "and no bystander was regrouped in its place"
             );
         });
     }
