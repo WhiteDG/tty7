@@ -1135,6 +1135,9 @@ impl Tty7App {
             );
         }
 
+        // Empty chrome until the pointer is over the rail: these two tiles are
+        // the only thing between a resting window and a bare column of tabs.
+        let chrome_shown = self.sidebar_chrome_hover.get();
         let controls = h_flex()
             .flex_shrink_0()
             .h(px(TITLE_BAR_HEIGHT))
@@ -1157,24 +1160,29 @@ impl Tty7App {
                 div()
                     .occlude()
                     .flex_shrink_0()
+                    .when(!chrome_shown, |tile| tile.invisible())
                     .child(self.new_tab_button("sidebar-add", cx)),
             )
             .child(
-                div().occlude().flex_shrink_0().child(
-                    crate::ui::tab_strip::chrome_tile(
-                        Button::new("sidebar-collapse")
-                            .icon(Icon::empty().path("icons/panel-left.svg")),
-                        false,
-                        cx,
-                    )
-                    .rounded_lg()
-                    .tooltip_element(crate::ui::tab_strip::chord_tooltip(
-                        t(L10nKey::TabTooltipHideSidebar),
-                        "ToggleLeftPanel",
-                        cx,
-                    ))
-                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
-                ),
+                div()
+                    .occlude()
+                    .flex_shrink_0()
+                    .when(!chrome_shown, |tile| tile.invisible())
+                    .child(
+                        crate::ui::tab_strip::chrome_tile(
+                            Button::new("sidebar-collapse")
+                                .icon(Icon::empty().path("icons/panel-left.svg")),
+                            false,
+                            cx,
+                        )
+                        .rounded_lg()
+                        .tooltip_element(crate::ui::tab_strip::chord_tooltip(
+                            t(L10nKey::TabTooltipHideSidebar),
+                            "ToggleLeftPanel",
+                            cx,
+                        ))
+                        .on_click(cx.listener(|this, _, _window, cx| this.toggle_left_panel(cx))),
+                    ),
             );
         // The tile inside asks for `w_full`, and a percentage is only a width
         // while some box above it has a real one. This row used to have none of
@@ -1345,6 +1353,10 @@ impl Tty7App {
                     )),
             )
             .child(handle)
+            .child(crate::ui::app::hover_sheet(
+                "sidebar-chrome-hover",
+                &self.sidebar_chrome_hover,
+            ))
     }
 
     /// What the sidebar row hid: the full title, the full branch and diff

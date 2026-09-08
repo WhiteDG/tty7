@@ -441,9 +441,14 @@ impl Tty7App {
                     .items_center()
                     .gap(px(2.))
                     .pl(px(tile_trailing_inset()))
+                    .relative()
                     .children(self.right_panel_tabs(cx))
                     .child(div().flex_1())
-                    .child(self.window_chrome(window, cx))
+                    .child(self.window_chrome(self.panel_chrome_hover.get(), window, cx))
+                    .child(crate::ui::app::hover_sheet(
+                        "panel-chrome-hover",
+                        &self.panel_chrome_hover,
+                    ))
                 }))
                 .child(body)
                 .children(self.sftp_transfers_footer(cx))
