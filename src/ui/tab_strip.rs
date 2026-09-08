@@ -1301,14 +1301,11 @@ impl Tty7App {
                         gpui::svg()
                             .path(agent.icon_path())
                             .size(px(size * 0.54))
-                            // SVG assets are rendered as a single-colour mask.
-                            // TraeCode's black field comes from the avatar, and
-                            // its brand mark uses the official green.
-                            .text_color(if agent == crate::core::cli_agent::CLIAgent::TraeCode {
-                                gpui::rgb(0x32F08C)
-                            } else {
-                                gpui::rgb(0xFFFFFF)
-                            }),
+                            // SVG assets render as a single-colour mask, so
+                            // the mark's colour comes from the agent rather
+                            // than from the file. The tray icon reads the same
+                            // answer.
+                            .text_color(gpui::rgb(agent.icon_rgb())),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
                     .tooltip(move |window, cx| {

@@ -460,6 +460,25 @@ impl CLIAgent {
         }
     }
 
+    /// The colour the agent's mark is drawn in.
+    ///
+    /// SVG assets render as a single-colour mask, so whatever `fill` the file
+    /// carries is thrown away and the colour has to come from here. It lives
+    /// next to [`Self::accent_rgb`] rather than at either draw site because
+    /// there are two of those — the tab avatar and the tray icon — and a mark
+    /// that answers differently depending on which one is asking is the same
+    /// agent wearing two faces.
+    ///
+    /// White for every mark that is a silhouette sitting on its brand colour.
+    /// TraeCode is the one whose mark is the coloured half of the pair, on an
+    /// accent that is deliberately black.
+    pub fn icon_rgb(self) -> u32 {
+        match self {
+            CLIAgent::TraeCode => 0x32F08C,
+            _ => 0xFFFFFF,
+        }
+    }
+
     pub fn icon_path(self) -> &'static str {
         match self {
             CLIAgent::Claude => "icons/agents/claude.svg",
