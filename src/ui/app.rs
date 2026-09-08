@@ -424,7 +424,7 @@ pub struct Tab {
     pub(crate) zoomed: Option<Entity<TerminalView>>,
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
     pub(crate) code: Option<Box<crate::ui::code_editor::TabCode>>,
-    pub(crate) sidebar_group: std::cell::RefCell<Option<std::path::PathBuf>>,
+    pub(crate) sidebar_group: std::cell::RefCell<Option<crate::core::group_key::GroupKey>>,
     pub(crate) overlay_top: OverlayTop,
     /// Whether this tab's document fills the workspace or docks beside the
     /// terminal, once the tab has been told. `None` follows `document_layout`
@@ -496,7 +496,9 @@ impl Tab {
             overlay_top: OverlayTop::default(),
             document_layout: None,
             sidebar_group: std::cell::RefCell::new(
-                tree.sidebar_group.clone().map(std::path::PathBuf::from),
+                tree.sidebar_group
+                    .as_deref()
+                    .and_then(crate::core::group_key::GroupKey::decode),
             ),
             tree_id: std::cell::Cell::new(tree.id),
             last_used: std::cell::Cell::new(0),
@@ -733,6 +735,18 @@ pub(crate) struct WorkspaceRename {
     _subs: Vec<Subscription>,
 }
 
+pub(crate) struct GroupRename {
+    /// The group being renamed, by the key it had when the box opened.
+    ///
+    /// A custom group *is* its name — there is no group record anywhere for
+    /// an id to point at, only the tabs that claim it. So renaming one means
+    /// rewriting every tab that says the old name, and this is what says
+    /// which those are.
+    pub(crate) key: crate::core::group_key::GroupKey,
+    pub(crate) input: Entity<InputState>,
+    pub(crate) _subs: Vec<Subscription>,
+}
+
 pub(crate) struct LoopbackForwardPanelState {
     pub(crate) form_pane_id: Option<u64>,
     pub(crate) managed: Vec<crate::daemon::protocol::ManagedForward>,
@@ -867,6 +881,12 @@ pub struct Tty7App {
     /// the sidebar — and takes no part in the reading.
     pub(crate) strip_slots: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     pub(crate) sidebar_slots: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// Where each custom group's block was drawn last frame, so a tab held
+    /// over one can be told which group it is over. Only custom groups are
+    /// here: a repo group's membership is decided by cwd, so dropping a tab
+    /// into one has no meaning to record.
+    pub(crate) sidebar_group_slots:
+        Rc<RefCell<Vec<(crate::core::group_key::GroupKey, Bounds<Pixels>)>>>,
     /// Where the active tab's panes were last drawn, which is the frame of
     /// reference a drag's landing is worked out in.
     pub(crate) pane_area: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -883,6 +903,7 @@ pub struct Tty7App {
     window_bounds: Bounds<Pixels>,
     pub(crate) workspace: WorkspaceId,
     pub(crate) workspace_rename: Option<WorkspaceRename>,
+    pub(crate) group_rename: Option<GroupRename>,
     window_title: std::cell::RefCell<String>,
     pub(crate) connect: Option<crate::ui::remote_workspace::ConnectFlow>,
     pub(crate) switcher: Option<crate::ui::switcher::Switcher>,
@@ -1440,6 +1461,7 @@ impl Tty7App {
             pane_detach: Cell::new(None),
             strip_slots: Rc::new(RefCell::new(Vec::new())),
             sidebar_slots: Rc::new(RefCell::new(Vec::new())),
+            sidebar_group_slots: Rc::new(RefCell::new(Vec::new())),
             pane_area: Rc::new(Cell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
@@ -1451,6 +1473,7 @@ impl Tty7App {
             window_bounds: window_bounds_to_remember(window),
             workspace,
             workspace_rename: None,
+            group_rename: None,
             window_title: std::cell::RefCell::new(String::new()),
             connect: None,
             switcher: None,
@@ -7223,10 +7246,16 @@ impl Render for Tty7App {
         } else {
             // Taken first either way: this is what ends the drag, and the merge
             // below must not find the tab it just moved still in the air.
-            let order = crate::ui::reorder::take_pending(&self.reorder);
+            let landed = crate::ui::reorder::take_landed(&self.reorder);
             if let Some((tab, zone)) = self.tab_merge.take() {
                 self.merge_tab(tab, zone, window, cx);
-            } else if let Some(order) = order {
+            } else if let Some((tab, key)) = landed.regroup {
+                // A drop into another group outranks the reordering the drag
+                // did on its way out of the one it came from. The pointer
+                // left that group; the shuffle it caused before leaving is
+                // not what was being asked for.
+                self.regroup_tab(tab, key, cx);
+            } else if let Some(order) = landed.order {
                 self.apply_tab_order(&order, cx);
             }
             // Also what ends the pane drag, so it is taken whichever of the two

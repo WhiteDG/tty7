@@ -6,6 +6,7 @@ pub mod config;
 pub mod crash;
 pub mod git;
 pub mod gitignore;
+pub mod group_key;
 #[allow(dead_code)]
 pub mod keychain;
 pub mod kitty_graphics;

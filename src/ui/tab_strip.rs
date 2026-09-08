@@ -17,7 +17,8 @@ use crate::core::actions::{
     SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6,
     SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight, TogglePalette,
 };
-use crate::core::config::RightPanelTab;
+use crate::core::config::{Config, RightPanelTab, SidebarGrouping};
+use crate::core::group_key::GroupKey;
 use crate::core::shells::DetectedShell;
 use crate::daemon::protocol::ShellSpec;
 use crate::ui::app::{SpawnWhere, TILE_GLYPH, TILE_SIZE, Tab, Tty7App, tile_trailing_inset};
@@ -1496,6 +1497,61 @@ impl Tty7App {
                         }
                     }),
             );
+        }
+
+        // Where this tab sits, and where it could be put instead.
+        //
+        // Laid out flat rather than behind a "Move to Group ▸" submenu: there
+        // are never many custom groups — they are maintained by hand — so a
+        // submenu would cost a second click to show two or three items, and
+        // `PopupMenu::submenu` wants a `&mut Context` this function does not
+        // have. The label above them says what the block is.
+        //
+        // Hidden entirely when grouping is off. The sidebar draws no headers
+        // then, so "move to group" would name something the user cannot see.
+        if cx.global::<Config>().sidebar_grouping != SidebarGrouping::None {
+            let stated = this
+                .tabs
+                .get(index)
+                .and_then(|t| t.sidebar_group.borrow().clone());
+            let here = match &stated {
+                Some(GroupKey::Custom(name)) => Some(name.clone()),
+                _ => None,
+            };
+            menu = menu
+                .separator()
+                .item(PopupMenuItem::label(t(L10nKey::SidebarMoveToGroup)));
+            for name in this.custom_group_names() {
+                menu = menu.item(
+                    PopupMenuItem::new(name.clone())
+                        .checked(here.as_deref() == Some(name.as_str()))
+                        .on_click({
+                            let app = app.clone();
+                            let name = name.clone();
+                            move |_, _window, cx| {
+                                let key = GroupKey::custom(&name);
+                                let _ =
+                                    app.update(cx, |this, cx| this.set_tab_group(index, key, cx));
+                            }
+                        }),
+                );
+            }
+            menu = menu.item(PopupMenuItem::new(t(L10nKey::SidebarNewGroup)).on_click({
+                let app = app.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| this.new_tab_group(index, window, cx));
+                }
+            }));
+            // Only worth offering once there is something to undo. A tab that
+            // never left its derived group is already grouped automatically.
+            if here.is_some() {
+                menu = menu.item(PopupMenuItem::new(t(L10nKey::SidebarAutoGroup)).on_click({
+                    let app = app.clone();
+                    move |_, _window, cx| {
+                        let _ = app.update(cx, |this, cx| this.set_tab_group(index, None, cx));
+                    }
+                }));
+            }
         }
 
         let in_repo = this.tab_is_in_repo(index, window, cx);

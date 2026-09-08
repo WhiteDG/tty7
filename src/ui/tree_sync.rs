@@ -11,6 +11,7 @@ use tty7_core::core::machine::{
 use tty7_core::daemon::control::{ControlClient, ControlRequest, ReplyOk};
 use tty7_core::host::HostId;
 
+use crate::core::group_key::GroupKey;
 use crate::core::session::{Session, SessionPane, SessionTab, WorkspaceId, WorkspaceStore};
 use crate::ui::app::Tty7App;
 use crate::ui::i18n::{L10nKey, t};
@@ -132,11 +133,7 @@ pub(crate) fn desired_tabs(
         out.push(DesiredTab {
             id,
             name: tab.name.clone(),
-            group: tab
-                .sidebar_group
-                .borrow()
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
+            group: tab.sidebar_group.borrow().as_ref().map(GroupKey::encode),
             root,
         });
     }
@@ -1517,7 +1514,7 @@ pub(crate) fn session_from_tree(
         .map(|tab| SessionTab {
             name: tab.name.clone(),
             tree_id: Some(tab.id),
-            sidebar_group: tab.sidebar_group.clone().map(std::path::PathBuf::from),
+            sidebar_group: tab.sidebar_group.as_deref().and_then(GroupKey::decode),
             pane: session_pane_from_node(&tab.root, panes),
         })
         .collect();
@@ -2476,7 +2473,7 @@ impl Tty7App {
             LayoutDelta::TabRegrouped { tab, group } => {
                 if let Some(index) = index_of(&self.tabs, *tab) {
                     *self.tabs[index].sidebar_group.borrow_mut() =
-                        group.clone().map(std::path::PathBuf::from);
+                        group.as_deref().and_then(GroupKey::decode);
                 }
                 true
             }
@@ -2579,7 +2576,7 @@ impl Tty7App {
         let gui = &mut self.tabs[index];
         gui.pane = pane;
         gui.name = tab.name.clone();
-        *gui.sidebar_group.borrow_mut() = tab.sidebar_group.clone().map(std::path::PathBuf::from);
+        *gui.sidebar_group.borrow_mut() = tab.sidebar_group.as_deref().and_then(GroupKey::decode);
         self.maximized = None;
         true
     }

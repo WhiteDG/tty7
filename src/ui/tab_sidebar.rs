@@ -4,8 +4,8 @@ use gpui::{
     deferred, div, ease_out_quint, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::Input;
-use gpui_component::menu::{ContextMenu, ContextMenuExt as _};
+use gpui_component::input::{Input, InputEvent};
+use gpui_component::menu::{ContextMenu, ContextMenuExt as _, PopupMenuItem};
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 use crate::core::config::{Config, SidebarGrouping};
+use crate::core::group_key::{GroupKey, collapse_key};
 use crate::terminal::git_status::GitStatusCache;
 use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
 use crate::ui::hints::tab_badge_label;
@@ -147,6 +148,19 @@ impl Tty7App {
         // search — or hidden with its collapsed group — must leave no rectangle
         // behind for a pane to be dropped between.
         *self.sidebar_slots.borrow_mut() = vec![Bounds::default(); self.tabs.len()];
+        // Read before it is blanked: the rectangles a tab held over the
+        // sidebar is measured against are the ones drawn last frame, the
+        // same way a pane dropped here is. Blanked and written again below
+        // so a group that folds or filters away stops accepting drops.
+        let over_group = self.sidebar_regroup_target(window);
+        let lifting_row = crate::ui::reorder::dragged_sidebar_tab(&self.reorder).is_some();
+        // Offered every frame the pointer is over a group, and cleared with
+        // the rest of the drag's pending state on the frames it is not — so
+        // letting go anywhere else drops on nothing.
+        if let Some(key) = over_group.clone() {
+            crate::ui::reorder::set_regroup(&self.reorder, key);
+        }
+        self.sidebar_group_slots.borrow_mut().clear();
         // Every group drops itself when its rows filter out, so a query that
         // matches nothing left the sidebar showing only its own search box.
         let mut any_rows = false;
@@ -162,7 +176,7 @@ impl Tty7App {
             .py_1p5()
             .gap_0p5();
 
-        let keys: Rc<Vec<Option<PathBuf>>> = Rc::new(self.sidebar_group_keys(cx));
+        let keys: Rc<Vec<Option<GroupKey>>> = Rc::new(self.sidebar_group_keys(cx));
         let sections = sidebar_sections(&keys);
         // A search outranks a fold. Typing something that matches a row inside
         // a folded group has to show that row — a box that says nothing
@@ -235,33 +249,41 @@ impl Tty7App {
         };
         let rem = window.rem_size().as_f32();
         let rendered = |ix: &usize| !visible_by_section[*ix].is_empty();
-        let repo_slots: Vec<usize> = (0..sections.len())
+        // Every section that owns a key — a repo root or a custom name — draws
+        // a header, and a header is what there is to grab, so these are the
+        // slots the group-reorder surface runs over. Scratch is excluded: it
+        // is where the keyless tabs fall, and it always sits last.
+        let keyed_slots: Vec<usize> = (0..sections.len())
             .filter(|&ix| sections[ix].key.is_some())
             .filter(rendered)
             .collect();
-        let repo_groups = repo_slots.len();
+        let keyed_groups = keyed_slots.len();
         let group_slots: Rc<RefCell<Vec<Bounds<Pixels>>>> =
-            Rc::new(RefCell::new(vec![Bounds::default(); repo_groups]));
-        let group_preview =
-            reorder::preview(&self.reorder, &Surface::SidebarGroups, repo_groups, pointer);
-        let repo_roots: Vec<PathBuf> = repo_slots
+            Rc::new(RefCell::new(vec![Bounds::default(); keyed_groups]));
+        let group_preview = reorder::preview(
+            &self.reorder,
+            &Surface::SidebarGroups,
+            keyed_groups,
+            pointer,
+        );
+        let keyed_keys: Vec<GroupKey> = keyed_slots
             .iter()
             .filter_map(|&ix| sections[ix].key.clone())
             .collect();
         let slot_display: Vec<usize> = match &group_preview {
             Some(p) => {
-                if let (Some(from), Some(to)) = (repo_roots.get(p.from), repo_roots.get(p.target))
+                if let (Some(from), Some(to)) = (keyed_keys.get(p.from), keyed_keys.get(p.target))
                     && let Some(order) = regrouped_order(&keys, from, to)
                 {
                     reorder::set_pending(&self.reorder, &Surface::SidebarGroups, order);
                 }
                 p.order.clone()
             }
-            None => (0..repo_groups).collect(),
+            None => (0..keyed_groups).collect(),
         };
         let mut blocks: Vec<(Option<usize>, usize)> = slot_display
             .into_iter()
-            .map(|slot| (Some(slot), repo_slots[slot]))
+            .map(|slot| (Some(slot), keyed_slots[slot]))
             .collect();
         blocks.extend(
             (0..sections.len())
@@ -277,7 +299,8 @@ impl Tty7App {
             // nothing to click otherwise, and the one headerless section (the
             // whole sidebar, when grouping is off) must never answer to the
             // scratch group's key.
-            let folded = section.name.is_some() && folded_keys.contains(&collapse_key(&group_key));
+            let folded =
+                section.name.is_some() && folded_keys.contains(&collapse_key(group_key.as_ref()));
             let mut rows: Vec<ContextMenu<Stateful<Div>>> = Vec::new();
             // The header keeps counting every row the group has; folding only
             // stops them being drawn. Nothing downstream then registers a
@@ -908,9 +931,20 @@ impl Tty7App {
                         .into_any_element(),
                 })
                 .collect();
+            // A custom group carries a pin. It is the only thing separating
+            // it on sight from a derived one — they behave differently (a
+            // `cd` moves a tab out of a repo group and never out of this
+            // one), and a custom group named after a real repo would
+            // otherwise print a header identical to that repo's.
+            let pinned = group_key.as_ref().is_some_and(GroupKey::is_custom);
+            let renaming_group = self
+                .group_rename
+                .as_ref()
+                .filter(|r| Some(&r.key) == group_key.as_ref())
+                .map(|r| r.input.clone());
             let header = section.name.clone().map(|name| {
                 let label: SharedString = name.to_uppercase().into();
-                h_flex()
+                let bar = h_flex()
                     .id(("sidebar-group", group_ix))
                     .w_full()
                     .items_center()
@@ -924,7 +958,7 @@ impl Tty7App {
                     .hover(|s| s.text_color(cx.theme().foreground))
                     .on_click(cx.listener({
                         let key = group_key.clone();
-                        move |this, _, _window, cx| this.toggle_sidebar_group(&key, cx)
+                        move |this, _, _window, cx| this.toggle_sidebar_group(key.as_ref(), cx)
                     }))
                     .when_some(group_slot, |header, slot| {
                         crate::ui::reorder::cursor_grab(header).on_drag(DragGroup, {
@@ -953,22 +987,76 @@ impl Tty7App {
                             .xsmall(),
                         ),
                     )
-                    .child(
-                        div()
+                    .when(pinned, |header| {
+                        header.child(
+                            div()
+                                .flex_shrink_0()
+                                .child(Icon::new(IconName::Asterisk).xsmall()),
+                        )
+                    })
+                    .child(match renaming_group {
+                        Some(input) => div()
+                            .id(("sidebar-group-rename", group_ix))
+                            .flex_1()
+                            .min_w_0()
+                            // The header folds the group on click, so a click
+                            // landing in the field would shut the very group
+                            // whose name is being typed — and take the focus
+                            // with it.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(Input::new(&input).appearance(false))
+                            .into_any_element(),
+                        None => div()
                             .flex_shrink(1.)
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(label),
-                    )
+                            .child(label)
+                            .into_any_element(),
+                    })
                     .child(
                         div()
                             .flex_shrink_0()
                             .text_color(cx.theme().muted_foreground.opacity(0.7))
                             .child(row_count.to_string()),
-                    )
+                    );
+                // Renaming is offered on a menu rather than a double click:
+                // the first click of a double would fold the group, so the
+                // name would be edited on a box that just shut. A repo group
+                // gets no menu — it is named after its root, and a rename
+                // there could only lie about where its tabs are.
+                //
+                // Attached last and erased to `AnyElement`, because the menu
+                // wrapper changes the element's type and the two arms have to
+                // agree.
+                match (pinned, group_key.clone()) {
+                    (true, Some(key)) => {
+                        let app = cx.entity().downgrade();
+                        bar.context_menu(move |menu, _window, _cx| {
+                            let app = app.clone();
+                            let key = key.clone();
+                            menu.item(PopupMenuItem::new(t(L10nKey::SidebarRenameGroup)).on_click(
+                                move |_, window, cx| {
+                                    let key = key.clone();
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.start_group_rename(key, window, cx)
+                                    });
+                                },
+                            ))
+                        })
+                        .into_any_element()
+                    }
+                    _ => bar.into_any_element(),
+                }
             });
 
+            // A tab in the air makes the difference between the two kinds of
+            // group visible: the ones that can take it stay lit, the ones
+            // that cannot fade back. Until a drag is under way they look
+            // alike, and this is where a user finds out which is which
+            // without being told.
+            let takes_drops = group_key.as_ref().is_some_and(GroupKey::is_custom);
             let block = v_flex()
                 .w_full()
                 .gap(px(ROW_GAP))
@@ -978,6 +1066,10 @@ impl Tty7App {
                         .is_some_and(|p| Some(p.from) == group_slot),
                     |b| b.opacity(0.75),
                 )
+                .when(lifting_row && !takes_drops, |b| b.opacity(0.4))
+                .when(over_group.is_some() && over_group == group_key, |b| {
+                    b.rounded_md().bg(cx.theme().drag_border.opacity(0.15))
+                })
                 .children(header)
                 .children(rows)
                 .when_some(group_slot, |block, slot| {
@@ -985,9 +1077,17 @@ impl Tty7App {
                         canvas(
                             {
                                 let slots = group_slots.clone();
+                                let landing = self.sidebar_group_slots.clone();
+                                // Only a custom group is recorded, so a drag
+                                // looking for somewhere to land finds nothing
+                                // over a repo group or over Scratch.
+                                let key = group_key.clone().filter(GroupKey::is_custom);
                                 move |bounds, _window, _cx| {
                                     if let Some(s) = slots.borrow_mut().get_mut(slot) {
                                         *s = bounds;
+                                    }
+                                    if let Some(key) = key.clone() {
+                                        landing.borrow_mut().push((key, bounds));
                                     }
                                 }
                             },
@@ -1300,7 +1400,194 @@ impl Tty7App {
     /// Fold the sidebar group `key` names, or unfold it if it is already
     /// shut. Persisted: a group folded away is a statement about a repo you
     /// are done with for now, and it should still be shut tomorrow.
-    pub(crate) fn toggle_sidebar_group(&mut self, key: &Option<PathBuf>, cx: &mut Context<Self>) {
+    /// The custom group a tab being dragged is currently held over, if any.
+    ///
+    /// Answers `None` unless a tab is in the air, the pointer is inside a
+    /// custom group's block, and that is not the group the tab is already in
+    /// — a drag that would change nothing offers nothing, so it falls back
+    /// to plain reordering.
+    ///
+    /// Only custom groups are candidates. A repo group's membership is
+    /// decided by its tabs' cwds, so "put this tab in tty7" is a request the
+    /// sidebar has no honest way to honour; those blocks are never recorded,
+    /// so the pointer finds nothing over them. The same goes for Scratch,
+    /// which is where tabs land when no group claims them.
+    fn sidebar_regroup_target(&self, window: &Window) -> Option<GroupKey> {
+        let dragged = crate::ui::reorder::dragged_sidebar_tab(&self.reorder)?;
+        let here = self
+            .tabs
+            .iter()
+            .find(|t| t.tree_id.get() == dragged)
+            .and_then(|t| t.sidebar_group.borrow().clone());
+        let pointer = window.mouse_position();
+        self.sidebar_group_slots
+            .borrow()
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&pointer))
+            .map(|(key, _)| key.clone())
+            .filter(|key| Some(key) != here.as_ref())
+    }
+
+    /// The custom groups that exist right now, in sidebar order.
+    ///
+    /// A group exists only while a tab says it does — there is no list of
+    /// groups anywhere else. That is what makes "move the last tab out" the
+    /// same gesture as "delete the group", and it is the same rule a repo
+    /// group already lives by.
+    ///
+    /// Read off the tabs rather than off [`Self::sidebar_group_keys`] so
+    /// that building a menu never runs the cwd probe, which writes back.
+    pub(crate) fn custom_group_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            if let Some(GroupKey::Custom(name)) = tab.sidebar_group.borrow().as_ref()
+                && !out.iter().any(|n| n == name)
+            {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    /// Put the dragged tab in the group it was dropped on.
+    ///
+    /// By id rather than index: a drag is several frames long, and a tab
+    /// closing anywhere else in that time would shift every index after it.
+    pub(crate) fn regroup_tab(
+        &mut self,
+        tab: tty7_core::core::machine::TabId,
+        key: GroupKey,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|t| t.tree_id.get() == tab) else {
+            return;
+        };
+        self.set_tab_group(index, Some(key), cx);
+    }
+
+    /// Put tab `index` in `key`, or hand it back to the cwd probe when `key`
+    /// is `None`.
+    ///
+    /// Clearing is the only way back. A stated group locks the probe out of
+    /// that tab for good, so without a way to clear it a tab moved into a
+    /// custom group could never follow its cwd again — and the user has no
+    /// way to tell that is what they just did.
+    pub(crate) fn set_tab_group(
+        &mut self,
+        index: usize,
+        key: Option<GroupKey>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        *tab.sidebar_group.borrow_mut() = key;
+        // Carries the move to the daemon as a `TabSetGroup`, so another
+        // window on the same workspace sees it too.
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    /// Make a new custom group, put tab `index` in it, and open its header
+    /// for renaming.
+    ///
+    /// No dialog: the tab is in the group before a character is typed, so
+    /// what the name is being given to is on screen while it is chosen. The
+    /// placeholder only has to be unique — the box opens selected, so the
+    /// first keystroke replaces it.
+    pub(crate) fn new_tab_group(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let taken = self.custom_group_names();
+        let base = t(L10nKey::SidebarNewGroupName).to_string();
+        let name = (1..)
+            .map(|n| match n {
+                1 => base.clone(),
+                n => format!("{base} {n}"),
+            })
+            .find(|candidate| !taken.contains(candidate))
+            .expect("an unbounded range always reaches an untaken name");
+        let Some(key) = GroupKey::custom(&name) else {
+            return;
+        };
+        self.set_tab_group(index, Some(key.clone()), cx);
+        self.start_group_rename(key, window, cx);
+    }
+
+    /// Open the header of custom group `key` for renaming.
+    pub(crate) fn start_group_rename(
+        &mut self,
+        key: GroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let GroupKey::Custom(current) = &key else {
+            // A repo group is named after its root. There is nothing to
+            // rename that would not be a lie about where the tabs are.
+            return;
+        };
+        let input = Self::rename_box(current.clone(), window, cx);
+        let subs = vec![cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_group_rename(window, cx)
+                }
+                _ => {}
+            },
+        )];
+        self.group_rename = Some(crate::ui::app::GroupRename {
+            key,
+            input,
+            _subs: subs,
+        });
+        cx.notify();
+    }
+
+    /// Write the typed name onto every tab that claims the old one.
+    ///
+    /// All in one pass. A group is only the set of tabs that name it, so a
+    /// rename that reached half of them would not be a half-renamed group —
+    /// it would be two groups.
+    pub(crate) fn commit_group_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.group_rename.take() else {
+            return;
+        };
+        let value = rename.input.read(cx).value().trim().to_string();
+        // A blank name is not a group. Taking it would drop every tab in it
+        // into Scratch, which is a lot to happen because a box was cleared
+        // and dismissed — so an empty name means "keep the name you had".
+        if let Some(new_key) = GroupKey::custom(&value)
+            && new_key != rename.key
+        {
+            for tab in &self.tabs {
+                let mut group = tab.sidebar_group.borrow_mut();
+                if group.as_ref() == Some(&rename.key) {
+                    *group = Some(new_key.clone());
+                }
+            }
+            // The fold list is keyed by name too, so a shut group that is
+            // renamed would spring open under a key nothing folds any more.
+            let (was, now) = (
+                collapse_key(Some(&rename.key)),
+                collapse_key(Some(&new_key)),
+            );
+            self.update_config(cx, |cfg| {
+                if let Some(at) = cfg.sidebar_collapsed_groups.iter().position(|p| *p == was) {
+                    cfg.sidebar_collapsed_groups[at] = now.clone();
+                }
+            });
+            self.save_session(cx);
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_sidebar_group(&mut self, key: Option<&GroupKey>, cx: &mut Context<Self>) {
         let id = collapse_key(key);
         self.update_config(cx, |cfg| {
             match cfg.sidebar_collapsed_groups.iter().position(|p| *p == id) {
@@ -1312,13 +1599,28 @@ impl Tty7App {
         });
     }
 
-    fn sidebar_group_keys(&self, cx: &gpui::App) -> Vec<Option<PathBuf>> {
+    fn sidebar_group_keys(&self, cx: &gpui::App) -> Vec<Option<GroupKey>> {
         let grouping = cx.global::<Config>().sidebar_grouping;
         self.tabs
             .iter()
             .map(|tab| {
+                // "No grouping" means no headers, full stop. A custom group
+                // says where a tab goes, not that a box may be drawn when the
+                // user asked for none — and letting one through would leave
+                // the sidebar showing that group beside a "Scratch" holding
+                // everything else, which is two headers more than the setting
+                // asked for. The key stays on the tab, so turning grouping
+                // back on brings it straight back.
                 if grouping == SidebarGrouping::None {
                     return None;
+                }
+                // A stated group outranks anything the cwd says. Without this
+                // the repo probe would drag a hand-placed tab back home on
+                // the very next frame, and no amount of clicking would keep
+                // it where it was put.
+                let stated = tab.sidebar_group.borrow().clone();
+                if stated.as_ref().is_some_and(GroupKey::is_custom) {
+                    return stated;
                 }
                 let cwd = tab.pane.first_leaf().and_then(|leaf| {
                     let view = leaf.terminal()?.read(cx);
@@ -1372,7 +1674,24 @@ impl Tty7App {
         &self,
         cwd: Option<&Path>,
         cx: &gpui::App,
-    ) -> Option<Option<PathBuf>> {
+    ) -> Option<Option<GroupKey>> {
+        // A tab spawned from one sitting in a custom group joins it, and does
+        // so before the cwd is consulted at all — the cwd says nothing about
+        // a group the user stated by hand.
+        //
+        // Every caller here spawns from the active tab (the two that start
+        // from a named tab activate it first), so that is the one to inherit
+        // from. Without this, ⌘T inside a folded custom group would draw
+        // nothing but the header's count going up by one: the new tab would
+        // land in a repo group somewhere else, and the fold would hide it.
+        if let Some(stated) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.sidebar_group.borrow().clone())
+            .filter(GroupKey::is_custom)
+        {
+            return Some(Some(stated));
+        }
         let cwd = cwd?;
         let host = self
             .window_workspace(cx)
@@ -1393,34 +1712,27 @@ fn resolved_group(
     grouping: SidebarGrouping,
     known: Option<Option<PathBuf>>,
     cwd: &Path,
-) -> Option<Option<PathBuf>> {
+) -> Option<Option<GroupKey>> {
     Some(match known? {
-        Some(root) => Some(root),
-        None if grouping == SidebarGrouping::RepoOrDirectory => Some(cwd.to_path_buf()),
+        Some(root) => Some(GroupKey::Repo(root)),
+        None if grouping == SidebarGrouping::RepoOrDirectory => {
+            Some(GroupKey::Repo(cwd.to_path_buf()))
+        }
         None => None,
     })
 }
 
-/// How a group is named in `Config::sidebar_collapsed_groups`. A keyed group
-/// is its repo root; the scratch group has no root, so it is written as the
-/// empty string — which no repo root can ever be.
-fn collapse_key(key: &Option<PathBuf>) -> String {
-    key.as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 #[derive(Debug, PartialEq)]
 struct Section {
-    key: Option<PathBuf>,
+    key: Option<GroupKey>,
     name: Option<String>,
     tabs: Vec<usize>,
 }
 
-fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<Section> {
-    let mut group_order: Vec<&PathBuf> = Vec::new();
+fn sidebar_sections(keys: &[Option<GroupKey>]) -> Vec<Section> {
+    let mut group_order: Vec<&GroupKey> = Vec::new();
     for k in keys.iter().flatten() {
-        if !group_order.iter().any(|g| *g == k) {
+        if !group_order.contains(&k) {
             group_order.push(k);
         }
     }
@@ -1431,15 +1743,15 @@ fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<Section> {
             tabs: (0..keys.len()).collect(),
         }];
     }
-    let names = group_names(&group_order);
+    let names = section_names(&group_order);
     let mut sections: Vec<Section> = group_order
         .iter()
         .zip(names)
-        .map(|(root, name)| Section {
-            key: Some((*root).clone()),
+        .map(|(key, name)| Section {
+            key: Some((*key).clone()),
             name: Some(name),
             tabs: (0..keys.len())
-                .filter(|&i| keys[i].as_ref() == Some(*root))
+                .filter(|&i| keys[i].as_ref() == Some(*key))
                 .collect(),
         })
         .collect();
@@ -1455,8 +1767,8 @@ fn sidebar_sections(keys: &[Option<PathBuf>]) -> Vec<Section> {
 }
 
 fn reordered_rows(
-    keys: &[Option<PathBuf>],
-    group: &Option<PathBuf>,
+    keys: &[Option<GroupKey>],
+    group: &Option<GroupKey>,
     visible: &[usize],
     from: usize,
     to: usize,
@@ -1481,18 +1793,22 @@ fn reordered_rows(
     Some(out)
 }
 
-fn regrouped_order(keys: &[Option<PathBuf>], from: &Path, to: &Path) -> Option<Vec<usize>> {
+fn regrouped_order(
+    keys: &[Option<GroupKey>],
+    from: &GroupKey,
+    to: &GroupKey,
+) -> Option<Vec<usize>> {
     if from == to {
         return None;
     }
-    let mut order: Vec<&PathBuf> = Vec::new();
+    let mut order: Vec<&GroupKey> = Vec::new();
     for k in keys.iter().flatten() {
-        if !order.iter().any(|g| *g == k) {
+        if !order.contains(&k) {
             order.push(k);
         }
     }
-    let fi = order.iter().position(|g| g.as_path() == from)?;
-    let ti = order.iter().position(|g| g.as_path() == to)?;
+    let fi = order.iter().position(|g| *g == from)?;
+    let ti = order.iter().position(|g| *g == to)?;
     let moved = order.remove(fi);
     order.insert(ti, moved);
 
@@ -1502,6 +1818,34 @@ fn regrouped_order(keys: &[Option<PathBuf>], from: &Path, to: &Path) -> Option<V
     }
     out.extend((0..keys.len()).filter(|&i| keys[i].is_none()));
     Some(out)
+}
+
+/// What each section's header reads, in `keys` order.
+///
+/// Only repo roots go through [`group_names`]. They are paths, so two of them
+/// can perfectly well end in the same component and need lengthening until
+/// they differ. A custom group's name is the name the user typed — there is
+/// nothing to shorten and nothing to disambiguate against, and running it
+/// through the path splitter would chop a name containing a `/` into
+/// components and then "disambiguate" it by growing a prefix that was never
+/// there.
+fn section_names(keys: &[&GroupKey]) -> Vec<String> {
+    let roots: Vec<&PathBuf> = keys
+        .iter()
+        .filter_map(|k| match k {
+            GroupKey::Repo(p) => Some(p),
+            GroupKey::Custom(_) => None,
+        })
+        .collect();
+    let mut disambiguated = group_names(&roots).into_iter();
+    keys.iter()
+        .map(|k| match k {
+            GroupKey::Repo(_) => disambiguated
+                .next()
+                .expect("group_names answers one name per root"),
+            GroupKey::Custom(name) => name.clone(),
+        })
+        .collect()
 }
 
 fn group_names(roots: &[&PathBuf]) -> Vec<String> {
@@ -1569,11 +1913,325 @@ mod fold_tests {
         app.sidebar_slots.borrow()[i].size.height > px(0.)
     }
 
+    /// Put tab `i` in a directory and tell the cache that directory is the
+    /// repo `root`, so the sidebar's own probe has a real answer to act on.
+    /// Both halves are needed: the probe reads the tab's cwd and looks it up
+    /// in the cache, and either one missing makes it return "no decision",
+    /// which would leave every group below untouched and every assertion
+    /// about overwriting vacuous.
+    fn plant_repo(app: &Tty7App, i: usize, cwd: &str, root: &str, cx: &mut gpui::App) {
+        use crate::terminal::git_status::{GitStatusCache, RepoSnapshot};
+        use crate::ui::host_ops::HostId;
+
+        let cwd = PathBuf::from(cwd);
+        let leaf = app.tabs[i].pane.first_leaf().expect("test tab has a pane");
+        leaf.terminal()
+            .expect("test pane is a terminal")
+            .update(cx, |view, _| {
+                view.set_git_status_cwd_for_test(Some(cwd.clone()))
+            });
+        cx.update_global::<GitStatusCache, _>(|cache, _| {
+            cache.finish_probe(
+                HostId::LOCAL,
+                &cwd,
+                Some(RepoSnapshot {
+                    root: PathBuf::from(root),
+                    home: PathBuf::from(root),
+                    branch: "main".into(),
+                    counts: Some((0, 0)),
+                }),
+            );
+        });
+    }
+
+    /// The rule the whole feature rests on. A group the user stated by hand
+    /// is not the probe's to change: without this the cwd probe would drag a
+    /// hand-placed tab back into its repo on the very next frame, and no
+    /// amount of clicking would keep it where it was put.
+    ///
+    /// Tab 1 is the control. It carries no stated group, so the same probe
+    /// that must leave tab 0 alone has to move tab 1 — otherwise this test
+    /// would pass just as well with the probe switched off entirely.
+    #[gpui::test]
+    fn a_probe_moves_a_derived_group_and_never_a_stated_one(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
+
+        app.update(&mut vcx, |app, cx| {
+            *app.tabs[0].sidebar_group.borrow_mut() = GroupKey::custom("work");
+            for i in 0..2 {
+                plant_repo(app, i, "/w/probed/sub", "/w/probed", cx);
+            }
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            let keys = app.sidebar_group_keys(cx);
+            assert_eq!(
+                keys[0],
+                GroupKey::custom("work"),
+                "the stated group survived a probe that had a real answer"
+            );
+            assert_eq!(
+                keys[1],
+                Some(GroupKey::Repo(PathBuf::from("/w/probed"))),
+                "and that same probe did move the tab that only had a derived one"
+            );
+            assert_eq!(
+                *app.tabs[0].sidebar_group.borrow(),
+                GroupKey::custom("work"),
+                "the tab itself was not written over either"
+            );
+        });
+    }
+
+    /// The way out. A stated group locks the probe out of that tab, so if
+    /// clearing it did not hand the tab back, a tab moved into a custom
+    /// group could never follow its cwd again.
+    #[gpui::test]
+    fn clearing_a_stated_group_hands_the_tab_back_to_the_probe(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+
+        app.update(&mut vcx, |app, cx| {
+            plant_repo(app, 0, "/w/probed/sub", "/w/probed", cx);
+            app.set_tab_group(0, GroupKey::custom("work"), cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.sidebar_group_keys(cx)[0],
+                GroupKey::custom("work"),
+                "stated, so the probe is locked out"
+            );
+        });
+
+        app.update(&mut vcx, |app, cx| app.set_tab_group(0, None, cx));
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.sidebar_group_keys(cx)[0],
+                Some(GroupKey::Repo(PathBuf::from("/w/probed"))),
+                "cleared, so the probe takes the tab back over"
+            );
+        });
+    }
+
+    /// A drag is several frames long, so the tab it is carrying is named by
+    /// id. Were it an index, any tab closing before the drop — in another
+    /// window on the same workspace, or by a shell exiting — would shift it,
+    /// and the drop would land on whichever tab slid into that slot.
+    #[gpui::test]
+    fn a_drop_finds_its_tab_after_the_indexes_shift(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+
+        let dragged = app.update(&mut vcx, |app, _| app.tabs[2].tree_id.get());
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.close_tab(0, window, cx);
+            app.regroup_tab(dragged, GroupKey::custom("work").expect("non-blank"), cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, _| {
+            let moved = app
+                .tabs
+                .iter()
+                .find(|t| t.tree_id.get() == dragged)
+                .expect("the dragged tab is still open");
+            assert_eq!(
+                *moved.sidebar_group.borrow(),
+                GroupKey::custom("work"),
+                "the tab that was picked up is the tab that moved"
+            );
+            assert!(
+                app.tabs
+                    .iter()
+                    .filter(|t| t.tree_id.get() != dragged)
+                    .all(|t| t.sidebar_group.borrow().is_none()),
+                "and no bystander was regrouped in its place"
+            );
+        });
+    }
+
+    /// ⌘T inside a custom group has to land in it. Otherwise the new tab
+    /// goes wherever its cwd says, and if the group it was opened from is
+    /// folded, the only thing that happens on screen is the header's count
+    /// going up by one — the symptom #804 fixed for repo groups.
+    #[gpui::test]
+    fn a_tab_spawned_inside_a_custom_group_joins_it(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+
+        app.update(&mut vcx, |app, cx| {
+            // A probe that would send the tab somewhere else if it were
+            // consulted, so this cannot pass by there being no answer.
+            plant_repo(app, 0, "/w/probed/sub", "/w/probed", cx);
+            app.set_tab_group(0, GroupKey::custom("work"), cx);
+            app.active = 0;
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.spawn_group(Some(&PathBuf::from("/w/probed/sub")), cx),
+                Some(GroupKey::custom("work")),
+                "the stated group is inherited ahead of anything the cwd says"
+            );
+        });
+
+        app.update(&mut vcx, |app, cx| app.set_tab_group(0, None, cx));
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.spawn_group(Some(&PathBuf::from("/w/probed/sub")), cx),
+                Some(Some(GroupKey::Repo(PathBuf::from("/w/probed")))),
+                "and with nothing stated the cwd decides again"
+            );
+        });
+    }
+
+    /// A group is only the set of tabs that name it, so a rename reaching
+    /// half of them would not leave a half-renamed group — it would leave
+    /// two groups.
+    #[gpui::test]
+    fn renaming_a_group_moves_every_tab_in_it_at_once(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+        let work = GroupKey::custom("work").expect("non-blank");
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.set_tab_group(0, Some(work.clone()), cx);
+            app.set_tab_group(1, Some(work.clone()), cx);
+            app.set_tab_group(2, GroupKey::custom("other"), cx);
+            // Shut it, so the fold state has somewhere to be carried from.
+            app.toggle_sidebar_group(Some(&work), cx);
+            app.start_group_rename(work.clone(), window, cx);
+            app.group_rename
+                .as_ref()
+                .expect("the box is up")
+                .input
+                .update(cx, |state, cx| state.set_value("urgent", window, cx));
+            app.commit_group_rename(window, cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            let renamed = GroupKey::custom("urgent");
+            assert_eq!(*app.tabs[0].sidebar_group.borrow(), renamed);
+            assert_eq!(*app.tabs[1].sidebar_group.borrow(), renamed, "both, in one");
+            assert_eq!(
+                *app.tabs[2].sidebar_group.borrow(),
+                GroupKey::custom("other"),
+                "and nothing outside the group moved"
+            );
+            assert_eq!(
+                cx.global::<Config>().sidebar_collapsed_groups,
+                vec!["custom:urgent".to_string()],
+                "a shut group that is renamed stays shut, under its new key"
+            );
+        });
+    }
+
+    /// Clearing the box and dismissing it must not drop a whole group's
+    /// worth of tabs into Scratch.
+    #[gpui::test]
+    fn a_blank_rename_leaves_the_group_alone(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+        let work = GroupKey::custom("work").expect("non-blank");
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.set_tab_group(0, Some(work.clone()), cx);
+            app.start_group_rename(work.clone(), window, cx);
+            app.group_rename
+                .as_ref()
+                .expect("the box is up")
+                .input
+                .update(cx, |state, cx| state.set_value("   ", window, cx));
+            app.commit_group_rename(window, cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, _| {
+            assert_eq!(
+                *app.tabs[0].sidebar_group.borrow(),
+                Some(work),
+                "an empty name means 'keep the one you had'"
+            );
+        });
+    }
+
+    /// The placeholder only has to be unique — the box opens selected, so
+    /// the first keystroke replaces it. But two groups with one name are one
+    /// group, so a second new group must not land on top of the first.
+    #[gpui::test]
+    fn a_second_new_group_does_not_land_on_the_first(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.new_tab_group(0, window, cx);
+            app.new_tab_group(1, window, cx);
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, _| {
+            let names = app.custom_group_names();
+            assert_eq!(names.len(), 2, "two groups, not one shared by both tabs");
+            assert_ne!(names[0], names[1]);
+        });
+    }
+
+    /// "No grouping" means no headers, full stop. Letting a custom group
+    /// through would draw its box beside a "Scratch" holding everything else
+    /// — two headers more than the setting asked for. The key stays on the
+    /// tab, so turning grouping back on brings it straight back.
+    #[gpui::test]
+    fn no_grouping_hides_a_custom_group_without_forgetting_it(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
+
+        app.update(&mut vcx, |app, cx| {
+            *app.tabs[0].sidebar_group.borrow_mut() = GroupKey::custom("work");
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.sidebar_grouping = SidebarGrouping::None;
+            cx.set_global(cfg);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.sidebar_group_keys(cx),
+                vec![None, None],
+                "nothing is grouped, so nothing draws a header"
+            );
+            assert_eq!(
+                *app.tabs[0].sidebar_group.borrow(),
+                GroupKey::custom("work"),
+                "but the tab still remembers where it was put"
+            );
+        });
+
+        app.update(&mut vcx, |_, cx| {
+            let mut cfg = cx.global::<Config>().clone();
+            cfg.sidebar_grouping = SidebarGrouping::Repo;
+            cx.set_global(cfg);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(
+                app.sidebar_group_keys(cx)[0],
+                GroupKey::custom("work"),
+                "turning grouping back on brings the group straight back"
+            );
+        });
+    }
+
     #[gpui::test]
     fn folding_a_group_takes_its_rows_off_the_sidebar(cx: &mut TestAppContext) {
         let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
-        let alpha = PathBuf::from("/w/alpha");
-        let beta = PathBuf::from("/w/beta");
+        let alpha = GroupKey::Repo(PathBuf::from("/w/alpha"));
+        let beta = GroupKey::Repo(PathBuf::from("/w/beta"));
 
         app.update(&mut vcx, |app, cx| {
             for (i, root) in [(0, &alpha), (1, &alpha), (2, &beta)] {
@@ -1592,7 +2250,7 @@ mod fold_tests {
         });
 
         app.update(&mut vcx, |app, cx| {
-            app.toggle_sidebar_group(&Some(alpha.clone()), cx)
+            app.toggle_sidebar_group(Some(&alpha), cx)
         });
         vcx.run_until_parked();
 
@@ -1610,7 +2268,7 @@ mod fold_tests {
         });
 
         app.update(&mut vcx, |app, cx| {
-            app.toggle_sidebar_group(&Some(alpha), cx)
+            app.toggle_sidebar_group(Some(&alpha), cx)
         });
         vcx.run_until_parked();
 
@@ -1626,13 +2284,13 @@ mod fold_tests {
     #[gpui::test]
     fn a_search_outranks_a_fold(cx: &mut TestAppContext) {
         let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
-        let alpha = PathBuf::from("/w/alpha");
+        let alpha = GroupKey::Repo(PathBuf::from("/w/alpha"));
 
         app.update(&mut vcx, |app, cx| {
             for i in 0..2 {
                 *app.tabs[i].sidebar_group.borrow_mut() = Some(alpha.clone());
             }
-            app.toggle_sidebar_group(&Some(alpha), cx);
+            app.toggle_sidebar_group(Some(&alpha), cx);
         });
         vcx.run_until_parked();
         app.update(&mut vcx, |app, _| {
@@ -1665,14 +2323,14 @@ mod fold_tests {
     #[gpui::test]
     fn a_fold_hides_the_active_row_too(cx: &mut TestAppContext) {
         let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
-        let alpha = PathBuf::from("/w/alpha");
+        let alpha = GroupKey::Repo(PathBuf::from("/w/alpha"));
 
         app.update(&mut vcx, |app, cx| {
             for i in 0..2 {
                 *app.tabs[i].sidebar_group.borrow_mut() = Some(alpha.clone());
             }
             app.active = 0;
-            app.toggle_sidebar_group(&Some(alpha.clone()), cx);
+            app.toggle_sidebar_group(Some(&alpha), cx);
         });
         vcx.run_until_parked();
 
@@ -1682,7 +2340,7 @@ mod fold_tests {
         });
 
         app.update(&mut vcx, |app, cx| {
-            app.toggle_sidebar_group(&Some(alpha), cx)
+            app.toggle_sidebar_group(Some(&alpha), cx)
         });
         vcx.run_until_parked();
 
@@ -1700,11 +2358,21 @@ mod tests {
         PathBuf::from(s)
     }
 
+    /// The derived group keyed on repo root `s`.
+    fn g(s: &str) -> GroupKey {
+        GroupKey::Repo(p(s))
+    }
+
+    /// The group the user named `s` by hand.
+    fn c(s: &str) -> GroupKey {
+        GroupKey::custom(s).expect("test names are not blank")
+    }
+
     #[test]
     fn the_scratch_group_folds_under_a_key_no_repo_can_take() {
-        assert_eq!(collapse_key(&Some(p("/w/repo"))), "/w/repo");
+        assert_eq!(collapse_key(Some(&g("/w/repo"))), "/w/repo");
         assert_eq!(
-            collapse_key(&None),
+            collapse_key(None),
             "",
             "scratch has no root, so it is stored as the name that is not one"
         );
@@ -1741,7 +2409,7 @@ mod tests {
         let cwd = p("/w/plain");
         assert_eq!(
             resolved_group(SidebarGrouping::RepoOrDirectory, Some(None), &cwd),
-            Some(Some(p("/w/plain")))
+            Some(Some(g("/w/plain")))
         );
         assert_eq!(
             resolved_group(SidebarGrouping::Repo, Some(None), &cwd),
@@ -1762,7 +2430,7 @@ mod tests {
         for mode in [SidebarGrouping::Repo, SidebarGrouping::RepoOrDirectory] {
             assert_eq!(
                 resolved_group(mode, Some(Some(p("/w/repo"))), &p("/w/repo/sub")),
-                Some(Some(p("/w/repo")))
+                Some(Some(g("/w/repo")))
             );
         }
     }
@@ -1770,21 +2438,21 @@ mod tests {
     #[test]
     fn sections_order_groups_by_first_appearance_scratch_last() {
         let keys = vec![
-            Some(p("/w/beta")),
+            Some(g("/w/beta")),
             None,
-            Some(p("/w/alpha")),
-            Some(p("/w/beta")),
+            Some(g("/w/alpha")),
+            Some(g("/w/beta")),
         ];
         let sections = sidebar_sections(&keys);
-        let shape: Vec<(Option<PathBuf>, Option<String>, Vec<usize>)> = sections
+        let shape: Vec<(Option<GroupKey>, Option<String>, Vec<usize>)> = sections
             .into_iter()
             .map(|s| (s.key, s.name, s.tabs))
             .collect();
         assert_eq!(
             shape,
             vec![
-                (Some(p("/w/beta")), Some("beta".into()), vec![0, 3]),
-                (Some(p("/w/alpha")), Some("alpha".into()), vec![2]),
+                (Some(g("/w/beta")), Some("beta".into()), vec![0, 3]),
+                (Some(g("/w/alpha")), Some("alpha".into()), vec![2]),
                 (None, Some("Scratch".into()), vec![1]),
             ]
         );
@@ -1802,10 +2470,10 @@ mod tests {
     #[test]
     fn a_row_badge_names_the_chord_that_opens_that_row() {
         let keys = vec![
-            Some(p("/w/beta")),
+            Some(g("/w/beta")),
             None,
-            Some(p("/w/alpha")),
-            Some(p("/w/beta")),
+            Some(g("/w/alpha")),
+            Some(g("/w/beta")),
         ];
         // What `visual_tab_order` returns for a left tab bar.
         let order: Vec<usize> = sidebar_sections(&keys)
@@ -1832,12 +2500,12 @@ mod tests {
     #[test]
     fn reordered_rows_moves_within_the_group_only() {
         let keys = vec![
-            Some(p("/w/alpha")),
-            Some(p("/w/beta")),
-            Some(p("/w/alpha")),
+            Some(g("/w/alpha")),
+            Some(g("/w/beta")),
+            Some(g("/w/alpha")),
             None,
         ];
-        let alpha = Some(p("/w/alpha"));
+        let alpha = Some(g("/w/alpha"));
         assert_eq!(
             reordered_rows(&keys, &alpha, &[0, 2], 0, 1),
             Some(vec![2, 0, 1, 3])
@@ -1851,8 +2519,8 @@ mod tests {
 
     #[test]
     fn reordered_rows_leaves_filtered_out_rows_alone() {
-        let keys = vec![Some(p("/w/a")), Some(p("/w/a")), Some(p("/w/a"))];
-        let a = Some(p("/w/a"));
+        let keys = vec![Some(g("/w/a")), Some(g("/w/a")), Some(g("/w/a"))];
+        let a = Some(g("/w/a"));
         assert_eq!(
             reordered_rows(&keys, &a, &[0, 2], 0, 1),
             Some(vec![1, 2, 0])
@@ -1862,28 +2530,93 @@ mod tests {
     #[test]
     fn regrouped_order_moves_the_group_into_the_target_slot() {
         let keys = vec![
-            Some(p("/w/alpha")),
+            Some(g("/w/alpha")),
             None,
-            Some(p("/w/beta")),
-            Some(p("/w/alpha")),
-            Some(p("/w/gamma")),
+            Some(g("/w/beta")),
+            Some(g("/w/alpha")),
+            Some(g("/w/gamma")),
         ];
         assert_eq!(
-            regrouped_order(&keys, &p("/w/gamma"), &p("/w/alpha")),
+            regrouped_order(&keys, &g("/w/gamma"), &g("/w/alpha")),
             Some(vec![4, 0, 3, 2, 1])
         );
         assert_eq!(
-            regrouped_order(&keys, &p("/w/alpha"), &p("/w/gamma")),
+            regrouped_order(&keys, &g("/w/alpha"), &g("/w/gamma")),
             Some(vec![2, 4, 0, 3, 1])
         );
     }
 
     #[test]
     fn regrouped_order_ignores_self_and_unknown_roots() {
-        let keys = vec![Some(p("/w/alpha")), Some(p("/w/beta"))];
-        assert_eq!(regrouped_order(&keys, &p("/w/alpha"), &p("/w/alpha")), None);
-        assert_eq!(regrouped_order(&keys, &p("/w/gone"), &p("/w/beta")), None);
-        assert_eq!(regrouped_order(&keys, &p("/w/alpha"), &p("/w/gone")), None);
+        let keys = vec![Some(g("/w/alpha")), Some(g("/w/beta"))];
+        assert_eq!(regrouped_order(&keys, &g("/w/alpha"), &g("/w/alpha")), None);
+        assert_eq!(regrouped_order(&keys, &g("/w/gone"), &g("/w/beta")), None);
+        assert_eq!(regrouped_order(&keys, &g("/w/alpha"), &g("/w/gone")), None);
+    }
+
+    /// A custom name is the name the user typed. Running it through the path
+    /// splitter would chop one containing a `/` into components and then
+    /// "shorten" it to the tail, so `work/urgent` would print as `urgent`.
+    #[test]
+    fn a_custom_name_is_never_shortened_the_way_a_path_is() {
+        let keys = vec![Some(c("work/urgent")), Some(g("/home/u/tty7"))];
+        let sections = sidebar_sections(&keys);
+        assert_eq!(
+            sections.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            vec![Some("work/urgent".into()), Some("tty7".into())]
+        );
+    }
+
+    /// Two repo roots ending in the same component grow a prefix until they
+    /// differ. A custom group sitting between them takes no part in that: it
+    /// is not a path, so there is no prefix to grow and nothing to collide
+    /// with as far as the path splitter is concerned.
+    #[test]
+    fn a_custom_group_sits_out_the_path_disambiguation() {
+        let keys = vec![
+            Some(g("/home/u/work/app")),
+            Some(c("scratch")),
+            Some(g("/home/u/fork/app")),
+        ];
+        let sections = sidebar_sections(&keys);
+        assert_eq!(
+            sections.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            vec![
+                Some("work/app".into()),
+                Some("scratch".into()),
+                Some("fork/app".into())
+            ],
+            "the two roots still disambiguate against each other"
+        );
+    }
+
+    /// A custom group named after a real repo prints the same header as that
+    /// repo, but the two are different groups and must stay apart — in the
+    /// section list and, through `collapse_key`, in the fold state.
+    #[test]
+    fn a_custom_group_never_merges_with_the_repo_it_is_named_after() {
+        let keys = vec![Some(g("/w/tty7")), Some(c("tty7"))];
+        let sections = sidebar_sections(&keys);
+        assert_eq!(sections.len(), 2, "two groups, not one");
+        assert_eq!(sections[0].tabs, vec![0]);
+        assert_eq!(sections[1].tabs, vec![1]);
+        assert_ne!(
+            collapse_key(sections[0].key.as_ref()),
+            collapse_key(sections[1].key.as_ref()),
+            "folding one must not fold the other"
+        );
+    }
+
+    /// A custom group is where a tab was put, and rows move within it the
+    /// same way they move within a repo group.
+    #[test]
+    fn rows_reorder_inside_a_custom_group_too() {
+        let keys = vec![Some(c("work")), Some(g("/w/beta")), Some(c("work"))];
+        let work = Some(c("work"));
+        assert_eq!(
+            reordered_rows(&keys, &work, &[0, 2], 0, 1),
+            Some(vec![2, 0, 1])
+        );
     }
 
     #[test]
