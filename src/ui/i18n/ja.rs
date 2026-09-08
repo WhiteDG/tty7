@@ -461,9 +461,9 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsDetectUrlsDesc => {
             "ホバーでリンクに下線を表示し、{modifier}+クリックで開く"
         }
-        L10nKey::ForwardSshLoopbackLinks => "SSH ループバックリンクを転送",
+        L10nKey::ForwardSshLoopbackLinks => "リモートポートを転送",
         L10nKey::SettingsForwardSshLoopbackLinksDesc => {
-            "ペインが SSH 接続中の場合、一時的なポートフォワード経由で localhost リンクを開く"
+            "SSH 接続中、ペインが待ち受けを始めたポートを自動転送し、localhost リンクをこの端末で開く"
         }
         L10nKey::SettingsOpenFilesInternal => "内蔵エディタ",
         L10nKey::SettingsOpenFilesSystem => "デフォルトアプリ",
@@ -831,7 +831,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "タイポグラフィ 文字 拡大 縮小 ズーム font size typography text bigger smaller zoom"
         }
         L10nKey::SettingsSearchForwardSshLoopbackLinksKeywords => {
-            "ssh リモート ポート トンネル localhost フォワード リンク forward ssh loopback links tunnel"
+            "ssh リモート ポート トンネル localhost フォワード リンク 自動転送 forward ssh loopback links tunnel ports"
         }
         L10nKey::SettingsSearchGrokBuildKeywords => {
             "エージェント 統合 フック インストール xai grok build agent integration hooks install"
@@ -1015,7 +1015,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "貼り付けた画像を {host} にアップロードできませんでした: {error}"
         }
         L10nKey::LinkFileOpenFailed => "{path} を開けませんでした: {error}",
-        L10nKey::ForwardPanelTitle => "ポートフォワード",
         L10nKey::ForwardDisconnected => "切断済み",
         L10nKey::ForwardDisconnectedFrom => "{host} から切断されました",
         L10nKey::SshEditProfile => "接続を編集…",
@@ -1028,6 +1027,11 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::ForwardToLabel => "転送先",
         L10nKey::ForwardSocksLabel => "SOCKS",
         L10nKey::ForwardAdd => "追加",
+        L10nKey::ForwardPortLabel => "リモートポート",
+        L10nKey::ForwardPortHere => "localhost:{port} で開きます",
+        L10nKey::ForwardNeedsPort => "ポートは 1 から 65535 までの数字です。",
+        L10nKey::ForwardAdvancedToggle => "詳細",
+        L10nKey::ForwardSimpleToggle => "シンプル",
         L10nKey::ForwardRequestFailed => "セッションに届きませんでした。何も変更していません",
         L10nKey::FileTreePlaceholderFileName => "ファイル名",
         L10nKey::FileTreePlaceholderFolderName => "フォルダ名",
@@ -1121,6 +1125,10 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::PanelProcessesSubtitle => "プロセス",
         L10nKey::PanelPortsSubtitle => "ポート",
+        L10nKey::PanelPortsUnsupported => {
+            "このマシンの tty7-server が古く、ポートを列挙できません。"
+        }
+        L10nKey::PortAutoForwarded => "リモートの :{port} は http://localhost:{local} で開けます",
         L10nKey::PanelCwd => "作業ディレクトリ",
         L10nKey::PanelShell => "シェル",
         L10nKey::PanelSsh => "ssh",

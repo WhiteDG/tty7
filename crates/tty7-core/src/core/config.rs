@@ -614,7 +614,7 @@ impl Default for Config {
             link_url: true,
             link_file_open: Some(LinkFileOpen::Internal),
             link_file_command: None,
-            ssh_loopback_forward: false,
+            ssh_loopback_forward: true,
             cursor_blink: true,
             scrollback_limit: 10_000,
             new_tab_position: NewTabPosition::AfterCurrent,

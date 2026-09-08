@@ -396,9 +396,9 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsLinks => "链接",
         L10nKey::DetectUrls => "检测 URL",
         L10nKey::SettingsDetectUrlsDesc => "悬停时给链接加下划线，通过 {modifier}+点击 打开。",
-        L10nKey::ForwardSshLoopbackLinks => "转发 SSH 回环链接",
+        L10nKey::ForwardSshLoopbackLinks => "转发远程端口",
         L10nKey::SettingsForwardSshLoopbackLinksDesc => {
-            "当窗格处于 SSH 中时，通过临时端口转发打开 localhost 链接。"
+            "SSH 会话里，自动转发窗格开始监听的端口，并在本机打开它的 localhost 链接。"
         }
         L10nKey::SettingsOpenFilesInternal => "内置编辑器",
         L10nKey::SettingsOpenFilesSystem => "默认应用",
@@ -738,7 +738,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "字号 字体大小 文字 放大 缩小 typography font size bigger smaller zoom"
         }
         L10nKey::SettingsSearchForwardSshLoopbackLinksKeywords => {
-            "SSH回环链接 端口转发 隧道 localhost 转发 forward ssh loopback links tunnel"
+            "SSH回环链接 端口转发 隧道 localhost 转发 自动转发 端口检测 forward ssh loopback links tunnel ports"
         }
         L10nKey::SettingsSearchGrokBuildKeywords => {
             "Grok Build agent 集成 hook 安装 xai grok build agent integration hooks install"
@@ -920,7 +920,6 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SftpTransferListFailed => "无法获取传输状态：{error}",
         L10nKey::SftpImagePasteUploadFailed => "无法将粘贴的图片上传到 {host}：{error}",
         L10nKey::LinkFileOpenFailed => "无法打开 {path}：{error}",
-        L10nKey::ForwardPanelTitle => "端口转发",
         L10nKey::ForwardDisconnected => "已断开",
         L10nKey::ForwardDisconnectedFrom => "与 {host} 的连接已断开",
         L10nKey::SshEditProfile => "编辑连接…",
@@ -933,6 +932,11 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::ForwardToLabel => "到",
         L10nKey::ForwardSocksLabel => "SOCKS",
         L10nKey::ForwardAdd => "添加",
+        L10nKey::ForwardPortLabel => "远程端口",
+        L10nKey::ForwardPortHere => "在 localhost:{port} 打开",
+        L10nKey::ForwardNeedsPort => "端口是 1 到 65535 之间的数字。",
+        L10nKey::ForwardAdvancedToggle => "高级",
+        L10nKey::ForwardSimpleToggle => "简单",
         L10nKey::ForwardRequestFailed => "联系不上这个会话——什么都没有改动。",
         L10nKey::FileTreePlaceholderFileName => "文件名",
         L10nKey::FileTreePlaceholderFolderName => "文件夹名",
@@ -1010,6 +1014,8 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::PanelTurnNoScrollback => "这一轮画在 alt screen 上，scrollback 里没有留下它。",
         L10nKey::PanelProcessesSubtitle => "进程",
         L10nKey::PanelPortsSubtitle => "端口",
+        L10nKey::PanelPortsUnsupported => "这台机器的 tty7-server 太旧，列不出端口。",
+        L10nKey::PortAutoForwarded => "远程 :{port} 现在是 http://localhost:{local}",
         L10nKey::PanelCwd => "工作目录",
         L10nKey::PanelShell => "shell",
         L10nKey::PanelSsh => "ssh",

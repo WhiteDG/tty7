@@ -450,9 +450,9 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsDetectUrlsDesc => {
             "Underline links on hover and open them on {modifier}-click."
         }
-        L10nKey::ForwardSshLoopbackLinks => "Forward SSH loopback links",
+        L10nKey::ForwardSshLoopbackLinks => "Forward remote ports",
         L10nKey::SettingsForwardSshLoopbackLinksDesc => {
-            "When a pane is in SSH, open localhost links through a temporary port forward."
+            "Over SSH, forward the ports a pane starts serving and open its localhost links here."
         }
         L10nKey::SettingsOpenFilesInternal => "Built-in editor",
         L10nKey::SettingsOpenFilesSystem => "Default app",
@@ -796,7 +796,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsSearchFontLigaturesKeywords => "typography glyph fira",
         L10nKey::SettingsSearchFontSizeKeywords => "typography text bigger smaller zoom",
         L10nKey::SettingsSearchForwardSshLoopbackLinksKeywords => {
-            "ssh remote port tunnel localhost forward links"
+            "ssh remote port tunnel localhost forward links ports autoforward detect"
         }
         L10nKey::SettingsSearchGrokBuildKeywords => {
             "agent integration hooks install xai grok build"
@@ -954,7 +954,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
             "Could not upload the pasted image to {host}: {error}"
         }
         L10nKey::LinkFileOpenFailed => "Could not open {path}: {error}",
-        L10nKey::ForwardPanelTitle => "Forwards",
         L10nKey::ForwardDisconnected => "Disconnected",
         L10nKey::ForwardDisconnectedFrom => "Disconnected from {host}",
         L10nKey::SshEditProfile => "Edit connection…",
@@ -967,6 +966,11 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::ForwardToLabel => "to",
         L10nKey::ForwardSocksLabel => "SOCKS",
         L10nKey::ForwardAdd => "Add",
+        L10nKey::ForwardPortLabel => "Remote port",
+        L10nKey::ForwardPortHere => "opens at localhost:{port}",
+        L10nKey::ForwardNeedsPort => "A port is a number from 1 to 65535.",
+        L10nKey::ForwardAdvancedToggle => "Advanced",
+        L10nKey::ForwardSimpleToggle => "Simple",
         L10nKey::ForwardRequestFailed => "Could not reach the session — nothing changed.",
         L10nKey::FileTreePlaceholderFileName => "file name",
         L10nKey::FileTreePlaceholderFolderName => "folder name",
@@ -1057,6 +1061,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::PanelProcessesSubtitle => "Processes",
         L10nKey::PanelPortsSubtitle => "Ports",
+        L10nKey::PanelPortsUnsupported => "This machine's tty7-server is too old to list ports.",
+        L10nKey::PortAutoForwarded => "Remote :{port} is now http://localhost:{local}",
         L10nKey::PanelCwd => "cwd",
         L10nKey::PanelShell => "shell",
         L10nKey::PanelSsh => "ssh",

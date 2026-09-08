@@ -126,6 +126,11 @@ pub mod feature {
     pub const HOST_RPC: &str = "host-rpc";
     pub const MACHINE_TREE: &str = "machine-tree";
     pub const STDIO_BRIDGE: &str = "stdio-bridge";
+    /// The peer can say what is running inside one of its panes, and what that
+    /// is listening on. Without it a remote pane's processes and ports are
+    /// simply unknown here: the pane lives in the peer's registry, and the
+    /// local daemon this client would otherwise ask has never heard of it.
+    pub const PANE_PROCS: &str = "pane-procs";
 }
 
 pub use crate::host::{Entry, MTime, Meta, Output, SearchHit};
@@ -309,6 +314,12 @@ pub enum ControlRequest {
     },
 
     AgentStates,
+    /// What is running inside one of the peer's panes, and what it is
+    /// listening on. `pane_id` is the peer's own id for it — the same one the
+    /// client spawned the pane with.
+    PaneProcs {
+        pane_id: u64,
+    },
     Routes,
     Status,
 }
@@ -353,7 +364,11 @@ impl ControlRequest {
             | RepoRoot { .. }
             | WatchOpen { .. }
             | WatchSet { .. }
-            | WatchClose { .. } => Duration::from_secs(5),
+            | WatchClose { .. }
+            // A poll, on a two-second timer: waiting longer than the gap
+            // between asks would only stack up requests behind a peer that has
+            // stopped answering.
+            | PaneProcs { .. } => Duration::from_secs(5),
             ReadFile { .. } | WriteFile { .. } => Duration::from_secs(30),
             CreateFileNew { .. } | CreateDir { .. } | Rename { .. } | Remove { .. } => {
                 Duration::from_secs(10)
@@ -430,6 +445,7 @@ pub enum ReplyOk {
     TabTree(Box<Tab>),
     Panes(Vec<u64>),
     AgentStates(Vec<PaneAgentState>),
+    PaneProcs(crate::daemon::protocol::PaneProcs),
     Routes(Vec<RouteInfo>),
     Status(ServerStatus),
 }
@@ -1496,6 +1512,7 @@ mod tests {
                 workspace: None,
             },
             ControlRequest::AgentStates,
+            ControlRequest::PaneProcs { pane_id: 7 },
             ControlRequest::Routes,
             ControlRequest::Status,
         ]
@@ -2226,6 +2243,7 @@ mod tests {
                 s(5),
             ),
             (R::AgentStates, s(5)),
+            (R::PaneProcs { pane_id: 7 }, s(5)),
             (R::Routes, s(5)),
             (R::Status, s(5)),
         ];

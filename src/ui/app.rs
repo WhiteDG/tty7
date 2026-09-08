@@ -749,10 +749,18 @@ pub(crate) struct LoopbackForwardPanelState {
     /// Why the last Add or Save did not take, in the far side's own words.
     /// Cleared the moment the form is closed or the edit is abandoned.
     pub(crate) mf_error: Option<String>,
-    /// Return, on each of the five boxes. Held here for the same reason the
-    /// sftp form holds its own: a live subscription on a box nothing is
-    /// showing would answer Return for a form that is gone.
+    /// Return, on each of the boxes. Held here for the same reason the sftp
+    /// form holds its own: a live subscription on a box nothing is showing
+    /// would answer Return for a form that is gone.
     pub(crate) mf_subs: Vec<Subscription>,
+    /// Whether the form is showing all five fields rather than the one.
+    ///
+    /// Almost every forward anyone builds by hand is "bring the remote's :3000
+    /// over here", which is one number — and asking for five fields to collect
+    /// one number is what made the panel feel like paperwork. The rest of the
+    /// `ssh -L` grammar is still here, one disclosure away, for the forwards
+    /// that really do need it.
+    pub(crate) mf_advanced: bool,
 }
 
 pub struct Tty7App {
@@ -1406,6 +1414,7 @@ impl Tty7App {
                 mf_editing: None,
                 mf_error: None,
                 mf_subs: Vec::new(),
+                mf_advanced: false,
             },
             sftp_panel,
             right_panel: Default::default(),
@@ -2771,6 +2780,7 @@ impl Tty7App {
     pub(crate) fn managed_forward_fields(&self, cx: &gpui::App) -> ForwardFields {
         let val = |input: &Entity<InputState>| input.read(cx).value().to_string();
         ForwardFields {
+            advanced: self.loopback_panel.mf_advanced,
             kind: self.loopback_panel.mf_kind,
             bind_host: val(&self.loopback_panel.mf_bind_host),
             bind_port: val(&self.loopback_panel.mf_bind_port),
@@ -2786,9 +2796,8 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::daemon::protocol::ForwardStatus;
-
-        let Some(rule) = self.managed_forward_fields(cx).collect() else {
+        let fields = self.managed_forward_fields(cx);
+        let Some(rule) = fields.collect() else {
             // Add is disabled while the fields do not make a rule and the form
             // already says what is missing, so there is nothing to do here and
             // nothing left to explain.
@@ -2815,31 +2824,32 @@ impl Tty7App {
             self.loopback_panel.managed = list;
         }
 
-        let before: Vec<u64> = self.loopback_panel.managed.iter().map(|m| m.id).collect();
-        let mut failure = None;
-        match route.add(rule) {
-            // The request never got an answer. An empty list here is not "this
-            // pane has no forwards", it is "nobody said" — assigning it is what
-            // used to blank the panel on a dropped connection.
-            None => failure = Some(t(L10nKey::ForwardRequestFailed).to_string()),
-            Some(list) => {
-                // A rule that could not be started is registered all the same,
-                // with the reason in its status, so whether the add worked is a
-                // question about the entry it appended rather than about
-                // whether the call returned.
-                let broken = added_forward(&before, &list).and_then(|added| match &added.status {
-                    ForwardStatus::Error(msg) => Some((added.id, msg.clone())),
-                    ForwardStatus::Listening => None,
-                });
-                self.loopback_panel.managed = list;
-                if let Some((id, msg)) = broken {
-                    if let Some(list) = route.remove(id) {
-                        self.loopback_panel.managed = list;
-                    }
-                    failure = Some(msg);
+        // The short form aims at the same number on both ends because that is
+        // the address people can predict. When it is already taken here, the
+        // useful answer is another port rather than a complaint: somebody who
+        // typed one number to forward one port has not been asked to care
+        // which local port it lands on, and the row says where it came out.
+        let retry_free_port = !fields.advanced && rule.bind_port != 0;
+        let mut failure = match self.place_forward(&route, rule.clone()) {
+            PlaceOutcome::Placed => None,
+            // Nobody answered, so nothing was bound and nothing would be bound
+            // by asking again — a second round trip would only spend another
+            // timeout on the way to the same sentence.
+            PlaceOutcome::Unreachable(msg) => Some(msg),
+            PlaceOutcome::Rejected(msg) if !retry_free_port => Some(msg),
+            PlaceOutcome::Rejected(_) => {
+                match self.place_forward(
+                    &route,
+                    crate::daemon::protocol::SshForwardRule {
+                        bind_port: 0,
+                        ..rule.clone()
+                    },
+                ) {
+                    PlaceOutcome::Placed => None,
+                    PlaceOutcome::Rejected(msg) | PlaceOutcome::Unreachable(msg) => Some(msg),
                 }
             }
-        }
+        };
 
         if let Some(msg) = failure {
             // Put back what the edit took out, so the worst a failed Save can
@@ -2877,6 +2887,41 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Ask the far side for one rule, and say what became of it.
+    ///
+    /// A rule that could not be started is registered all the same, with the
+    /// reason in its status, so whether the add worked is a question about the
+    /// entry it appended rather than about whether the call returned. The dead
+    /// entry is taken back out — a forward listed as listening on nothing is
+    /// worse than no forward.
+    fn place_forward(
+        &mut self,
+        route: &ForwardRoute,
+        rule: crate::daemon::protocol::SshForwardRule,
+    ) -> PlaceOutcome {
+        use crate::daemon::protocol::ForwardStatus;
+
+        let before: Vec<u64> = self.loopback_panel.managed.iter().map(|m| m.id).collect();
+        // The request never got an answer. An empty list here is not "this
+        // pane has no forwards", it is "nobody said" — assigning it is what
+        // used to blank the panel on a dropped connection.
+        let Some(list) = route.add(rule) else {
+            return PlaceOutcome::Unreachable(t(L10nKey::ForwardRequestFailed).to_string());
+        };
+        let broken = added_forward(&before, &list).and_then(|added| match &added.status {
+            ForwardStatus::Error(msg) => Some((added.id, msg.clone())),
+            ForwardStatus::Listening => None,
+        });
+        self.loopback_panel.managed = list;
+        let Some((id, msg)) = broken else {
+            return PlaceOutcome::Placed;
+        };
+        if let Some(list) = route.remove(id) {
+            self.loopback_panel.managed = list;
+        }
+        PlaceOutcome::Rejected(msg)
+    }
+
     pub(crate) fn edit_managed_forward(
         &mut self,
         forward: crate::daemon::protocol::ManagedForward,
@@ -2886,6 +2931,10 @@ impl Tty7App {
         self.loopback_panel.mf_kind = forward.kind;
         self.loopback_panel.form_pane_id = Some(forward.pane_id);
         self.loopback_panel.mf_error = None;
+        // A rule that already exists is shown whole: the short form cannot
+        // spell a bind host or a remote forward, so editing one through it
+        // would silently rewrite the parts it cannot see.
+        self.loopback_panel.mf_advanced = true;
         let target_port = if forward.target_port == 0 {
             String::new()
         } else {
@@ -2951,12 +3000,19 @@ impl Tty7App {
     }
 
     pub(crate) fn show_ssh_forwards(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((pane_id, _)) = self.active_connected_native_ssh_pane(window, cx) else {
+        // Whatever the panel would let this pane forward, which is a wider set
+        // than "a connected native-ssh pane": a pane in a remote workspace
+        // forwards over the workspace's own connection, and the command used
+        // to do nothing at all there while the panel beside it worked.
+        let Some(ctx) = self.pane_forward_ctx(window, cx) else {
             return;
         };
+        if ctx.route.is_none() {
+            return;
+        }
         self.set_right_panel_tab(crate::core::config::RightPanelTab::Info, cx);
-        if self.loopback_panel.form_pane_id != Some(pane_id) {
-            self.toggle_managed_forward_form(pane_id, window, cx);
+        if self.loopback_panel.form_pane_id != Some(ctx.pane_id) {
+            self.toggle_managed_forward_form(ctx.pane_id, window, cx);
         }
     }
 
@@ -2971,6 +3027,8 @@ impl Tty7App {
             return;
         }
         self.loopback_panel.form_pane_id = Some(pane_id);
+        self.loopback_panel.mf_advanced = false;
+        self.loopback_panel.mf_kind = crate::daemon::protocol::SshForwardKind::Local;
         self.cancel_managed_forward_edit(window, cx);
         self.refresh_managed_forwards(pane_id, cx);
         self.arm_managed_forward_form(pane_id, window, cx);
@@ -3016,6 +3074,12 @@ impl Tty7App {
             })
             .collect();
         inputs[0].update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    pub(crate) fn toggle_managed_forward_advanced(&mut self, cx: &mut Context<Self>) {
+        self.loopback_panel.mf_advanced = !self.loopback_panel.mf_advanced;
+        self.loopback_panel.mf_error = None;
+        cx.notify();
     }
 
     pub(crate) fn close_managed_forward_form(
@@ -7126,7 +7190,43 @@ pub(crate) struct ForwardRoute {
     workspace: Option<crate::terminal::PaneWorkspace>,
 }
 
+/// What came of asking the far side to put one forward up.
+enum PlaceOutcome {
+    Placed,
+    /// The far side answered and the rule could not be started — a bind that
+    /// collided, a port this process may not have. Another bind port might.
+    Rejected(String),
+    /// Nobody answered. Nothing was bound, and nothing about the rule is what
+    /// went wrong.
+    Unreachable(String),
+}
+
+/// Who a set of forwards belongs to on the far side.
+///
+/// A workspace's forwards outlive any one of its panes and are shared between
+/// all of them, so "have we already offered to forward :3000" is a question
+/// about the workspace — asking it per pane made switching tabs re-announce
+/// every port the workspace had already forwarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ForwardOwnerKey {
+    Pane(u64),
+    Workspace(crate::core::session::WorkspaceId),
+}
+
 impl ForwardRoute {
+    pub(crate) fn new(pane_id: u64, workspace: Option<crate::terminal::PaneWorkspace>) -> Self {
+        Self { pane_id, workspace }
+    }
+
+    /// Which side of the daemon's own forward registry this route addresses —
+    /// the same split `ForwardOwner` makes there.
+    pub(crate) fn owner_key(&self) -> ForwardOwnerKey {
+        match &self.workspace {
+            Some(ws) => ForwardOwnerKey::Workspace(ws.workspace),
+            None => ForwardOwnerKey::Pane(self.pane_id),
+        }
+    }
+
     fn workspace_op(
         &self,
         op: crate::daemon::protocol::WorkspaceOp,
@@ -7190,6 +7290,37 @@ impl ForwardRoute {
         Self::forwards(crate::terminal::RemoteTerminal::on_workspace(req)).unwrap_or_default()
     }
 
+    /// The local port that reaches `remote_host:remote_port` over this route,
+    /// building the forward if there is not one yet.
+    ///
+    /// The far side keeps one automatic forward per endpoint and hands the
+    /// same port back on the next ask, so callers may treat this as "what is
+    /// the address here" rather than as an action with a cost — which is what
+    /// lets the Ports list call it on a click and the watcher call it on a
+    /// port it has only just noticed.
+    pub(crate) fn ensure_loopback(
+        &self,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> anyhow::Result<crate::daemon::protocol::LoopbackForward> {
+        let Some(req) = self.workspace_op(crate::daemon::protocol::WorkspaceOp::EnsureLoopback {
+            remote_host: remote_host.to_string(),
+            remote_port,
+        }) else {
+            return crate::terminal::RemoteTerminal::ensure_loopback_forward(
+                self.pane_id,
+                remote_host,
+                remote_port,
+            );
+        };
+        match crate::terminal::RemoteTerminal::on_workspace(req)? {
+            crate::daemon::protocol::DaemonMsg::LoopbackForward(f) => Ok(f),
+            other => Err(anyhow::anyhow!(
+                "unexpected reply to EnsureLoopback: {other:?}"
+            )),
+        }
+    }
+
     pub(crate) fn remove(
         &self,
         forward_id: u64,
@@ -7217,6 +7348,10 @@ impl Render for Tty7App {
         self.touch_active_tab();
         self.declare_displayed_panes(cx);
         self.scm_sync_watchers(window, cx);
+        // Keeps looking for new listening ports on the pane in front, panel
+        // open or not — a port that appears while the panel is shut is exactly
+        // the one worth forwarding unasked.
+        self.sync_port_watch(window, cx);
         if cx.has_active_drag() {
             crate::ui::reorder::clear_pending(&self.reorder);
             crate::ui::pane_drag::clear_landing(&self.pane_drag);
@@ -10563,6 +10698,9 @@ mod managed_forward_gpui_tests {
         app.update_in(&mut vcx, |app, window, cx| {
             app.loopback_panel.managed = vec![listening(1)];
             app.loopback_panel.form_pane_id = Some(1);
+            // These three fields are the long form's; without this the short
+            // form would read them as the one number it asks for.
+            app.loopback_panel.mf_advanced = true;
             let typed: [(&gpui::Entity<InputState>, &str); 3] = [
                 (&app.loopback_panel.mf_bind_port, "9000"),
                 (&app.loopback_panel.mf_target_host, "127.0.0.1"),
@@ -10599,6 +10737,7 @@ mod managed_forward_gpui_tests {
             app.loopback_panel.managed = vec![listening(1)];
             app.loopback_panel.form_pane_id = Some(1);
             app.loopback_panel.mf_editing = Some(listening(1));
+            app.loopback_panel.mf_advanced = true;
             let typed: [(&gpui::Entity<InputState>, &str); 3] = [
                 (&app.loopback_panel.mf_bind_port, "8080"),
                 (&app.loopback_panel.mf_target_host, "10.0.0.6"),

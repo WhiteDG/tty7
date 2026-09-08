@@ -481,12 +481,44 @@ enum LinkAt {
     None,
 }
 
+/// What it takes to open one of a pane's loopback ports from this machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PortRoute {
+    /// The port is already reachable here under its own number.
+    Direct,
+    /// A local forward has to exist first; the pane's `ForwardRoute` builds it.
+    Forward,
+    /// Another machine's port, with no way to reach it from here.
+    #[default]
+    Blocked,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum LoopbackPlan {
     Direct,
     NoForwardNeeded,
     ForwardOnPane(u64),
     ForwardOnWorkspace(Box<crate::terminal::PaneWorkspace>),
+}
+
+/// What a pane's loopback port takes to open, given how its links would be
+/// forwarded and whether the daemon listing it is this machine's.
+///
+/// Deliberately not "is the pane local": a remote pane's :3000 is perfectly
+/// reachable once a forward exists, and building that forward is something
+/// this app already knows how to do. Answering only "local or not" is what
+/// left the Ports list showing a port it then refused to open.
+pub(crate) fn port_route_of(plan: &LoopbackPlan, local: bool) -> PortRoute {
+    match plan {
+        // WSL shares this machine's loopback, so its ports are already here
+        // under the same number.
+        LoopbackPlan::NoForwardNeeded => PortRoute::Direct,
+        LoopbackPlan::ForwardOnPane(_) | LoopbackPlan::ForwardOnWorkspace(_) => PortRoute::Forward,
+        // No plan and no forwarding: this machine's own ports open, and
+        // another machine's do not.
+        LoopbackPlan::Direct if local => PortRoute::Direct,
+        LoopbackPlan::Direct => PortRoute::Blocked,
+    }
 }
 
 pub(super) fn loopback_plan(
@@ -5634,12 +5666,9 @@ impl TerminalView {
         }
 
         let forwarded = match &plan {
-            LoopbackPlan::ForwardOnPane(pane_id) => RemoteTerminal::ensure_loopback_forward(
-                *pane_id,
-                loopback.forward_host(),
-                loopback.port,
-            ),
-            LoopbackPlan::ForwardOnWorkspace(ws) => self.ensure_workspace_loopback(ws, &loopback),
+            LoopbackPlan::ForwardOnPane(_) | LoopbackPlan::ForwardOnWorkspace(_) => self
+                .forward_route()
+                .ensure_loopback(loopback.forward_host(), loopback.port),
             LoopbackPlan::Direct | LoopbackPlan::NoForwardNeeded => unreachable!("handled above"),
         };
         match forwarded {
@@ -5657,27 +5686,14 @@ impl TerminalView {
         }
     }
 
-    fn ensure_workspace_loopback(
-        &self,
-        ws: &crate::terminal::PaneWorkspace,
-        loopback: &super::loopback::LoopbackUrl,
-    ) -> anyhow::Result<crate::daemon::protocol::LoopbackForward> {
-        let req = RemoteTerminal::workspace_request(
-            ws,
-            self.pane_id,
-            crate::daemon::protocol::WorkspaceOp::EnsureLoopback {
-                remote_host: loopback.forward_host().to_string(),
-                remote_port: loopback.port,
-            },
-        )
-        .ok_or_else(|| anyhow::anyhow!("this workspace has no SSH connection to forward over"))?;
-        match RemoteTerminal::on_workspace(req)? {
-            crate::daemon::protocol::DaemonMsg::LoopbackForward(f) => Ok(f),
-            other => Err(anyhow::anyhow!("unexpected reply: {other:?}")),
-        }
+    /// How forward requests about this pane reach the daemon that owns them —
+    /// through the workspace when there is one, and by pane id when there is
+    /// not. The Ports list and the port watcher build the same thing.
+    pub(crate) fn forward_route(&self) -> crate::ui::app::ForwardRoute {
+        crate::ui::app::ForwardRoute::new(self.pane_id, self.workspace.clone())
     }
 
-    fn loopback_plan(&self, cx: &mut Context<Self>) -> LoopbackPlan {
+    fn loopback_plan(&self, cx: &gpui::App) -> LoopbackPlan {
         loopback_plan(
             cx.global::<Config>().ssh_loopback_forward,
             self.workspace.as_ref(),
@@ -5686,8 +5702,19 @@ impl TerminalView {
         )
     }
 
-    fn can_forward_loopback(&self, cx: &mut Context<Self>) -> bool {
+    fn can_forward_loopback(&self, cx: &gpui::App) -> bool {
         !matches!(self.loopback_plan(cx), LoopbackPlan::Direct)
+    }
+
+    /// How a loopback port this pane is serving can be reached from here.
+    ///
+    /// The Ports list asks this about every listener it found, and it is a
+    /// different question from "is this pane local": a remote pane's :3000 is
+    /// perfectly reachable once a forward exists, and building that forward is
+    /// something this app already knows how to do. Answering only "local or
+    /// not" is what left the list showing a port it refused to open.
+    pub(crate) fn port_route(&self, cx: &gpui::App) -> PortRoute {
+        port_route_of(&self.loopback_plan(cx), self.host_id().is_local())
     }
 
     pub fn hover_link_at(
@@ -7570,9 +7597,10 @@ mod tests {
         assert!(!out.contains(" …"), "{out:?}");
     }
     use super::{
-        COMPLETION_MENU_MAX_W, LoopbackPlan, RawInput, SelectEndCopy, Typeahead, WheelRoute,
-        clipboard_paste_text, compose_notification_title, cwd_is_on_host, display_width,
-        is_typeahead_interrupt, link_path_style, loopback_plan, observe_typeahead_for_owner,
+        COMPLETION_MENU_MAX_W, LoopbackPlan, PortRoute, RawInput, SelectEndCopy, Typeahead,
+        WheelRoute, clipboard_paste_text, compose_notification_title, cwd_is_on_host,
+        display_width, is_typeahead_interrupt, link_path_style, loopback_plan,
+        observe_typeahead_for_owner,
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
@@ -7806,6 +7834,34 @@ mod tests {
         assert_eq!(
             loopback_plan(true, Some(&w), Some(RemoteKind::NativeSsh), 7),
             LoopbackPlan::ForwardOnWorkspace(Box::new(w))
+        );
+    }
+
+    /// What the Ports list asks about every listener it found. The middle
+    /// case is the one that matters: a remote pane's port is not unreachable,
+    /// it is one forward away.
+    #[test]
+    fn a_remote_port_is_a_forward_away_rather_than_out_of_reach() {
+        use super::port_route_of;
+        assert_eq!(
+            port_route_of(&LoopbackPlan::ForwardOnPane(7), false),
+            PortRoute::Forward
+        );
+        assert_eq!(
+            port_route_of(&LoopbackPlan::NoForwardNeeded, false),
+            PortRoute::Direct,
+            "WSL serves onto this machine's own loopback"
+        );
+        assert_eq!(
+            port_route_of(&LoopbackPlan::Direct, true),
+            PortRoute::Direct,
+            "this machine's ports open with no help"
+        );
+        assert_eq!(
+            port_route_of(&LoopbackPlan::Direct, false),
+            PortRoute::Blocked,
+            "another machine's port with forwarding turned off is not ours to \
+             open — opening it here would reach some unrelated local service"
         );
     }
 
