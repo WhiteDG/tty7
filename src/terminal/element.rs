@@ -32,7 +32,7 @@ enum UnderlineKind {
 }
 
 #[derive(Clone)]
-struct RenderCell {
+pub(super) struct RenderCell {
     c: char,
     marks: Option<Box<[char]>>,
     fg: Hsla,
@@ -291,7 +291,7 @@ fn match_tint(cx: &gpui::App) -> u32 {
     }
 }
 
-struct PaintColors {
+pub(super) struct PaintColors {
     default_fg: Hsla,
     default_bg: Hsla,
     caret: Hsla,
@@ -401,7 +401,7 @@ fn blend_toward(c: Hsla, dim: f32, under: Rgba) -> Hsla {
 }
 
 impl PaintColors {
-    fn resolve(theme: &gpui_component::Theme, cx: &gpui::App) -> Self {
+    pub(super) fn resolve(theme: &gpui_component::Theme, cx: &gpui::App) -> Self {
         let default_fg = theme.foreground;
         let default_bg = theme.background;
         let caret = theme.caret;
@@ -836,8 +836,6 @@ fn segment_row(row: &[RenderCell]) -> Vec<RowSeg> {
 
 thread_local! {
                             static CHAR_STRINGS: RefCell<HashMap<char, SharedString>> = RefCell::new(HashMap::new());
-
-                        static GRID_BUF: RefCell<Vec<RenderCell>> = const { RefCell::new(Vec::new()) };
 
                         /// Measured ink extents and the font size they were measured at.
                         static INK_EXTENTS: RefCell<(Pixels, HashMap<(gpui::FontId, char), Option<Pixels>>)> =
@@ -1413,7 +1411,7 @@ fn paint_glyphs(
 }
 
 #[derive(Clone, Copy)]
-struct GridCursor {
+pub(super) struct GridCursor {
     row: usize,
     col: usize,
     // Where the IME candidate window should anchor: the fake caret drawn by
@@ -1553,7 +1551,8 @@ fn paint_marked(
     );
 }
 
-struct GridSnapshot {
+#[derive(Clone)]
+pub(super) struct GridSnapshot {
     cursor: Option<GridCursor>,
     sliver: Option<Vec<RenderCell>>,
     any_selected: bool,
@@ -1567,7 +1566,7 @@ struct GridSnapshot {
 }
 
 impl TerminalElement {
-    fn build_grid(
+    pub(super) fn build_grid(
         &self,
         colors: &PaintColors,
         buf: &mut Vec<RenderCell>,
@@ -1577,9 +1576,8 @@ impl TerminalElement {
         cx: &App,
         dim: f32,
         under: Rgba,
-    ) -> GridSnapshot {
-        buf.clear();
-        buf.resize(rows * cols, RenderCell::default());
+        must_block: bool,
+    ) -> Option<GridSnapshot> {
         let mut cursor: Option<GridCursor> = None;
         let mut sliver: Option<Vec<RenderCell>> = None;
         let mut any_selected = false;
@@ -1591,7 +1589,32 @@ impl TerminalElement {
                 palette[..16].copy_from_slice(&active.ansi16);
             }
             let term = self.view.read(cx).terminal.term.clone();
-            let term = term.lock();
+            // Rendering does not queue for the grid lock. Holding it is the
+            // pane's own reader, part-way through feeding a batch of output
+            // into the emulator — and one UI thread draws every pane in every
+            // window, so waiting here wires one pane's write speed to the frame
+            // rate of the whole window. That is the same illness as #709, which
+            // was this thread parked in `write(2)` for a stalled link; this is
+            // the read side of it. A frame that cannot have the lock paints the
+            // one before it, and nobody can see a frame of lag.
+            //
+            // `try_lock_unfair` rather than a lease: a painter that queued
+            // would make the reader wait for a frame it is not going to get
+            // anyway. Skipping the queue is safe precisely because it never
+            // waits.
+            let term = match term.try_lock_unfair() {
+                Some(term) => term,
+                // The two frames that have to have it: the first one, with no
+                // previous grid to fall back on, and the one after a resize,
+                // where the previous grid is the wrong shape. Both are rare and
+                // neither is in the steady state.
+                None if must_block => term.lock(),
+                None => return None,
+            };
+            // After the lock, not before: an early return must leave the
+            // previous frame's cells intact for the caller to paint again.
+            buf.clear();
+            buf.resize(rows * cols, RenderCell::default());
             let content = term.renderable_content();
             display_offset = content.display_offset as i32;
             history_size = term.grid().history_size();
@@ -1683,7 +1706,7 @@ impl TerminalElement {
         let (any_match, any_current) =
             self.flag_search_matches(buf, rows, cols, display_offset, cx);
         self.flag_hovered_link(buf, rows, cols, display_offset, cx);
-        GridSnapshot {
+        Some(GridSnapshot {
             cursor,
             sliver,
             any_selected,
@@ -1691,7 +1714,7 @@ impl TerminalElement {
             any_current,
             display_offset,
             history_size,
-        }
+        })
     }
 
     fn flag_hovered_link(
@@ -2035,8 +2058,18 @@ impl Element for TerminalElement {
             (colors, 1., Rgba::default())
         };
 
-        let mut buf = GRID_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
-        let snap = self.build_grid(
+        // This pane's previous frame, borrowed for the duration of this one.
+        // `build_grid` overwrites it when it gets the terminal lock, and leaves
+        // it exactly as it is when it does not.
+        let mut buf = self
+            .view
+            .update(cx, |view, _| std::mem::take(&mut view.grid_buf));
+        let previous = self.view.read(cx).grid_snap.clone();
+        // The two frames with nothing to fall back on: the first one this pane
+        // ever paints, and the one after a resize, whose previous grid is the
+        // wrong shape to paint into these bounds. Those wait for the lock.
+        let must_block = previous.is_none() || buf.len() != geom.rows * geom.cols;
+        let built = self.build_grid(
             &colors,
             &mut buf,
             geom.rows,
@@ -2045,7 +2078,17 @@ impl Element for TerminalElement {
             cx,
             dim,
             under,
+            must_block,
         );
+        if let Some(snap) = &built {
+            let snap = snap.clone();
+            self.view.update(cx, |view, _| view.grid_snap = Some(snap));
+        }
+        // `must_block` above is exactly the condition under which `build_grid`
+        // is not allowed to come back empty, so one of the two is always here.
+        let Some(snap) = built.or(previous) else {
+            return;
+        };
         let cursor = snap.cursor;
         let sliver = snap.sliver.as_ref();
 
@@ -2241,7 +2284,7 @@ impl Element for TerminalElement {
             }
         });
 
-        GRID_BUF.with(|b| *b.borrow_mut() = buf);
+        self.view.update(cx, |view, _| view.grid_buf = buf);
 
         self.register_mouse_handlers(geom, bounds, prepaint.hitbox.id, window);
 
