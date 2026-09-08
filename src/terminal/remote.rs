@@ -3261,6 +3261,40 @@ mod replay_tests {
         false
     }
 
+    /// Types `line` at the pane until the grid echoes `needle` back, and
+    /// answers whether it ever did.
+    ///
+    /// One write is not enough for the *first* command a fresh pane is given.
+    /// `spawn` returning means the pty exists, not that the shell behind it
+    /// has started, printed a prompt, or begun reading — and on Windows the
+    /// ConPTY has not necessarily connected the child to its input pipe yet,
+    /// so bytes typed into that window reach nobody at all. On a loaded runner
+    /// the window is wide: both cases showed up on Windows CI as a grid that
+    /// was still completely empty after 15s, so not even a prompt had been
+    /// printed, let alone an echo.
+    ///
+    /// Retyping is safe for everything asserted here: a line that did land and
+    /// was merely slow simply runs twice, and every assertion is a `contains`.
+    /// The later commands in these tests keep their single `write_input` —
+    /// by then the shell has echoed once, which is proof it is reading.
+    fn type_until_echoed(
+        pane: &tty7_core::daemon::pane::DaemonPane,
+        line: &[u8],
+        term: &RemoteTerminal,
+        needle: &str,
+    ) -> bool {
+        for _ in 0..15 {
+            pane.write_input(line);
+            for _ in 0..80 {
+                if all_text(term).contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        false
+    }
+
     /// Switching workspaces drops every pane and attaches to the same daemon
     /// panes again. Whatever the pane put on screen while the window was
     /// elsewhere — and whatever it had already — has to come back with it.
@@ -3286,9 +3320,13 @@ mod replay_tests {
         // pane is not 80x24 on screen, so the real geometry goes down the link
         // and the grid waits for the daemon to echo it back.
         first.resize(TermSize::new(120, 40), 8, 17);
-        pane.write_input(b"echo BEFORE-THE-SWITCH\r");
         assert!(
-            wait_for(&first, "BEFORE-THE-SWITCH"),
+            type_until_echoed(
+                &pane,
+                b"echo BEFORE-THE-SWITCH\r",
+                &first,
+                "BEFORE-THE-SWITCH"
+            ),
             "the pane never echoed the first command; grid held:\n{}",
             all_text(&first)
         );
@@ -3367,8 +3405,11 @@ mod replay_tests {
 
         let (first_epoch, mut first, first_forward) = attach_client(&pane);
         first.resize(TermSize::new(120, 40), 8, 17);
-        pane.write_input(b"echo RACED-OUTPUT\r");
-        assert!(wait_for(&first, "RACED-OUTPUT"), "the pane never echoed");
+        assert!(
+            type_until_echoed(&pane, b"echo RACED-OUTPUT\r", &first, "RACED-OUTPUT"),
+            "the pane never echoed; grid held:\n{}",
+            all_text(&first)
+        );
 
         // The second rebuild attaches before the first one's view is dropped.
         let (second_epoch, second, second_forward) = attach_client(&pane);
