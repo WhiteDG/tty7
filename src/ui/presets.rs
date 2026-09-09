@@ -86,6 +86,16 @@ pub mod state {
     pub const CURSOR: f32 = 1.70;
     pub const TEXT_RESTING: f32 = 4.6;
     pub const TEXT_STEP: f32 = 1.4;
+
+    /// The sidebar's selection ladder sits one rung above the window's. The
+    /// window paints a selected row inside a list the user is already looking
+    /// at; the sidebar paints the one tab out of twenty that owns the pane
+    /// area, and at 1.30:1 that tint measured as the faintest mark in the
+    /// column — fainter than a group header's count. `PRESSED` and `CURSOR`
+    /// climb with it so the ladder keeps its spacing.
+    pub const SIDEBAR_SELECTED: f32 = 1.50;
+    pub const SIDEBAR_PRESSED: f32 = 1.75;
+    pub const SIDEBAR_CURSOR: f32 = 1.92;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,9 +202,26 @@ impl Theme {
             sidebar,
             // Blended, not bisected, so a palette's own softness carries into
             // the sidebar — but floored on the fill it is actually painted on
-            // (`sidebar`, not `background`), because four of the builtins
-            // land this under 4.5:1 and it is the tab title, not a caption.
-            sidebar_fg: at_least(mix(fg, bg, 0.28), fg, sidebar, TEXT_FLOOR),
+            // (`sidebar`, not `background`). This is the tab title, the top
+            // rung of a three-rung column (title / branch / group header), and
+            // it is floored at `TITLE_FLOOR` rather than `TEXT_FLOOR` because
+            // the rung under it, `muted_foreground`, already sits at
+            // `TEXT_RESTING`: a title at 4.5:1 next to a caption at 4.6:1 is
+            // the same grey twice, and the column reads as one flat wash with
+            // nothing to look at first.
+            sidebar_fg: {
+                let title = at_least(mix(fg, bg, 0.10), fg, sidebar, TITLE_FLOOR);
+                // …and capped so the selected label keeps its `TEXT_STEP`
+                // above it: on a white-on-black palette a 10% blend lands so
+                // close to `fg` that there is nothing brighter left to step
+                // to. The floor wins over the cap on a soft palette, where
+                // the step is taken past `fg` instead (see `stepped_ink`).
+                let headroom = (contrast(fg, sidebar) / state::TEXT_STEP).max(TITLE_FLOOR);
+                match headroom > TITLE_FLOOR && contrast(title, sidebar) > headroom {
+                    true => dim(title, sidebar, headroom),
+                    false => title,
+                }
+            },
             accent: legible_accent(bg, self.accent),
         }
     }
@@ -298,14 +325,14 @@ impl Theme {
 
     pub fn surfaces(&self) -> Surfaces {
         let m = self.neutrals();
+        let fg = legible_foreground(self.background_color(), self.foreground);
         let mut sidebar = self.surface(m.sidebar);
+        sidebar.selected = raise(sidebar.base, fg, state::SIDEBAR_SELECTED);
+        sidebar.pressed = raise(sidebar.base, fg, state::SIDEBAR_PRESSED);
+        sidebar.cursor = raise(sidebar.base, fg, state::SIDEBAR_CURSOR);
         sidebar.text_resting = m.sidebar_fg;
-        sidebar.text_selected = stepped_ink(
-            sidebar.selected,
-            sidebar.base,
-            legible_foreground(self.background_color(), self.foreground),
-            sidebar.text_resting,
-        );
+        sidebar.text_selected =
+            stepped_ink(sidebar.selected, sidebar.base, fg, sidebar.text_resting);
         Surfaces {
             window: self.surface(m.background),
             sidebar,
@@ -572,6 +599,41 @@ pub(crate) fn wash(surface: u32, tint: u32, target: f32) -> u32 {
 }
 
 const TEXT_FLOOR: f32 = 4.5;
+
+/// The floor for the top rung of a text column whose second rung rests at
+/// `TEXT_RESTING`. WCAG AAA's 7:1, which also happens to be the smallest
+/// ratio that clears `TEXT_STEP` over a 4.6:1 caption with room to spare on
+/// the fills a sidebar is actually painted on.
+const TITLE_FLOOR: f32 = 7.0;
+
+/// A semantic ink stepped down to sit beside body text instead of over it.
+///
+/// `success` and `danger` are cleared to `TEXT_FLOOR` at full chroma, which is
+/// right for the one line that says a push failed and wrong for a `+94 −26`
+/// repeated on every row of a list: twelve saturated numerals become the
+/// loudest thing in the column while carrying the least. Blending toward the
+/// caption ink they sit next to keeps the hue (green still means added) and
+/// takes the shout out, then the blend is walked back toward the full ink
+/// only when the surface it lands on cannot carry it at `TEXT_FLOOR`.
+pub(crate) fn resting_ink(ink: Hsla, beside: Hsla, surface: Hsla) -> Hsla {
+    let (ink, beside, surface) = (pack(ink), pack(beside), pack(surface));
+    let blend = mix(ink, beside, 0.45);
+    gpui::rgb(at_least(blend, ink, surface, TEXT_FLOOR)).into()
+}
+
+/// A brand colour as ink on a theme surface: kept as authored when it already
+/// reads there, walked toward black or white only when it does not. What an
+/// agent glyph is drawn in once the disc behind it is no longer a solid brand
+/// fill — Claude's orange is a fill colour, not a text colour, on a light
+/// window, and pure-black Codex vanishes into a dark one.
+pub(crate) fn legible_on(surface: Hsla, seed: u32) -> Hsla {
+    gpui::rgb(legible_ink(pack(surface), seed, ACCENT_FLOOR)).into()
+}
+
+fn pack(c: Hsla) -> u32 {
+    let rgb = crate::terminal::palette::hsla_to_rgb(c);
+    (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32
+}
 
 /// Hairlines are separators, not control outlines — the surfaces they divide
 /// carry their own fills, so WCAG 1.4.11's 3:1 does not apply and painting them
@@ -1632,10 +1694,17 @@ mod tests {
         let dracula = builtins().into_iter().find(|t| t.id == "dracula").unwrap();
         let bg = dracula.background_color();
         let s = dracula.surfaces();
+        // The resting rung is checked as `state::SELECTED` on the sidebar
+        // fill — the surface it was signed off on — rather than as the rail's
+        // own fill: the rail was lifted off this value on purpose
+        // (`state::SIDEBAR_SELECTED`) once the tab that owns the pane area
+        // measured as the faintest mark in its own column, and this pin is
+        // here to catch the constant drifting, not that decision.
+        let fg = legible_foreground(bg, dracula.foreground);
         for (what, now, legacy) in [
             (
                 "resting",
-                s.sidebar.selected,
+                raise(s.sidebar.base, fg, state::SELECTED),
                 mix(bg, dracula.foreground, 0.12),
             ),
             ("cursor", s.window.cursor, mix(bg, dracula.foreground, 0.17)),
@@ -1937,12 +2006,59 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_title_is_stepped_off_its_caption() {
+        // The three rungs of a sidebar row — title, branch line, group
+        // header — all sat at the same 4.5:1 grey once; this is the guard
+        // against that column flattening again. The caption is dimmed on the
+        // window and painted on the sidebar, so measure it where it lands.
+        for t in builtins() {
+            let m = t.neutrals();
+            let step = contrast(m.sidebar_fg, m.muted_foreground);
+            assert!(
+                step >= state::TEXT_STEP - 0.01,
+                "{}: title {:#08x} is only {step:.2}:1 off the caption {:#08x}",
+                t.id,
+                m.sidebar_fg,
+                m.muted_foreground
+            );
+        }
+    }
+
+    #[test]
+    fn resting_semantic_ink_keeps_the_text_floor() {
+        for t in builtins() {
+            let m = t.neutrals();
+            let sem = t.semantics();
+            let beside: Hsla = gpui::rgb(m.muted_foreground).into();
+            for (name, ink) in [("success", sem.success.ink), ("danger", sem.danger.ink)] {
+                for (surface_name, surface) in [
+                    ("window", m.background),
+                    ("sidebar", m.sidebar),
+                    ("popover", m.popover),
+                ] {
+                    let resting = pack(resting_ink(
+                        gpui::rgb(ink).into(),
+                        beside,
+                        gpui::rgb(surface).into(),
+                    ));
+                    let ratio = contrast(resting, surface);
+                    assert!(
+                        ratio >= TEXT_FLOOR - 0.02,
+                        "{}/{surface_name}: resting {name} {resting:#08x} is only {ratio:.2}:1",
+                        t.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sidebar_text_reads_on_the_fill_it_is_painted_on() {
         for t in builtins() {
             let m = t.neutrals();
             let ratio = contrast(m.sidebar_fg, m.sidebar);
             assert!(
-                ratio >= TEXT_FLOOR - 0.01,
+                ratio >= TITLE_FLOOR - 0.01,
                 "{}: sidebar text {:#08x} is only {ratio:.2}:1 on the sidebar fill {:#08x}",
                 t.id,
                 m.sidebar_fg,

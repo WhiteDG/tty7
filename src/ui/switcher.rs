@@ -2916,6 +2916,7 @@ impl Tty7App {
                         tab.status,
                         tab.unread,
                         tab.ssh,
+                        picked,
                         ROW_AVATAR,
                         cx,
                     ))

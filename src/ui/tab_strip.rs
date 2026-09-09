@@ -1006,15 +1006,22 @@ impl Tty7App {
                                     .bg(cx.theme().secondary)
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(monogram),
                             )
                             .child(
+                                // Chrome, not a row: the tile inherits the
+                                // rail's title ink, which now belongs to the
+                                // tabs. The workspace name reads at the group
+                                // headers' weight so the one dark line in
+                                // the column stays the tab in front.
                                 div()
                                     .flex_shrink(1.)
                                     .min_w_0()
                                     .truncate()
                                     .text_size(px(12.5))
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(SharedString::from(current.clone())),
                             )
                             .child(
@@ -1271,6 +1278,7 @@ impl Tty7App {
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
         ssh: Option<u32>,
+        lit: bool,
         size: f32,
         cx: &App,
     ) -> gpui::AnyElement {
@@ -1293,16 +1301,29 @@ impl Tty7App {
                     Some(state) => format!("{} — {state}", agent.display_name()),
                     None => agent.display_name().to_string(),
                 };
+                // The brand colour is identity, not state, and identity is
+                // not what a column of twenty tabs needs shouted: a solid
+                // orange disc on every Claude row made the brand the loudest
+                // mark in the sidebar while a seven-pixel dot carried the one
+                // thing that changes. So the disc rests as a tint of its
+                // brand with the mark drawn in the brand's own ink, and only
+                // lights up solid where the eye is meant to land — the tab in
+                // front, and an agent that has stopped to ask something.
+                let accent = agent.accent_rgb();
+                let lit = lit || hollow;
+                let surface = cx.theme().background;
                 base.relative()
                     .rounded_full()
-                    .bg(gpui::rgb(agent.accent_rgb()))
+                    .when(lit, |d| d.bg(gpui::rgb(accent)))
+                    .when(!lit, |d| {
+                        d.bg(gpui::Hsla::from(gpui::rgb(accent)).opacity(0.16))
+                    })
                     // Codex and Grok are both pure black, which is the window
                     // fill on a dark theme — the disc dissolves and leaves the
                     // glyph floating. A hairline keeps it a disc in any theme.
-                    .when(
-                        crate::ui::presets::needs_edge(agent.accent_rgb(), cx.theme().background),
-                        |d| d.border_1().border_color(cx.theme().border),
-                    )
+                    .when(crate::ui::presets::needs_edge(accent, surface), |d| {
+                        d.border_1().border_color(cx.theme().border)
+                    })
                     .child(
                         gpui::svg()
                             .path(agent.icon_path())
@@ -1311,7 +1332,10 @@ impl Tty7App {
                             // the mark's colour comes from the agent rather
                             // than from the file. The tray icon reads the same
                             // answer.
-                            .text_color(gpui::rgb(agent.icon_rgb())),
+                            .text_color(match lit {
+                                true => gpui::Hsla::from(gpui::rgb(agent.icon_rgb())),
+                                false => crate::ui::presets::legible_on(surface, accent),
+                            }),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
                     .tooltip(move |window, cx| {
@@ -1935,6 +1959,7 @@ impl Tty7App {
                         agent_status,
                         agent_unread,
                         None,
+                        is_active,
                         18.,
                         cx,
                     ))
