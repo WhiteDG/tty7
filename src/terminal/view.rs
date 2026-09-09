@@ -25,9 +25,10 @@ use super::scrollbar::{GridScroll, TerminalScrollHandle};
 use super::search::{LinkTarget, SearchState};
 use super::typeahead::{RawInput, Typeahead};
 use crate::core::actions::{
-    CloseActiveTab, DecreaseFontSize, ForkAgentSessionDown, ForkAgentSessionLeft,
-    ForkAgentSessionRight, ForkAgentSessionUp, IncreaseFontSize, NewTab, SendBackTab, SendTab,
-    SplitDown, SplitRight, ToggleMaximizePane,
+    CloseActiveTab, CopyLinkPathUnderPointer, DecreaseFontSize, ForkAgentSessionDown,
+    ForkAgentSessionLeft, ForkAgentSessionRight, ForkAgentSessionUp, IncreaseFontSize, NewTab,
+    OpenLinkUnderPointer, RevealLinkUnderPointer, SendBackTab, SendTab, SplitDown, SplitRight,
+    ToggleMaximizePane,
 };
 use crate::core::config::{BellMode, Config, LinkFileOpen, MouseZoomModifier, NotifyMode};
 use crate::core::shell_quote::quote_for_shell;
@@ -352,6 +353,10 @@ pub struct TerminalView {
     /// deferred callback, one turn after the click — can still see the
     /// modifiers the user actually held.
     context_menu_allowed: bool,
+    /// The file link the most recent right mouse-down landed on, latched for
+    /// the same reason [`context_menu_allowed`](Self::context_menu_allowed)
+    /// is: by the time the menu is built the pointer is only a memory.
+    menu_link: Option<super::search::LinkTarget>,
     scroll_debt: f32,
     /// Lines travelled under the zoom modifier that have not yet added up to a
     /// font-size step. Kept apart from [`scroll_debt`](Self::scroll_debt) so
@@ -459,6 +464,15 @@ pub struct TerminalView {
 pub(super) struct HoveredLink {
     pub start: Point,
     pub end: Point,
+    /// Whether the modifier that would open this link is down.
+    ///
+    /// A link underlines as soon as the pointer reaches it, so the user can
+    /// see there is something there without holding anything. Only once the
+    /// modifier is down does it look and behave like something clickable:
+    /// promising a hand cursor over a link a plain click will not follow is
+    /// the kind of small lie that teaches people to stop trusting the
+    /// underline.
+    pub armed: bool,
 }
 
 enum LoopbackOpen {
@@ -1526,6 +1540,7 @@ impl TerminalView {
             link_repo_root: None,
             link_repo_root_pending: false,
             context_menu_allowed: true,
+            menu_link: None,
             scroll_debt: 0.,
             zoom_debt: 0.,
             scroll_frac: 0.,
@@ -5610,6 +5625,63 @@ impl TerminalView {
         true
     }
 
+    /// Latches the file link under a right mouse-down for the context menu.
+    ///
+    /// Resolving here rather than in the menu builder is what lets the menu
+    /// name a real file: the builder runs a turn later, with no event and no
+    /// pointer, and asking the grid then would be asking about wherever the
+    /// mouse has since gone.
+    pub fn record_menu_link(&mut self, col: usize, row: usize, cx: &mut Context<Self>) {
+        let include_loopback = self.can_forward_loopback(cx);
+        self.menu_link = match self.resolve_link_at(col, row, true, include_loopback, cx) {
+            LinkAt::Found(target @ LinkTarget::File { .. }, ..) => Some(target),
+            _ => None,
+        };
+    }
+
+    /// Drops a latched link, for a right click the application is taking.
+    pub fn forget_menu_link(&mut self) {
+        self.menu_link = None;
+    }
+
+    /// The path the context menu is about, if it is about one.
+    fn menu_link_path(&self) -> Option<&std::path::Path> {
+        match self.menu_link.as_ref()? {
+            LinkTarget::File { path, .. } => Some(path),
+            LinkTarget::Url(_) => None,
+        }
+    }
+
+    fn open_menu_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(LinkTarget::File {
+            path,
+            line,
+            column,
+            is_dir,
+        }) = self.menu_link.clone()
+        else {
+            return;
+        };
+        self.open_file_link(path, line, column, is_dir, window, cx);
+    }
+
+    fn reveal_menu_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.menu_link_path().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        if let Err(e) = reveal_file_path(&path) {
+            self.warn_file_open_failed(&path, &e, window, cx);
+        }
+    }
+
+    fn copy_menu_link_path(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.menu_link_path() else {
+            return;
+        };
+        let text = path.to_string_lossy().into_owned();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     /// Hands a resolved file link to whatever the user wants opening files.
     ///
     /// The built-in editor is the default because it is the one place that can
@@ -5790,16 +5862,41 @@ impl TerminalView {
         &mut self,
         col: usize,
         row: usize,
-        include_files: bool,
+        armed: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A mouse crossing a pane lands on the same cell many times over.
+        // Nothing about the answer depends on where inside the cell the
+        // pointer is, so the work is worth doing once.
+        if self.last_hover_cell == Some((col, row)) && self.link_modifier_down == armed {
+            return self.hovered_link.is_some();
+        }
         self.last_hover_cell = Some((col, row));
+        self.link_modifier_down = armed;
         if !cx.global::<Config>().link_url {
             self.clear_hovered_link(cx);
             return false;
         }
+        // A full-screen application drew what is on the grid and is watching
+        // the mouse itself, so pointing things out inside it is tty7 drawing
+        // on somebody else's window. Holding the modifier says the user wants
+        // tty7's reading of the screen anyway, and then it is theirs to have.
+        if !armed && self.on_alt_screen() {
+            if self.hovered_link.take().is_some() {
+                cx.notify();
+            }
+            return false;
+        }
+        // Most of a screen is blanks, and reading one cell costs a fraction
+        // of lifting a whole soft-wrapped logical line out of the grid.
+        if self.cell_is_blank(col, row) {
+            if self.hovered_link.take().is_some() {
+                cx.notify();
+            }
+            return false;
+        }
         let include_loopback = self.can_forward_loopback(cx);
-        let next = self.link_span_at(col, row, include_files, include_loopback, cx);
+        let next = self.link_span_at(col, row, armed, include_loopback, cx);
         if next != self.hovered_link {
             self.hovered_link = next;
             cx.notify();
@@ -5807,12 +5904,32 @@ impl TerminalView {
         self.hovered_link.is_some()
     }
 
-    pub fn refresh_link_hover(&mut self, include_files: bool, cx: &mut Context<Self>) -> bool {
-        self.link_modifier_down = include_files;
+    /// Whether the cell under the pointer holds anything a link could be made
+    /// of.
+    fn cell_is_blank(&self, col: usize, row: usize) -> bool {
+        let term = self.terminal.term.lock();
+        let Some(line) = Self::grid_line(&term, row) else {
+            return true;
+        };
+        col >= term.columns() || term.grid()[line][Column(col)].c.is_whitespace()
+    }
+
+    pub fn refresh_link_hover(&mut self, armed: bool, cx: &mut Context<Self>) -> bool {
         let Some((col, row)) = self.last_hover_cell else {
+            self.link_modifier_down = armed;
             return false;
         };
-        self.hover_link_at(col, row, include_files, cx)
+        self.hover_link_at(col, row, armed, cx)
+    }
+
+    /// Runs the hover again from scratch, for when the answer may have
+    /// changed under a mouse that never moved: a probe landing, a repository
+    /// root arriving.
+    fn recompute_link_hover(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((col, row)) = self.last_hover_cell.take() else {
+            return false;
+        };
+        self.hover_link_at(col, row, self.link_modifier_down, cx)
     }
 
     pub fn link_modifier_down(&self) -> bool {
@@ -5830,12 +5947,12 @@ impl TerminalView {
         &mut self,
         col: usize,
         row: usize,
-        include_files: bool,
+        armed: bool,
         include_loopback: bool,
         cx: &mut Context<Self>,
     ) -> Option<HoveredLink> {
-        match self.resolve_link_at(col, row, include_files, include_loopback, cx) {
-            LinkAt::Found(_, start, end) => Some(HoveredLink { start, end }),
+        match self.resolve_link_at(col, row, true, include_loopback, cx) {
+            LinkAt::Found(_, start, end) => Some(HoveredLink { start, end, armed }),
             LinkAt::Unresolved { .. } | LinkAt::None => None,
         }
     }
@@ -5904,7 +6021,7 @@ impl TerminalView {
             // Nothing answered. Hand back what the token *said* so a click can
             // say so out loud instead of looking broken.
             None => match files
-                .then(|| super::search::file_candidate_at(&text, click_idx))
+                .then(|| super::search::unresolved_candidate(&text, click_idx, roots.style))
                 .flatten()
             {
                 Some(candidate) => LinkAt::Unresolved { candidate, pending },
@@ -6010,8 +6127,7 @@ impl TerminalView {
             move |view, root, cx| {
                 view.link_repo_root_pending = false;
                 view.link_repo_root = Some((cwd, root));
-                let down = view.link_modifier_down;
-                view.refresh_link_hover(down, cx);
+                view.recompute_link_hover(cx);
             },
         );
     }
@@ -6055,8 +6171,7 @@ impl TerminalView {
             },
             |view, answers, cx| {
                 if view.link_probes.land(answers) {
-                    let down = view.link_modifier_down;
-                    view.refresh_link_hover(down, cx);
+                    view.recompute_link_hover(cx);
                 }
             },
         );
@@ -6776,6 +6891,15 @@ impl Render for TerminalView {
                 this.step_match(Direction::Left, cx);
             }))
             .on_action(cx.listener(|this, _: &ClearScrollback, _w, cx| this.clear_scrollback(cx)))
+            .on_action(cx.listener(|this, _: &OpenLinkUnderPointer, window, cx| {
+                this.open_menu_link(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RevealLinkUnderPointer, window, cx| {
+                this.reveal_menu_link(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyLinkPathUnderPointer, _w, cx| {
+                this.copy_menu_link_path(cx);
+            }))
             .on_action(cx.listener(|this, _: &InsertNewline, _w, cx| {
                 this.insert_newline_action(cx);
             }))
@@ -6806,6 +6930,37 @@ impl Render for TerminalView {
                 if !menu_view.read(cx).context_menu_allowed {
                     return menu;
                 }
+                let view = menu_view.read(cx);
+                // A path is the most specific thing the pointer can be on, so
+                // what it can do goes above what the pane can do.
+                let menu = match view.menu_link_path() {
+                    Some(path) => {
+                        let local = view.host_id.is_local();
+                        let reveal = match cfg!(target_os = "macos") {
+                            true => L10nKey::AppMenuRevealInFinder,
+                            false => L10nKey::AppMenuRevealInFolder,
+                        };
+                        let label = link_menu_label(path);
+                        menu.min_w(px(220.))
+                            .action_context(menu_focus.clone())
+                            .label(label)
+                            .menu(t(L10nKey::AppMenuOpenLink), Box::new(OpenLinkUnderPointer))
+                            // A file on another machine has no folder here to
+                            // show it in, and naming this one's would show
+                            // whatever it happens to keep at that path.
+                            .menu_element_with_disabled(
+                                Box::new(RevealLinkUnderPointer),
+                                !local,
+                                menu_row_with_hint(t(reveal), None),
+                            )
+                            .menu(
+                                t(L10nKey::AppMenuCopyLinkPath),
+                                Box::new(CopyLinkPathUnderPointer),
+                            )
+                            .separator()
+                    }
+                    None => menu,
+                };
                 let menu = menu
                     .min_w(px(220.))
                     .action_context(menu_focus.clone())
@@ -6834,7 +6989,6 @@ impl Render for TerminalView {
                         Box::new(ClearScrollback),
                     );
 
-                let view = menu_view.read(cx);
                 // `fork_label` is tty7-core's capability probe, and core has no
                 // locale table — take the answer, not its English wording.
                 let can_fork = view.agent().and_then(|a| a.fork_label()).is_some();
@@ -6883,6 +7037,15 @@ impl Render for TerminalView {
                     .menu(t(L10nKey::AppMenuClosePaneTab), Box::new(CloseActiveTab))
             })
     }
+}
+
+/// The header the link section of the context menu wears: the file's own
+/// name, so a menu opened over a long path says which one it is about without
+/// making the menu as wide as the path.
+fn link_menu_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn menu_row_with_hint(
@@ -7117,6 +7280,29 @@ pub(crate) fn open_file_path(path: &std::path::Path) -> std::io::Result<()> {
         "xdg-open"
     };
     std::process::Command::new(opener).arg(path).spawn()?;
+    Ok(())
+}
+
+/// Shows a path where it lives, rather than opening it.
+///
+/// `open -R` and `explorer /select,` both select the file inside its folder;
+/// no desktop-neutral Linux equivalent exists, so there the folder is opened
+/// and the file is left for the eye to find.
+pub(crate) fn reveal_file_path(path: &std::path::Path) -> std::io::Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    } else if cfg!(windows) {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(format!("/select,{}", path.display()));
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path.parent().unwrap_or(path));
+        c
+    };
+    command.spawn()?;
     Ok(())
 }
 
@@ -10057,8 +10243,16 @@ mod gpui_tests {
                     "the file is right there under the pane's directory"
                 );
                 assert!(
-                    !view.hover_link_at(7, 0, false, cx),
-                    "without the modifier a file path is not a link"
+                    view.hovered_link.as_ref().is_some_and(|link| link.armed),
+                    "with the modifier down it is ready to be clicked"
+                );
+                assert!(
+                    view.hover_link_at(7, 0, false, cx),
+                    "a path is pointed out before the modifier is down, not after"
+                );
+                assert!(
+                    view.hovered_link.as_ref().is_some_and(|link| !link.armed),
+                    "but held back, because a plain click will not follow it"
                 );
 
                 let gone = "ready (scratchpad/notes.md) and (".len();
@@ -10077,6 +10271,30 @@ mod gpui_tests {
                     }
                     _ => panic!("expected an unresolved path-shaped candidate"),
                 }
+
+                view.record_menu_link(7, 0, cx);
+                assert!(
+                    matches!(
+                        view.menu_link_path(),
+                        Some(path) if path.ends_with("scratchpad/notes.md")
+                    ),
+                    "a right click over a path opens a menu about that path"
+                );
+                view.record_menu_link(0, 0, cx);
+                assert!(
+                    view.menu_link_path().is_none(),
+                    "and a right click over `ready` opens the ordinary one"
+                );
+
+                // `ready (scratchpad...`: the blank between the two words.
+                assert!(!view.hover_link_at(5, 0, false, cx));
+                assert!(view.hovered_link.is_none(), "a blank holds no link");
+                assert_eq!(
+                    view.last_hover_cell,
+                    Some((5, 0)),
+                    "and the pointer is still remembered, so crossing a run \
+                     of blanks costs one look each rather than one a frame"
+                );
             })
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -10324,6 +10542,7 @@ mod gpui_tests {
                 view.hovered_link = Some(HoveredLink {
                     start: Point::new(Line(23), Column(0)),
                     end: Point::new(Line(23), Column(3)),
+                    armed: true,
                 });
                 view.set_grid_size(80, 24, px(8.), px(17.), 1., cx);
                 assert_eq!(view.last_hover_cell, Some((0, 23)));
@@ -10332,6 +10551,59 @@ mod gpui_tests {
                 assert!(view.hovered_link.is_none(), "so is the link it resolved");
             })
             .unwrap();
+    }
+
+    /// A full-screen application drew the grid and is watching the mouse
+    /// itself, so tty7 stays out of it until asked.
+    #[gpui::test]
+    fn a_path_under_a_full_screen_application_waits_for_the_modifier(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("tty7-view-alt-link-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("scratchpad")).expect("create scratchpad dir");
+        std::fs::write(dir.join("scratchpad/notes.md"), b"# notes").expect("create notes.md");
+
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
+        DaemonMsg::Output(b"\x1b[?1049hready scratchpad/notes.md\r\n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            let seen = window
+                .update(cx, |view, _, _| {
+                    view.cwd().is_some()
+                        && view.on_alt_screen()
+                        && view.terminal.term.lock().grid()[Line(0)][Column(6)].c == 's'
+                })
+                .unwrap();
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.on_alt_screen(), "the application took the grid");
+                assert!(
+                    !view.hover_link_at(6, 0, false, cx),
+                    "nothing is pointed out over somebody else's window"
+                );
+                assert!(
+                    view.hover_link_at(6, 0, true, cx),
+                    "asking for tty7's reading of the screen still gets it"
+                );
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_menu_is_headed_by_the_file_it_is_about() {
+        assert_eq!(
+            link_menu_label(std::path::Path::new("/a/very/long/way/down/notes.md")),
+            "notes.md",
+            "the name, so the menu is not as wide as the path"
+        );
+        assert_eq!(link_menu_label(std::path::Path::new("/")), "/");
     }
 
     /// Runs out the wait a new title is held for.

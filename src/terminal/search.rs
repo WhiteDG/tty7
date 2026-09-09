@@ -17,6 +17,11 @@ use crate::ui::i18n::{L10nKey, t};
 
 const MAX_MATCHES: usize = 10_000;
 
+/// How many readings of one token the candidate ladder may produce. Each one
+/// costs a probe per root, so the cap is what keeps a separator-dense token
+/// from turning a hover into a burst of filesystem calls.
+const MAX_FILE_CANDIDATES: usize = 8;
+
 /// How long a printing pane has to stay quiet before an open search bar
 /// rescans it. Short enough that a command's output is re-counted by the time
 /// the eye gets back to the bar, long enough that a flood costs one scan per
@@ -879,18 +884,30 @@ pub(super) fn link_at(
     if !include_files {
         return None;
     }
-    let candidate = file_candidate_at(text, col)?;
-    let (path, is_dir) = resolve_candidate(&candidate, roots, probe)?;
-    Some(LinkMatch {
-        start: candidate.start,
-        end: candidate.end,
-        target: LinkTarget::File {
-            path,
-            line: candidate.line,
-            column: candidate.column,
-            is_dir,
-        },
-    })
+    for candidate in file_candidates_at(text, col) {
+        let Some((path, is_dir)) = resolve_candidate(&candidate, roots, probe) else {
+            continue;
+        };
+        // A path can carry its line number instead of wearing it: only once
+        // something has answered for the file is it worth reading the prose
+        // beside it, and a directory has no line to land on.
+        let line = match (candidate.line, is_dir) {
+            (Some(line), _) => Some(line),
+            (None, true) => None,
+            (None, false) => location_after(text, candidate.end + 1),
+        };
+        return Some(LinkMatch {
+            start: candidate.start,
+            end: candidate.end,
+            target: LinkTarget::File {
+                path,
+                line,
+                column: candidate.column,
+                is_dir,
+            },
+        });
+    }
+    None
 }
 
 /// The first of `candidate`'s possible paths that something answers for.
@@ -987,31 +1004,171 @@ impl FileCandidate {
     }
 }
 
+/// Every path-shaped reading of the token under `col`, best first.
+///
 /// The syntactic half of file detection: everything that can be decided from
-/// the text alone, with no filesystem behind it.
-pub(super) fn file_candidate_at(text: &str, col: usize) -> Option<FileCandidate> {
-    let (start, end, token) = non_ws_token_at(text, col)?;
-    let (start, mut end, mut token) = trim_file_token(start, end, token);
-    if token.is_empty() {
-        return None;
+/// the text alone, with no filesystem behind it. One token can be read more
+/// than one way because terminal output wraps paths in a small set of known
+/// prefixes and suffixes — `--file=src/main.rs`, `+++ b/src/main.rs`,
+/// `src@` from `ls -F` — and which reading is the real one is a question only
+/// the filesystem can settle. So the ladder hands them all to the caller in
+/// the order they are worth asking about, longest path first.
+///
+/// Deliberately a short ladder rather than every substring between every
+/// separator: naming the prefixes costs a handful of readings where
+/// enumerating pairs costs a probe per pair, on every hover.
+pub(super) fn file_candidates_at(text: &str, col: usize) -> Vec<FileCandidate> {
+    let Some((base, _, token)) = non_ws_token_at(text, col) else {
+        return Vec::new();
+    };
+    let chars: Vec<char> = token.chars().collect();
+    let mut out: Vec<FileCandidate> = Vec::new();
+    for cut in left_cuts(&chars) {
+        push_candidates(base, &chars, cut, col, &mut out);
+    }
+    // Longest path first: `/srv/app/log` beats the `/srv/app` inside it when
+    // both exist, and a peeled reading only gets its turn once the one that
+    // was actually written has missed.
+    out.sort_by(|a, b| {
+        b.path
+            .chars()
+            .count()
+            .cmp(&a.path.chars().count())
+            .then(a.start.cmp(&b.start))
+    });
+    out.truncate(MAX_FILE_CANDIDATES);
+    out
+}
+
+/// The best reading of the token under `col`, which is what most of the
+/// carving tests are about.
+#[cfg(test)]
+fn file_candidate_at(text: &str, col: usize) -> Option<FileCandidate> {
+    file_candidates_at(text, col).into_iter().next()
+}
+
+/// The reading a click that resolved nothing should name.
+///
+/// The shortest one still written like a path, which is the part the user was
+/// pointing at rather than the `--flag=` or `label:` wrapped around it. A
+/// token that is not written like a path at all still comes back, so the
+/// caller can decide to say nothing at all about it.
+pub(super) fn unresolved_candidate(
+    text: &str,
+    col: usize,
+    style: PathStyle,
+) -> Option<FileCandidate> {
+    let candidates = file_candidates_at(text, col);
+    candidates
+        .iter()
+        .rev()
+        .find(|c| c.looks_like_a_path(style))
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// Where inside a token a path could start, besides the token's own start.
+///
+/// Each rule is applied to every cut it produces, so the prefixes stack the
+/// way they do in real output: `git diff`'s `a/` behind a `--file=`, a label
+/// behind that. The cap is what stops a separator-dense token from walking.
+fn left_cuts(chars: &[char]) -> Vec<usize> {
+    let mut cuts = vec![0usize];
+    let mut next = 0;
+    while next < cuts.len() && cuts.len() < MAX_FILE_CANDIDATES {
+        let base = cuts[next];
+        next += 1;
+        let rest = &chars[base..];
+        let mut offsets: Vec<usize> = Vec::new();
+        // `--file=src/main.rs`, `PATH=/usr/bin`. The last `=` wins, so a value
+        // that is itself an assignment keeps only its tail.
+        if let Some(i) = rest.iter().rposition(|&c| c == '=') {
+            offsets.push(i + 1);
+        }
+        // `note:src/main.rs`. Only a plain word may sit in front: one letter
+        // is a Windows drive (`C:\src`), and a prefix carrying a `/` or a `.`
+        // is more likely a path with a line number written onto it.
+        if let Some(i) = rest.iter().position(|&c| c == ':')
+            && i >= 2
+            && rest[0].is_ascii_alphabetic()
+            && rest[..i]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+        {
+            offsets.push(i + 1);
+        }
+        // What `git diff` calls the two sides of a change.
+        if matches!(rest.first(), Some('a' | 'b')) && rest.get(1) == Some(&'/') {
+            offsets.push(2);
+        }
+        for offset in offsets {
+            let cut = base + offset;
+            if cut < chars.len() && !cuts.contains(&cut) {
+                cuts.push(cut);
+            }
+        }
+    }
+    cuts
+}
+
+/// Turns one left cut into the readings it supports and files them in `out`.
+fn push_candidates(
+    base: usize,
+    chars: &[char],
+    cut: usize,
+    col: usize,
+    out: &mut Vec<FileCandidate>,
+) {
+    let mut start = cut;
+    while chars.get(start).is_some_and(|&c| is_left_wrapper(c)) {
+        start += 1;
+    }
+    let end = start + trim_token_end(&chars[start..]);
+    if end <= start {
+        return;
     }
 
-    let mut location = split_file_location(&token);
-    if location.line.is_none() && token.ends_with(':') {
-        token.pop();
-        end = end.saturating_sub(1);
-        location = split_file_location(&token);
+    let mut ends = vec![end];
+    // `ls -F` marks what it lists: `src@` is a symlink, `run*` an executable,
+    // `sock=` a socket, `fifo|` a FIFO. The mark is not part of the name.
+    if end - 1 > start && matches!(chars[end - 1], '@' | '*' | '=' | '|') {
+        ends.push(end - 1);
     }
-    if location.path.is_empty() {
-        return None;
+
+    for end in ends {
+        let mut token: String = chars[start..end].iter().collect();
+        let mut end = end - 1;
+        let mut location = split_file_location(&token);
+        // `foo.sh:` before `line 12`, and ripgrep's `path:` before a match.
+        if location.line.is_none() && token.ends_with(':') {
+            token.pop();
+            end = end.saturating_sub(1);
+            location = split_file_location(&token);
+        }
+        if location.path.is_empty() {
+            continue;
+        }
+        if !(base + start..=base + end).contains(&col) {
+            continue;
+        }
+        let mut readings = Vec::with_capacity(2);
+        if location.literal_too {
+            readings.push((token, None, None));
+        }
+        readings.push((location.path, location.line, location.column));
+        for (path, line, column) in readings {
+            let candidate = FileCandidate {
+                start: base + start,
+                end: base + end,
+                path,
+                line,
+                column,
+            };
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
     }
-    (start..=end).contains(&col).then_some(FileCandidate {
-        start,
-        end,
-        path: location.path,
-        line: location.line,
-        column: location.column,
-    })
 }
 
 pub(super) fn url_span_at(text: &str, col: usize) -> Option<(usize, usize, String)> {
@@ -1082,61 +1239,125 @@ fn non_ws_token_at(text: &str, col: usize) -> Option<(usize, usize, String)> {
     Some((start, end, chars[start..=end].iter().collect()))
 }
 
-fn trim_file_token(mut start: usize, mut end: usize, mut token: String) -> (usize, usize, String) {
-    while token
-        .chars()
-        .next()
-        .is_some_and(|c| matches!(c, '(' | '[' | '<' | '\'' | '"' | '{' | '`'))
-    {
-        token.remove(0);
-        start += 1;
-    }
-    while token
-        .chars()
-        .next_back()
-        .is_some_and(is_file_trailing_punct)
-    {
-        token.pop();
-        end = end.saturating_sub(1);
-    }
-    (start, end, token)
-}
-
-fn is_file_trailing_punct(c: char) -> bool {
+/// What can open a path without being part of it: the brackets and quotes
+/// prose puts around one, and the box-drawing glyphs `tree` and friends draw
+/// in front of one.
+fn is_left_wrapper(c: char) -> bool {
     matches!(
         c,
-        ')' | ']'
-            | '}'
-            | '.'
-            | ','
-            | ';'
-            | '\''
-            | '"'
-            | '>'
-            | '`'
-            | '）'
-            | '］'
-            | '】'
-            | '》'
-            | '」'
-            | '。'
-            | '，'
-            | '；'
-    )
+        '(' | '[' | '<' | '{' | '\'' | '"' | '`' | '（' | '［' | '｛' | '《' | '「' | '『' | '【'
+    ) || ('\u{2500}'..='\u{257F}').contains(&c)
+}
+
+/// Where the path stops and the sentence around it starts again, as an
+/// exclusive char index.
+fn trim_token_end(chars: &[char]) -> usize {
+    let mut end = chars.len();
+    while end > 0 {
+        let strip = match chars[end - 1] {
+            // A close that has an open of its own inside the token belongs to
+            // the path: `report(1).pdf` is a filename, `(src/lib.rs)` is not.
+            ')' => count_chars(&chars[..end], ')') > count_chars(&chars[..end], '('),
+            ']' => count_chars(&chars[..end], ']') > count_chars(&chars[..end], '['),
+            '}' => count_chars(&chars[..end], '}') > count_chars(&chars[..end], '{'),
+            // `.`, `..` and `foo/.` are directories, not a sentence that ran
+            // into the path.
+            '.' => !matches!(
+                end.checked_sub(2).and_then(|i| chars.get(i)),
+                None | Some('.' | '/' | '\\')
+            ),
+            ',' | ';' | '\'' | '"' | '>' | '`' | '）' | '］' | '】' | '》' | '」' | '』' | '。'
+            | '，' | '、' | '；' | '：' => true,
+            _ => false,
+        };
+        if !strip {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
+fn count_chars(chars: &[char], needle: char) -> usize {
+    chars.iter().filter(|&&c| c == needle).count()
 }
 
 struct FileLocation {
     path: String,
     line: Option<u32>,
     column: Option<u32>,
+    /// Whether the whole token is also worth reading as a filename.
+    ///
+    /// `backup(1)` and `main.ts(10)` are spelled identically, and only the
+    /// filesystem knows which is which, so both readings go on the ladder.
+    /// A `:10:2` suffix gets no such courtesy: a colon is illegal in a
+    /// Windows filename and vanishingly rare in a POSIX one, and doubling
+    /// the probes for the spelling every compiler uses is not worth it.
+    literal_too: bool,
 }
 
+/// The path, and the `line:column` written onto the end of it.
+///
+/// Three spellings cover what build tools actually print: `main.rs:10:2`
+/// (rustc, clang, ripgrep, eslint), `main.ts(10,2)` (tsc, MSVC, and every
+/// compiler that grew up on Windows) and `main.rs#L10` (a permalink pasted
+/// into a shell).
 fn split_file_location(token: &str) -> FileLocation {
+    if let Some(location) = paren_location(token) {
+        return location;
+    }
+    if let Some(location) = anchor_location(token) {
+        return location;
+    }
+    colon_location(token)
+}
+
+/// `main.ts(10,2)` and `main.ts(10)`.
+fn paren_location(token: &str) -> Option<FileLocation> {
+    let inner = token.strip_suffix(')')?;
+    let open = inner.rfind('(')?;
+    let (path, digits) = inner.split_at(open);
+    let digits = &digits['('.len_utf8()..];
+    if path.is_empty() || digits.is_empty() {
+        return None;
+    }
+    let mut parts = digits.split(',').map(str::trim);
+    let line = parts.next()?.parse().ok()?;
+    let column = match parts.next() {
+        Some(column) => Some(column.parse().ok()?),
+        None => None,
+    };
+    parts.next().is_none().then_some(FileLocation {
+        path: path.to_string(),
+        line: Some(line),
+        column,
+        literal_too: true,
+    })
+}
+
+/// `main.rs#L10`, and the `#L10-L20` a GitHub range permalink carries.
+fn anchor_location(token: &str) -> Option<FileLocation> {
+    let (path, anchor) = token.rsplit_once("#L")?;
+    if path.is_empty() {
+        return None;
+    }
+    let line = anchor.split('-').next()?.parse().ok()?;
+    Some(FileLocation {
+        path: path.to_string(),
+        line: Some(line),
+        column: None,
+        literal_too: true,
+    })
+}
+
+/// `main.rs:10:2` and `main.rs:10`.
+fn colon_location(token: &str) -> FileLocation {
     let Some((prefix, last)) = strip_numeric_suffix(token) else {
         return FileLocation {
             path: token.to_string(),
             line: None,
             column: None,
+            literal_too: false,
         };
     };
     if let Some((path, line)) = strip_numeric_suffix(prefix) {
@@ -1144,12 +1365,14 @@ fn split_file_location(token: &str) -> FileLocation {
             path: path.to_string(),
             line: Some(line),
             column: Some(last),
+            literal_too: false,
         }
     } else {
         FileLocation {
             path: prefix.to_string(),
             line: Some(last),
             column: None,
+            literal_too: false,
         }
     }
 }
@@ -1161,6 +1384,47 @@ fn strip_numeric_suffix(token: &str) -> Option<(&str, u32)> {
     }
     let value = suffix.parse().ok()?;
     Some((prefix, value))
+}
+
+/// The line number written *next to* a path rather than onto it.
+///
+/// Python's traceback is why this exists: `File "handlers.py", line 214` puts
+/// the number two tokens away, and landing on the file but not the line is
+/// most of the way to useless in the one place where clicking a path is worth
+/// the most. `bash`, `make` and `pytest` spell it the same way.
+fn location_after(text: &str, from: usize) -> Option<u32> {
+    /// Far enough to clear `", line ` and the number, and short enough that a
+    /// `line` belonging to the next sentence is out of reach.
+    const WINDOW: usize = 24;
+
+    let chars: Vec<char> = text.chars().skip(from).take(WINDOW).collect();
+    let at = |i: usize| chars.get(i).copied();
+    let mut i = 0;
+    // Whatever closed the path: the quote around it, the comma after it, the
+    // colon `bash` puts there.
+    while at(i)
+        .is_some_and(|c| matches!(c, '"' | '\'' | ',' | ':' | ')' | ']') || c.is_whitespace())
+    {
+        i += 1;
+    }
+    let word: String = chars.iter().skip(i).take(4).collect();
+    if !word.eq_ignore_ascii_case("line") {
+        return None;
+    }
+    i += 4;
+    // `lineage 5` is not a location.
+    if !at(i).is_some_and(char::is_whitespace) {
+        return None;
+    }
+    while at(i).is_some_and(char::is_whitespace) {
+        i += 1;
+    }
+    let digits: String = chars
+        .iter()
+        .skip(i)
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// The token with a leading `~` turned into a real directory, still spelled
@@ -2106,5 +2370,154 @@ mod tests {
             None
         );
         assert!(local_link_at("listening on localhost", 15, &one_root(cwd), true).is_some());
+    }
+
+    /// The span a link underlines, as `(start, end)` inclusive columns.
+    fn link_span(line: &str, col: usize, cwd: &Path) -> (usize, usize) {
+        let link = local_link_at(line, col, &one_root(cwd), true).expect("file link under cursor");
+        (link.start, link.end)
+    }
+
+    /// A path is rarely written on its own: build tools glue a flag, a label
+    /// or a diff side onto the front of it, and none of that is the path.
+    #[test]
+    fn a_path_is_found_inside_the_prefix_glued_onto_it() {
+        let path = temp_file("prefixed/src/main.rs");
+        let cwd = path.parent().and_then(Path::parent).unwrap();
+        let at = |line: &str| {
+            let byte = line.find("src/main.rs").expect("path start");
+            let col = line[..byte].chars().count();
+            (link_span(line, col, cwd), col)
+        };
+
+        for line in [
+            "rustc --emit=metadata --file=src/main.rs",
+            "note:src/main.rs",
+            "--- a/src/main.rs",
+            "+++ b/src/main.rs",
+            "├──src/main.rs",
+        ] {
+            let ((start, end), col) = at(line);
+            assert_eq!(
+                (start, end),
+                (col, col + "src/main.rs".chars().count() - 1),
+                "{line:?} must underline the path and nothing around it"
+            );
+            assert_file_link(line, col, cwd, &path, None, None);
+        }
+    }
+
+    /// `ls -F` says what it is listing by writing the type onto the name.
+    #[test]
+    fn an_ls_type_marker_is_not_part_of_the_name() {
+        let path = temp_file("marked/run.sh");
+        let cwd = path.parent().unwrap();
+
+        for marker in ['@', '*', '=', '|'] {
+            let line = format!("run.sh{marker}  other");
+            assert_file_link(&line, 2, cwd, &path, None, None);
+            assert_eq!(link_span(&line, 2, cwd), (0, 5), "{marker} is not a name");
+        }
+    }
+
+    /// What every compiler that grew up on Windows prints, `tsc` included.
+    #[test]
+    fn a_parenthesised_line_and_column_is_read_as_a_location() {
+        let path = temp_file("msvc/app.ts");
+        let cwd = path.parent().and_then(Path::parent).unwrap();
+
+        assert_file_link(
+            "msvc/app.ts(10,2): error TS2304",
+            2,
+            cwd,
+            &path,
+            Some(10),
+            Some(2),
+        );
+        assert_file_link("msvc/app.ts(10): warning", 2, cwd, &path, Some(10), None);
+        assert_file_link("msvc/app.ts#L7 pasted", 2, cwd, &path, Some(7), None);
+    }
+
+    /// The same spelling names a file on a machine that has downloaded
+    /// something twice, so the written-out reading is tried first.
+    #[test]
+    fn a_filename_that_looks_like_a_location_wins_over_the_location() {
+        let path = temp_file("dupes/backup(1)");
+        let cwd = path.parent().and_then(Path::parent).unwrap();
+
+        assert_file_link("kept dupes/backup(1) here", 5, cwd, &path, None, None);
+    }
+
+    /// Python puts the line number two tokens away from the file, and that is
+    /// the single place where clicking a path is worth the most.
+    #[test]
+    fn a_line_number_written_beside_a_path_is_still_a_location() {
+        let path = temp_file("beside/handlers.py");
+        let cwd = path.parent().and_then(Path::parent).unwrap();
+        let quoted = format!("  File \"{}\", line 214, in dispatch", path.display());
+        let byte = quoted.find('/').expect("absolute path start");
+        let col = quoted[..byte].chars().count();
+
+        assert_file_link(&quoted, col, Path::new("/"), &path, Some(214), None);
+        assert_eq!(
+            link_span(&quoted, col, Path::new("/")),
+            (col, col + path.to_string_lossy().chars().count() - 1),
+            "the underline stays on the path, not on the prose after it"
+        );
+
+        assert_file_link(
+            "beside/handlers.py: line 12: bad substitution",
+            2,
+            cwd,
+            &path,
+            Some(12),
+            None,
+        );
+        assert_file_link("beside/handlers.py lineage 12", 2, cwd, &path, None, None);
+    }
+
+    /// A directory has no line to land on, so nothing beside it is read as
+    /// one.
+    #[test]
+    fn nothing_beside_a_directory_is_read_as_a_line_number() {
+        let file = temp_file("nolines/inner/keep.txt");
+        let dir = file.parent().unwrap();
+        let cwd = dir.parent().and_then(Path::parent).unwrap();
+
+        assert_file_link("nolines/inner, line 12", 2, cwd, dir, None, None);
+    }
+
+    /// A trailing period ends a sentence, except where it is the directory.
+    #[test]
+    fn a_dot_that_names_a_directory_survives_the_trailing_trim() {
+        let file = temp_file("dotdir/inner/keep.txt");
+        let inner = file.parent().unwrap();
+        let cwd = inner.parent().unwrap();
+
+        let link = local_link_at("copied to inner/. now", 10, &one_root(cwd), true)
+            .expect("a dot directory is a directory");
+        match link.target {
+            LinkTarget::File { path, is_dir, .. } => {
+                assert_eq!(path, cwd.join("inner/."));
+                assert!(is_dir);
+            }
+            LinkTarget::Url(url) => panic!("expected directory link, got URL {url}"),
+        }
+    }
+
+    /// Every reading of one token is worth at most a handful of questions.
+    #[test]
+    fn the_candidate_ladder_stays_short() {
+        let dense = "a/b=note:d/e/f.rs:10:2";
+        let candidates = file_candidates_at(dense, 12);
+        assert!(
+            candidates.len() <= MAX_FILE_CANDIDATES,
+            "{} readings of {dense:?}",
+            candidates.len()
+        );
+        assert!(
+            candidates.iter().any(|c| c.path == "d/e/f.rs"),
+            "the reading behind the `note:` label is still on the ladder"
+        );
     }
 }

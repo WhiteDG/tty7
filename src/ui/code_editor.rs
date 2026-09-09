@@ -232,6 +232,14 @@ fn place_cursor(
     window.refresh();
 }
 
+/// Why the built-in editor could not take a file.
+enum EditorOpenError {
+    /// Not text, so the editor was never the right place for it.
+    NotText(PathBuf),
+    /// Something already worded for the user.
+    Message(String),
+}
+
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
@@ -523,47 +531,40 @@ impl Tty7App {
             host.clone(),
             window,
             cx,
-            move |h| -> Result<(PathBuf, String, Option<MTime>), String> {
+            move |h| -> Result<(PathBuf, String, Option<MTime>), EditorOpenError> {
                 let path = h.canonicalize(&p).unwrap_or(p);
                 let meta = match h.stat(&path) {
                     Ok(m) => m,
                     Err(e) => {
-                        return Err(t_fmt(
+                        return Err(EditorOpenError::Message(t_fmt(
                             L10nKey::EditorCantOpen,
                             &[("path", &path.display().to_string()), ("e", &e.to_string())],
-                        ));
+                        )));
                     }
                 };
                 if meta.len > MAX_FILE_BYTES {
-                    return Err(t_fmt(
+                    return Err(EditorOpenError::Message(t_fmt(
                         L10nKey::EditorFileTooLarge,
                         &[
                             ("path", &path.display().to_string()),
                             ("size", &(meta.len / (1024 * 1024)).to_string()),
                         ],
-                    ));
+                    )));
                 }
                 let bytes = match h.read_file(&path, MAX_FILE_BYTES) {
                     Ok(b) => b,
                     Err(e) => {
-                        return Err(t_fmt(
+                        return Err(EditorOpenError::Message(t_fmt(
                             L10nKey::EditorCantRead,
                             &[("path", &path.display().to_string()), ("e", &e.to_string())],
-                        ));
+                        )));
                     }
                 };
                 if looks_binary(&bytes) {
-                    return Err(t_fmt(
-                        L10nKey::EditorBinaryFile,
-                        &[("path", &path.display().to_string())],
-                    ));
+                    return Err(EditorOpenError::NotText(path));
                 }
-                let text = String::from_utf8(bytes).map_err(|_| {
-                    t_fmt(
-                        L10nKey::EditorNotUtf8,
-                        &[("path", &path.display().to_string())],
-                    )
-                })?;
+                let text =
+                    String::from_utf8(bytes).map_err(|_| EditorOpenError::NotText(path.clone()))?;
                 Ok((path, text, meta.mtime))
             },
             move |app, opened, window, cx| match opened {
@@ -574,9 +575,52 @@ impl Tty7App {
                     // would otherwise lose the line it asked for.
                     app.apply_pending_cursor(host_id, &requested, &path, window, cx);
                 }
-                Err(message) => window.push_notification(message, cx),
+                Err(EditorOpenError::NotText(path)) => {
+                    app.open_outside_the_editor(host_id, &path, window, cx);
+                }
+                Err(EditorOpenError::Message(message)) => {
+                    window.push_notification(message, cx);
+                }
             },
         );
+    }
+
+    /// What to do with a file the built-in editor cannot show.
+    ///
+    /// A click on a PNG or a `.zip` meant "open this", not "tell me it is not
+    /// text", and on this machine the desktop knows how. A file on another
+    /// machine has nobody here to hand it to, so that one gets the words.
+    fn open_outside_the_editor(
+        &mut self,
+        host_id: HostId,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !host_id.is_local() || !self.can_spawn_locally(cx) {
+            window.push_notification(
+                t_fmt(
+                    L10nKey::EditorBinaryFile,
+                    &[("path", &path.display().to_string())],
+                ),
+                cx,
+            );
+            return;
+        }
+        // The OS association can fail to spawn like any other opener (#542).
+        if let Err(e) = crate::terminal::view::open_file_path(path) {
+            log::warn!("failed to open {}: {e}", path.display());
+            window.push_notification(
+                t_fmt(
+                    L10nKey::LinkFileOpenFailed,
+                    &[
+                        ("path", &path.display().to_string()),
+                        ("error", &e.to_string()),
+                    ],
+                ),
+                cx,
+            );
+        }
     }
 
     fn editor_activate_open(
