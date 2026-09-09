@@ -2389,35 +2389,43 @@ pub(crate) fn notify_desktop(title: Option<&str>, body: &str) {
 /// `u64` here is what lets a caller hand over a `pane_id` — a different number,
 /// assigned by the daemon — and get a notification that reveals nothing.
 ///
-/// Every other case (no pane, unsupported platform, no room left to wait for a
-/// click) falls back to the plain `notify-rust` path below, which is why
+/// macOS always goes through `macos_notify`, clickable or not. Elsewhere, every
+/// other case (no pane, unsupported platform, no room left to wait for a click)
+/// falls back to the plain `notify-rust` path below, which is why
 /// `try_clickable_notification` reports whether it took the job.
 pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Option<EntityId>) {
     let summary = sanitize_notification_text(title.unwrap_or("tty7"), NOTIFY_TITLE_MAX);
     let body = sanitize_notification_text(body, NOTIFY_BODY_MAX);
 
-    if let Some(pane) = pane
-        && try_clickable_notification(&summary, &body, pane.as_u64())
+    #[cfg(all(target_os = "macos", not(test)))]
     {
-        return;
+        macos_notify::deliver(summary, body, pane.map(|p| p.as_u64()));
     }
-
-    std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        ensure_notification_app();
-        let mut notif = notify_rust::Notification::new();
-        notif.summary(&summary).body(&body);
-        // Without our own AUMID, the Windows backend falls back to
-        // PowerShell's — icon and name included. Only set ours once the shell
-        // has indexed a shortcut carrying it: for an AUMID it does not know,
-        // `show()` reports success and drops the toast, so the ugly fallback
-        // beats the branded one every time we are not sure.
-        #[cfg(target_os = "windows")]
-        if let Some(app_id) = crate::core::aumid::toast_app_id() {
-            notif.app_id(app_id);
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    {
+        if let Some(pane) = pane
+            && try_clickable_notification(&summary, &body, pane.as_u64())
+        {
+            return;
         }
-        let _ = notif.show();
-    });
+
+        std::thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            ensure_notification_app();
+            let mut notif = notify_rust::Notification::new();
+            notif.summary(&summary).body(&body);
+            // Without our own AUMID, the Windows backend falls back to
+            // PowerShell's — icon and name included. Only set ours once the
+            // shell has indexed a shortcut carrying it: for an AUMID it does
+            // not know, `show()` reports success and drops the toast, so the
+            // ugly fallback beats the branded one every time we are not sure.
+            #[cfg(target_os = "windows")]
+            if let Some(app_id) = crate::core::aumid::toast_app_id() {
+                notif.app_id(app_id);
+            }
+            let _ = notif.show();
+        });
+    }
 }
 
 /// Longest title / body we hand to a notification backend.
@@ -2448,58 +2456,128 @@ fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// Deliver a click-to-reveal notification, reporting whether it was taken.
-/// `false` means the caller should fall back to the plain notification path.
-#[cfg(all(target_os = "macos", not(test)))]
-fn try_clickable_notification(title: &str, body: &str, leaf_id: u64) -> bool {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+/// What a click on a macOS notification has to carry back: the pane to reveal.
+///
+/// It rides in the notification's `identifier`, which is the one field the
+/// center hands back verbatim on activation without a dictionary round trip.
+/// The sequence number keeps two notifications for the same pane apart — the
+/// center treats a repeated identifier as "replace the earlier one".
+#[cfg(any(target_os = "macos", test))]
+const NOTIFICATION_ID_PREFIX: &str = "tty7-pane-";
 
-    // `mac-notification-sys` blocks the calling thread until the user acts on
-    // the notification, and its wait has no timeout: a banner nobody touches —
-    // the common case, since unclicked ones just pile up in Notification
-    // Center — parks its thread for the rest of the session. Cap how many can
-    // be outstanding and let the rest through as fire-and-forget, so a chatty
-    // agent cannot turn a session's notifications into a thread leak.
-    const MAX_PENDING_CLICKS: usize = 8;
-    static PENDING: AtomicUsize = AtomicUsize::new(0);
-
-    if PENDING
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_PENDING_CLICKS).then_some(n + 1)
-        })
-        .is_err()
-    {
-        return false;
-    }
-
-    let (title, body) = (title.to_string(), body.to_string());
-    std::thread::spawn(move || {
-        show_macos_toast(&title, &body, leaf_id);
-        PENDING.fetch_sub(1, Ordering::AcqRel);
-    });
-    true
+#[cfg(any(target_os = "macos", test))]
+fn notification_identifier(leaf_id: u64) -> String {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{NOTIFICATION_ID_PREFIX}{leaf_id}-{seq}")
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn leaf_id_in_identifier(identifier: &str) -> Option<u64> {
+    let rest = identifier.strip_prefix(NOTIFICATION_ID_PREFIX)?;
+    let (leaf_id, _seq) = rest.split_once('-')?;
+    leaf_id.parse().ok()
+}
+
+/// macOS notifications, straight to `NSUserNotificationCenter`.
+///
+/// This used to go through `mac-notification-sys` with `wait_for_click`, so a
+/// click could reveal the pane. The way that crate notices a click is to park
+/// the sending thread and, for every notification outstanding, add a repeating
+/// 0.5 s timer to the *main* run loop that calls `deliveredNotifications` — a
+/// synchronous XPC round trip — to see whether the banner is still there. A
+/// banner nobody clicks stays in Notification Center, so its timer never goes
+/// away. Sampled with nine outstanding: a fifth of the UI thread inside that
+/// XPC, every window juddering, and each agent turn adding one more timer.
+///
+/// Here the click arrives through the center's delegate, which is what the
+/// API is for: no parked thread, no timer, nothing on the main thread until
+/// the user actually clicks. The pane rides in the notification's identifier.
+///
+/// Nothing else may touch the center on this platform. `mac-notification-sys`
+/// installs a delegate of its own the first time it sends, the last
+/// `setDelegate:` wins, and `notify-rust` is that crate on macOS — so its
+/// `show` is never called here, only its `set_application`, which does not
+/// install one (that is what names a bare `cargo run` binary to the center).
 #[cfg(all(target_os = "macos", not(test)))]
-fn show_macos_toast(title: &str, body: &str, leaf_id: u64) {
-    use mac_notification_sys::{Notification, NotificationResponse};
+#[allow(
+    deprecated,
+    reason = "UNUserNotificationCenter needs a signed, entitled bundle; NSUserNotification is what a bare binary can use"
+)]
+mod macos_notify {
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::runtime::ProtocolObject;
+    use objc2::{AnyThread, define_class, msg_send};
+    use objc2_foundation::{
+        NSObject, NSObjectProtocol, NSString, NSUserNotification, NSUserNotificationCenter,
+        NSUserNotificationCenterDelegate,
+    };
 
-    // `send` sets the delivering application on first use and keeps it under a
-    // `Once`, so whoever notifies first decides the name and icon for the whole
-    // session. Without this the default wins — `com.apple.Finder` — and every
-    // later notification, this path or `notify-rust`'s, claims to be Finder.
-    ensure_notification_app();
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; `Delegate` has no
+        // ivars and no `Drop`.
+        #[unsafe(super = NSObject)]
+        #[name = "Tty7NotificationDelegate"]
+        struct Delegate;
 
-    let response = Notification::new()
-        .title(title)
-        .message(body)
-        .wait_for_click(true)
-        .send();
+        // SAFETY: `NSObjectProtocol` has no safety requirements.
+        unsafe impl NSObjectProtocol for Delegate {}
 
-    match response {
-        Ok(NotificationResponse::Click) => reveal_pane(leaf_id),
-        Ok(_) => {}
-        Err(e) => log::warn!("failed to show macOS notification: {e}"),
+        // SAFETY: `NSUserNotificationCenterDelegate` has no safety requirements.
+        unsafe impl NSUserNotificationCenterDelegate for Delegate {
+            /// Runs on the main thread, when the user clicks the banner or the
+            /// entry in Notification Center. Only a channel push happens here.
+            #[unsafe(method(userNotificationCenter:didActivateNotification:))]
+            fn did_activate(
+                &self,
+                center: &NSUserNotificationCenter,
+                notification: &NSUserNotification,
+            ) {
+                if let Some(leaf_id) = notification
+                    .identifier()
+                    .and_then(|id| super::leaf_id_in_identifier(&id.to_string()))
+                {
+                    super::reveal_pane(leaf_id);
+                }
+                center.removeDeliveredNotification(notification);
+            }
+        }
+    );
+
+    fn install_delegate() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            super::ensure_notification_app();
+            // SAFETY: `NSObject`'s `init` takes nothing and returns the object.
+            let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(), init] };
+            let center = NSUserNotificationCenter::defaultUserNotificationCenter();
+            // SAFETY: `delegate` is a `Delegate`, which conforms to the protocol.
+            unsafe { center.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+            // The center holds its delegate unretained. Ours lives as long as
+            // the process, so it is simply never released.
+            std::mem::forget(delegate);
+        });
+    }
+
+    /// Hands the notification to the center and returns. `deliverNotification:`
+    /// is an XPC message, so it goes out on a short-lived thread rather than
+    /// from wherever the OSC sequence was parsed — never the UI thread.
+    pub(super) fn deliver(title: String, body: String, leaf_id: Option<u64>) {
+        std::thread::spawn(move || {
+            autoreleasepool(|_| {
+                install_delegate();
+                let notification = NSUserNotification::new();
+                notification.setTitle(Some(&NSString::from_str(&title)));
+                notification.setInformativeText(Some(&NSString::from_str(&body)));
+                if let Some(leaf_id) = leaf_id {
+                    let id = super::notification_identifier(leaf_id);
+                    notification.setIdentifier(Some(&NSString::from_str(&id)));
+                }
+                NSUserNotificationCenter::defaultUserNotificationCenter()
+                    .deliverNotification(&notification);
+            });
+        });
     }
 }
 
@@ -2678,6 +2756,31 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    #[test]
+    fn a_notification_identifier_carries_its_pane_back_out() {
+        let id = notification_identifier(42);
+        assert_eq!(leaf_id_in_identifier(&id), Some(42));
+    }
+
+    #[test]
+    fn two_notifications_for_one_pane_do_not_replace_each_other() {
+        // The center replaces a delivered notification whose identifier repeats.
+        assert_ne!(notification_identifier(7), notification_identifier(7));
+    }
+
+    #[test]
+    fn a_foreign_identifier_reveals_nothing() {
+        for id in [
+            "",
+            "tty7-pane-",
+            "tty7-pane-x-1",
+            "tty7-pane-42",
+            "other-42-1",
+        ] {
+            assert_eq!(leaf_id_in_identifier(id), None, "{id:?}");
+        }
+    }
 
     #[test]
     fn sanitizing_drops_control_bytes_but_keeps_line_breaks() {
