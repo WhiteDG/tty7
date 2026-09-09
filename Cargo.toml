@@ -115,10 +115,8 @@ reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "1d217ee
 alacritty_terminal.workspace = true
 
 # Desktop notifications driven by OSC 9 / OSC 777 escape sequences, on Linux and
-# Windows. macOS never calls its `show`: that backend (`mac-notification-sys`)
-# installs its own delegate on NSUserNotificationCenter and would take the
-# click-to-reveal delegate in `terminal::remote::macos_notify` with it. On macOS
-# only its `set_application` is used, to name a bare binary to the center.
+# Windows. On macOS only its `set_application` is used — never `show`; see
+# `terminal::remote::macos_notify` for why.
 notify-rust = "4"
 
 # Filesystem watcher for live config reload: watches `config.json` and reloads

@@ -2390,18 +2390,18 @@ pub(crate) fn notify_desktop(title: Option<&str>, body: &str) {
 /// assigned by the daemon — and get a notification that reveals nothing.
 ///
 /// macOS always goes through `macos_notify`, clickable or not. Elsewhere, every
-/// other case (no pane, unsupported platform, no room left to wait for a click)
-/// falls back to the plain `notify-rust` path below, which is why
+/// other case (no pane, unsupported platform, Windows toast queue full) falls
+/// back to the plain `notify-rust` path below, which is why
 /// `try_clickable_notification` reports whether it took the job.
 pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Option<EntityId>) {
     let summary = sanitize_notification_text(title.unwrap_or("tty7"), NOTIFY_TITLE_MAX);
     let body = sanitize_notification_text(body, NOTIFY_BODY_MAX);
 
-    #[cfg(all(target_os = "macos", not(test)))]
+    #[cfg(target_os = "macos")]
     {
         macos_notify::deliver(summary, body, pane.map(|p| p.as_u64()));
     }
-    #[cfg(not(all(target_os = "macos", not(test))))]
+    #[cfg(not(target_os = "macos"))]
     {
         if let Some(pane) = pane
             && try_clickable_notification(&summary, &body, pane.as_u64())
@@ -2410,8 +2410,6 @@ pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Opt
         }
 
         std::thread::spawn(move || {
-            #[cfg(target_os = "macos")]
-            ensure_notification_app();
             let mut notif = notify_rust::Notification::new();
             notif.summary(&summary).body(&body);
             // Without our own AUMID, the Windows backend falls back to
@@ -2460,8 +2458,16 @@ fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
 ///
 /// It rides in the notification's `identifier`, which is the one field the
 /// center hands back verbatim on activation without a dictionary round trip.
-/// The sequence number keeps two notifications for the same pane apart — the
-/// center treats a repeated identifier as "replace the earlier one".
+/// Shape: `tty7-pane-<pid>-<leaf>-<seq>`.
+///
+/// The pid is what makes a stale identifier fail closed. Notifications outlive
+/// the process that sent them, and the center hands a click on one of those to
+/// whatever process now owns the bundle id — a relaunched tty7, or a second
+/// instance running alongside. A leaf id is a gpui entity id, which a fresh
+/// process hands out again in the same order, so without the pid that click
+/// would reveal an unrelated pane. The sequence number keeps two notifications
+/// for the same pane apart — the center treats a repeated identifier as
+/// "replace the earlier one".
 #[cfg(any(target_os = "macos", test))]
 const NOTIFICATION_ID_PREFIX: &str = "tty7-pane-";
 
@@ -2470,12 +2476,17 @@ fn notification_identifier(leaf_id: u64) -> String {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{NOTIFICATION_ID_PREFIX}{leaf_id}-{seq}")
+    let pid = std::process::id();
+    format!("{NOTIFICATION_ID_PREFIX}{pid}-{leaf_id}-{seq}")
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn leaf_id_in_identifier(identifier: &str) -> Option<u64> {
     let rest = identifier.strip_prefix(NOTIFICATION_ID_PREFIX)?;
+    let (pid, rest) = rest.split_once('-')?;
+    if pid.parse::<u32>().ok()? != std::process::id() {
+        return None;
+    }
     let (leaf_id, _seq) = rest.split_once('-')?;
     leaf_id.parse().ok()
 }
@@ -2500,7 +2511,7 @@ fn leaf_id_in_identifier(identifier: &str) -> Option<u64> {
 /// `setDelegate:` wins, and `notify-rust` is that crate on macOS — so its
 /// `show` is never called here, only its `set_application`, which does not
 /// install one (that is what names a bare `cargo run` binary to the center).
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 #[allow(
     deprecated,
     reason = "UNUserNotificationCenter needs a signed, entitled bundle; NSUserNotification is what a bare binary can use"
@@ -2527,7 +2538,9 @@ mod macos_notify {
         // SAFETY: `NSUserNotificationCenterDelegate` has no safety requirements.
         unsafe impl NSUserNotificationCenterDelegate for Delegate {
             /// Runs on the main thread, when the user clicks the banner or the
-            /// entry in Notification Center. Only a channel push happens here.
+            /// entry in Notification Center. A channel push, then the clicked
+            /// entry is dropped from the center — a one-way message, unlike the
+            /// `deliveredNotifications` round trip this module exists to avoid.
             #[unsafe(method(userNotificationCenter:didActivateNotification:))]
             fn did_activate(
                 &self,
@@ -2548,7 +2561,16 @@ mod macos_notify {
     fn install_delegate() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            super::ensure_notification_app();
+            // Name the delivering application to the center before it is first
+            // touched: the center drops requests from a process with no bundle
+            // identity, which is what a bare `cargo run` binary is. This
+            // swizzles `-[NSBundle bundleIdentifier]` for the main bundle to
+            // `com.github.tty7` when LaunchServices knows that id (a bundled
+            // tty7.app, or a machine that has one installed); when it does not,
+            // the swizzle's own default, `com.apple.Terminal`, is what the
+            // center sees. It can only be called once per process, so there is
+            // no second chance to pass a different name.
+            let _ = notify_rust::set_application("com.github.tty7");
             // SAFETY: `NSObject`'s `init` takes nothing and returns the object.
             let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(), init] };
             let center = NSUserNotificationCenter::defaultUserNotificationCenter();
@@ -2727,17 +2749,14 @@ fn show_windows_toast(
 
 /// Ask the tray dispatch loop to bring `leaf_id` to the front. Runs on whatever
 /// thread the platform hands the activation to, so it only touches the channel.
-#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+#[cfg(any(target_os = "macos", all(target_os = "windows", not(test))))]
 fn reveal_pane(leaf_id: u64) {
     if let Some(tx) = crate::ui::tray::sender() {
         let _ = tx.try_send(crate::ui::tray::TrayAction::RevealPane { leaf_id });
     }
 }
 
-#[cfg(not(any(
-    all(target_os = "macos", not(test)),
-    all(target_os = "windows", not(test))
-)))]
+#[cfg(not(any(target_os = "macos", all(target_os = "windows", not(test)))))]
 fn try_clickable_notification(_title: &str, _body: &str, _leaf_id: u64) -> bool {
     // Linux notifications go through notify-rust; click-to-reveal would need a
     // D-Bus action listener of its own.
@@ -2771,15 +2790,29 @@ mod notification_tests {
 
     #[test]
     fn a_foreign_identifier_reveals_nothing() {
+        let pid = std::process::id();
         for id in [
-            "",
-            "tty7-pane-",
-            "tty7-pane-x-1",
-            "tty7-pane-42",
-            "other-42-1",
+            String::new(),
+            "tty7-pane-".into(),
+            "tty7-pane-x-1".into(),
+            "tty7-pane-42".into(),
+            "other-42-1".into(),
+            format!("tty7-pane-{pid}"),
+            format!("tty7-pane-{pid}-42"),
+            format!("tty7-pane-{pid}-x-1"),
         ] {
-            assert_eq!(leaf_id_in_identifier(id), None, "{id:?}");
+            assert_eq!(leaf_id_in_identifier(&id), None, "{id:?}");
         }
+    }
+
+    #[test]
+    fn a_notification_from_another_process_reveals_nothing() {
+        // Notifications outlive the process that sent them, and gpui hands out
+        // the same entity ids again in a fresh process. A stale click must not
+        // land on whatever pane holds that id now.
+        let other_pid = std::process::id().wrapping_add(1);
+        let stale = format!("{NOTIFICATION_ID_PREFIX}{other_pid}-42-0");
+        assert_eq!(leaf_id_in_identifier(&stale), None);
     }
 
     #[test]
@@ -2806,17 +2839,6 @@ mod notification_tests {
             "a &amp; b &lt; c &gt; &quot;d&quot; &apos;e&apos;"
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_notification_app() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if notify_rust::set_application("com.github.tty7").is_err() {
-            let _ = notify_rust::set_application("com.apple.Terminal");
-        }
-    });
 }
 
 struct OscNotifyScanner {
