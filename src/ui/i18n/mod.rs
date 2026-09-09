@@ -789,6 +789,8 @@ l10n_keys! {
     PanelProcessesSubtitle,
     PanelPortsSubtitle,
     PanelPortsUnsupported,
+    PanelPortsProbeFailed,
+    PanelPortsRestricted,
     PortAutoForwarded,
     PanelCwd,
     PanelShell,
