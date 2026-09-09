@@ -12,7 +12,6 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
-use crate::terminal::agent_marks::{AgentTurnScanner, AgentTurns, TurnCut};
 use crate::terminal::parked_cursor::{CursorCut, ParkedCursorRepair, ParkedCursorScanner};
 
 use std::collections::VecDeque;
@@ -64,16 +63,6 @@ struct ShellState {
     cycle: u64,
 }
 
-/// A point in a batch of pty output where the emulator has to stop, because
-/// something wants to read the state the sequence there left behind — the cell
-/// a repaint hid the cursor on, or the row an agent turn began at. Both are
-/// positions, and a position is only knowable by parsing up to it and no
-/// further.
-enum Cut {
-    Cursor(CursorCut),
-    Turn(TurnCut),
-}
-
 struct ReaderSignals {
     cwd: Arc<Mutex<Option<PathBuf>>>,
     shell: Arc<Mutex<ShellState>>,
@@ -93,10 +82,6 @@ struct ReaderSignals {
     images: crate::terminal::images::ImageStore,
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     clipboard_write_busy: Arc<AtomicBool>,
-    /// Where each agent turn started, anchored to the grid the same way — see
-    /// [`crate::terminal::agent_marks`]. The daemon reads the same events for
-    /// the status dot, but only the client holds the rows they point into.
-    turns: AgentTurns,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -539,9 +524,6 @@ pub struct RemoteTerminal {
     images: crate::terminal::images::ImageStore,
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     clipboard_write_busy: Arc<AtomicBool>,
-    /// The conversation's shape, for the outline in the Info panel: one entry
-    /// per agent turn, anchored to the scrollback row it began on.
-    turns: AgentTurns,
     route: PaneRoute,
     proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
@@ -833,10 +815,6 @@ impl RemoteTerminal {
         // Drop them; the daemon does not replay out-of-band image frames, so a
         // browser redraws on its next transmit (see issue #213's reattach note).
         self.images.clear();
-        // Turn anchors point into the same grid. The replay that follows
-        // carries the agent's events with it, so the outline rebuilds itself
-        // from the bytes rather than being kept across the reset.
-        self.turns.clear();
 
         let quit = Arc::new(AtomicBool::new(false));
         let reader = Self::spawn_reader(
@@ -861,7 +839,6 @@ impl RemoteTerminal {
                 images: self.images.clone(),
                 clipboard_writes: self.clipboard_writes.clone(),
                 clipboard_write_busy: self.clipboard_write_busy.clone(),
-                turns: self.turns.clone(),
             },
         );
         self.reader_thread = Some(reader);
@@ -915,7 +892,6 @@ impl RemoteTerminal {
         let images = crate::terminal::images::ImageStore::new();
         let clipboard_writes = Arc::new(Mutex::new(VecDeque::new()));
         let clipboard_write_busy = Arc::new(AtomicBool::new(false));
-        let turns = AgentTurns::new();
 
         let reader_quit = Arc::new(AtomicBool::new(false));
         let reader_thread = Self::spawn_reader(
@@ -940,7 +916,6 @@ impl RemoteTerminal {
                 images: images.clone(),
                 clipboard_writes: clipboard_writes.clone(),
                 clipboard_write_busy: clipboard_write_busy.clone(),
-                turns: turns.clone(),
             },
         );
 
@@ -976,7 +951,6 @@ impl RemoteTerminal {
             images,
             clipboard_writes,
             clipboard_write_busy,
-            turns,
             route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
@@ -1061,7 +1035,6 @@ impl RemoteTerminal {
                     images,
                     clipboard_writes,
                     clipboard_write_busy,
-                    turns,
                 } = signals;
                 crate::core::threads::promote_to_user_interactive();
                 let mut stream = read_half;
@@ -1071,7 +1044,6 @@ impl RemoteTerminal {
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
                 let mut cursor_scan = ParkedCursorScanner::new();
                 let mut parked_cursor = ParkedCursorRepair::default();
-                let mut turn_scan = AgentTurnScanner::new();
                 let mut pending: Vec<u8> = buffered;
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1122,25 +1094,14 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
-                                // Each scanner reports an offset one past the
-                                // sequence it matched, in ascending order, so the
-                                // batch splits at each of them: advance the
+                                // The scanner reports an offset one past each
+                                // sequence it matched, in ascending order, so
+                                // the batch splits at each of them: advance the
                                 // emulator to the cut, act on the state that
                                 // sequence left behind, carry on.
-                                let mut cuts: Vec<(usize, Cut)> = Vec::new();
+                                let mut cuts: Vec<(usize, CursorCut)> = Vec::new();
                                 if Self::REPAIR_PARKED_CURSOR {
-                                    cursor_scan
-                                        .feed(&out_batch, |off, c| cuts.push((off, Cut::Cursor(c))));
-                                }
-                                // Two ascending runs concatenated are not one
-                                // ascending run, and a cut out of order would
-                                // advance the emulator backwards — but only a
-                                // batch carrying both kinds pays for the sort,
-                                // and agent events are a handful per turn.
-                                let cursor_cuts = cuts.len();
-                                turn_scan.feed(&out_batch, |off, c| cuts.push((off, Cut::Turn(c))));
-                                if cursor_cuts > 0 && cuts.len() > cursor_cuts {
-                                    cuts.sort_by_key(|(off, _)| *off);
+                                    cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
                                 }
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
@@ -1156,10 +1117,7 @@ impl RemoteTerminal {
                                         for (off, cut) in cuts {
                                             processor.advance(&mut *term, &out_batch[at..off]);
                                             at = off;
-                                            match cut {
-                                                Cut::Cursor(c) => parked_cursor.apply(&mut term, c),
-                                                Cut::Turn(t) => turns.apply(&term, t),
-                                            }
+                                            parked_cursor.apply(&mut term, cut);
                                         }
                                         processor.advance(&mut *term, &out_batch[at..]);
                                     }
@@ -1278,27 +1236,13 @@ impl RemoteTerminal {
                                 flush_batch!();
                                 cursor_scan.reset();
                                 parked_cursor.reset();
-                                turn_scan.reset();
                                 proxy.replaying.store(true, Ordering::Relaxed);
-                                // A replayed ring is the pane's own history
-                                // coming back, agent events and all, so cut it
-                                // the same way live output is cut: the outline
-                                // of a conversation is rebuilt by reattaching
-                                // to the pane, not lost with the old client.
-                                let mut turn_cuts: Vec<(usize, TurnCut)> = Vec::new();
-                                turn_scan.feed(&bytes, |off, c| turn_cuts.push((off, c)));
                                 {
                                     let mut term = term.lock();
                                     if quit.load(Ordering::SeqCst) {
                                         return;
                                     }
-                                    let mut at = 0usize;
-                                    for (off, cut) in turn_cuts {
-                                        processor.advance(&mut *term, &bytes[at..off]);
-                                        at = off;
-                                        turns.apply(&term, cut);
-                                    }
-                                    processor.advance(&mut *term, &bytes[at..]);
+                                    processor.advance(&mut *term, &bytes);
                                     if processor.sync_timeout().sync_timeout().is_some() {
                                         processor.stop_sync(&mut *term);
                                     }
@@ -1700,12 +1644,6 @@ impl RemoteTerminal {
 
     pub fn agent_session(&self) -> Option<AgentSessionState> {
         self.agent_session.lock().ok().and_then(|g| g.clone())
-    }
-
-    /// This pane's agent turns, anchored to the scrollback. Same cheap handle
-    /// clone as [`images`](Self::images), shared with the reader thread.
-    pub fn agent_turns(&self) -> AgentTurns {
-        self.turns.clone()
     }
 
     pub fn zle_reading(&self) -> bool {
@@ -5516,75 +5454,6 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(""), "an unnamed command start does not inherit a name");
-    }
-
-    /// A `prompt-submit` the hook wrote into the middle of a batch of output.
-    fn prompt_event(prompt: &str) -> Vec<u8> {
-        format!(
-            "\x1b]777;notify;{};{{\"v\":1,\"agent\":\"claude\",\
-             \"event\":\"prompt-submit\",\"prompt\":\"{prompt}\"}}\x07",
-            crate::core::cli_agent::AGENT_EVENT_SENTINEL
-        )
-        .into_bytes()
-    }
-
-    fn poll_turns(term: &RemoteTerminal) -> Vec<crate::terminal::agent_marks::AgentTurn> {
-        for _ in 0..200 {
-            let turns = term.agent_turns().list();
-            if !turns.is_empty() {
-                return turns;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        Vec::new()
-    }
-
-    #[test]
-    fn an_agent_turn_anchors_where_its_event_sits_in_the_batch() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // One frame, so one batch: the event's row is only reachable by
-        // splitting the batch at it. Reading the cursor after the whole batch
-        // has been parsed would answer 5.
-        let mut out = b"a\r\nb\r\n".to_vec();
-        out.extend_from_slice(&prompt_event("restore the outline"));
-        out.extend_from_slice(b"c\r\nd\r\ne\r\n");
-        DaemonMsg::Output(out).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
-
-        let turns = poll_turns(&term);
-        assert_eq!(turns.len(), 1, "one prompt, one turn");
-        assert_eq!(
-            turns[0].row,
-            Some(2),
-            "the anchor is the row the event arrived on, not the end of the batch"
-        );
-        assert_eq!(turns[0].text, "restore the outline");
-        assert!(!turns[0].done, "no stop yet");
-    }
-
-    #[test]
-    fn a_replayed_ring_brings_the_conversation_back_with_it() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // What reattaching to a pane looks like: its history arrives as a
-        // snapshot, agent events and all. The outline has to be rebuilt from
-        // those bytes — nothing else carries it across a client restart.
-        let mut snapshot = b"older output\r\n".to_vec();
-        snapshot.extend_from_slice(&prompt_event("what did we decide"));
-        DaemonMsg::Snapshot(snapshot)
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let turns = poll_turns(&term);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].row, Some(1));
-        assert_eq!(turns[0].text, "what did we decide");
     }
 
     #[test]

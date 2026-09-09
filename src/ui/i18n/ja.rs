@@ -1127,13 +1127,6 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::PanelNoChanges => "未コミットの変更はありません",
         L10nKey::PanelNoChangesHint => "ワーキングツリーはクリーンです",
         L10nKey::PanelSessionSubtitle => "セッション",
-        L10nKey::PanelConversationSubtitle => "会話",
-        L10nKey::PanelTurnAltScreenNow => {
-            "全画面プログラムがこのペインを占有している間は、戻る先がありません"
-        }
-        L10nKey::PanelTurnNoScrollback => {
-            "このターンは代替画面に描かれたため、スクロールバックに残っていません"
-        }
         L10nKey::PanelProcessesSubtitle => "プロセス",
         L10nKey::PanelPortsSubtitle => "ポート",
         L10nKey::PanelPortsUnsupported => "リモートの tty7-server が古く、ポートを列挙できません。",
