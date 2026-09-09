@@ -2023,13 +2023,6 @@ fn group_names(roots: &[&PathBuf]) -> Vec<String> {
     }
 }
 
-/// Whether a `+N −M` is a button, and what it opens if it is.
-///
-/// One function because the setting is one setting: the sidebar's counts and
-/// the Info panel's `changes` row are the same number about the same working
-/// tree, and "Open diff preview from sidebar counts" turning one of them into
-/// plain text while the other stayed clickable would be a setting that half
-/// works.
 /// Where a click on a tab's diff counts opens the overlay: the focused pane's
 /// repo, when the setting allows a preview at all.
 fn git_click(
@@ -2047,6 +2040,13 @@ fn git_click(
     )
 }
 
+/// Whether a `+N −M` is a button, and what it opens if it is.
+///
+/// One function because the setting is one setting: the sidebar's counts and
+/// the Info panel's `changes` row are the same number about the same working
+/// tree, and "Open diff preview from sidebar counts" turning one of them into
+/// plain text while the other stayed clickable would be a setting that half
+/// works.
 pub(crate) fn diff_click_cwd<T>(cfg: &Config, target: Option<T>) -> Option<T> {
     cfg.sidebar_diff_preview.then_some(target).flatten()
 }
