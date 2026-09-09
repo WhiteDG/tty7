@@ -406,6 +406,14 @@ pub struct TerminalView {
     history_ranked: Vec<String>,
     history_frecency: Vec<f64>,
     history_scope: super::history::Scope,
+    /// What each scope this pane has already loaded held when it was left, so
+    /// stepping back into one (`exit` out of an `ssh` session, most of all)
+    /// has a list to recall from right away instead of an empty one that only
+    /// refills once a background read lands (#817).
+    history_cache: Vec<(super::history::Scope, super::history::History)>,
+    /// Whether the current scope's list is a finished load rather than the
+    /// empty placeholder one starts as. Only a finished one is worth stashing.
+    history_ready: bool,
     ranked_cwd: Option<std::path::PathBuf>,
     history_nav: Option<usize>,
     history_stash: String,
@@ -1557,6 +1565,8 @@ impl TerminalView {
             history_ranked,
             history_frecency,
             history_scope: super::history::Scope::Local,
+            history_cache: Vec::new(),
+            history_ready: true,
             ranked_cwd: None,
             history_nav: None,
             history_stash: String::new(),
@@ -3658,21 +3668,70 @@ impl TerminalView {
         super::history::Scope::Local
     }
 
+    /// How many scopes' lists to keep around. A pane hops between a handful of
+    /// hosts at most; the cap is only here so a long-lived pane that reaches
+    /// many of them cannot grow without bound.
+    const HISTORY_CACHE_MAX: usize = 4;
+
+    /// Park the current scope's list so coming back to it is instant. A list
+    /// that never finished loading is not worth parking — the empty one it
+    /// would leave behind is exactly what the cache exists to avoid handing
+    /// back.
+    fn stash_history(&mut self) {
+        if !self.history_ready {
+            return;
+        }
+        let scope = self.history_scope.clone();
+        self.history_cache.retain(|(cached, _)| *cached != scope);
+        self.history_cache.push((
+            scope,
+            super::history::History {
+                entries: std::mem::take(&mut self.history),
+                counts: std::mem::take(&mut self.history_counts),
+                cwds: std::mem::take(&mut self.history_cwds),
+                meta: std::mem::take(&mut self.history_meta),
+            },
+        ));
+        if self.history_cache.len() > Self::HISTORY_CACHE_MAX {
+            self.history_cache.remove(0);
+        }
+    }
+
     fn follow_history_scope(&mut self, cx: &mut Context<Self>) {
         let scope = self.desired_history_scope();
         if scope == self.history_scope {
             return;
         }
         self.flush_pending_history();
+        self.stash_history();
         self.history_scope = scope.clone();
-        self.history.clear();
-        self.history_counts.clear();
-        self.history_cwds.clear();
-        self.history_meta.clear();
+        match self
+            .history_cache
+            .iter()
+            .position(|(cached, _)| *cached == scope)
+        {
+            Some(i) => {
+                let (_, cached) = self.history_cache.remove(i);
+                self.history = cached.entries;
+                self.history_counts = cached.counts;
+                self.history_cwds = cached.cwds;
+                self.history_meta = cached.meta;
+                self.history_ready = true;
+            }
+            None => {
+                self.history.clear();
+                self.history_counts.clear();
+                self.history_cwds.clear();
+                self.history_meta.clear();
+                self.history_ready = false;
+            }
+        }
         self.history_ranked.clear();
         self.history_frecency.clear();
         self.history_nav = None;
         self.reverse_search = None;
+        let ranked_cwd = self.ranked_cwd.clone();
+        self.rerank_history(ranked_cwd.as_deref());
         cx.notify();
 
         let shell_files = self.remote_shell_history_sources(cx);
@@ -3700,6 +3759,7 @@ impl TerminalView {
                 view.history_counts = loaded.counts;
                 view.history_cwds = loaded.cwds;
                 view.history_meta = loaded.meta;
+                view.history_ready = true;
                 let cwd = view.ranked_cwd.clone();
                 view.rerank_history(cwd.as_deref());
                 cx.notify();
@@ -10020,6 +10080,107 @@ mod gpui_tests {
             })
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coming back from an `ssh` session left the pane with no history at all:
+    /// the scope switch cleared the list, and the reload that refills it is a
+    /// background task, so ↑ recalled nothing until that landed (#817).
+    #[gpui::test]
+    fn a_pane_back_from_ssh_still_recalls_its_local_history(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.history = vec!["cargo build".to_string(), "ssh box".to_string()];
+            })
+            .unwrap();
+
+        let away = crate::daemon::protocol::RemoteContext {
+            kind: crate::daemon::protocol::RemoteKind::Ssh,
+            argv: vec!["ssh".into(), "box".into()],
+            target: "box".into(),
+        };
+        DaemonMsg::RemoteContext(Some(away))
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            if window
+                .update(cx, |view, _, _| view.remote_context().is_some())
+                .unwrap()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        window
+            .update(cx, |view, _, cx| view.follow_history_scope(cx))
+            .unwrap();
+
+        DaemonMsg::RemoteContext(None).encode(&mut daemon).unwrap();
+        for _ in 0..200 {
+            if window
+                .update(cx, |view, _, _| view.remote_context().is_none())
+                .unwrap()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, _, cx| {
+                view.follow_history_scope(cx);
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "ssh box",
+                    "↑ right after the ssh session ended recalled nothing"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The cache above must not hand a scope someone else's list: stepping into
+    /// an `ssh` session still starts from nothing until the far end's own
+    /// history is read.
+    #[gpui::test]
+    fn a_pane_going_out_to_ssh_does_not_inherit_the_local_history(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.history = vec!["rm -rf ./build".to_string()];
+            })
+            .unwrap();
+
+        DaemonMsg::RemoteContext(Some(crate::daemon::protocol::RemoteContext {
+            kind: crate::daemon::protocol::RemoteKind::Ssh,
+            argv: vec!["ssh".into(), "box".into()],
+            target: "box".into(),
+        }))
+        .encode(&mut daemon)
+        .unwrap();
+        for _ in 0..200 {
+            if window
+                .update(cx, |view, _, _| view.remote_context().is_some())
+                .unwrap()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, _, cx| {
+                view.follow_history_scope(cx);
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "",
+                    "a local command was recalled onto a remote prompt"
+                );
+            })
+            .unwrap();
     }
 
     /// Absolute paths in a pane that is `ssh`-ed somewhere used to be resolved
