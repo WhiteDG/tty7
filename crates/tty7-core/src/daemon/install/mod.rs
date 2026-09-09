@@ -1341,37 +1341,135 @@ fn connection_label(conn: &SshConnection) -> String {
     conn.key().as_str().to_string()
 }
 
+/// What one SSH connection's server probe proved, kept so that the panes after
+/// the first one do not pay for proving it again.
+///
+/// `Installer::run` is four to six serial round trips — `uname -sm`, an SFTP
+/// realpath for the home directory, an SFTP stat, a control probe that spawns
+/// the server binary, and `check_running_build`, which walks `/proc/<pid>/exe`
+/// with a `readlink` per PID (or shells out to `ps` where there is no `/proc`).
+/// That is a fair price once for a machine and an absurd one per pane: issue
+/// #695 is a user watching `connecting to ...` for ten seconds every time they
+/// open a tab on a host tty7 was already connected to and already serving. The
+/// SSH connection itself is reused, so none of that wait is handshake cost.
+///
+/// Deliberately not a global map keyed by host, the way [`wsl`]'s is. A distro
+/// name is the whole identity of a WSL target, but an SSH connection can die
+/// and be replaced under the same key, and a note about the previous link must
+/// not answer for the next one. Keying by connection generation *is* keeping
+/// the note on the connection — see `SshConnection::proved_server`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvedServer {
+    /// The server binary the probe settled on, which is what the route runs.
+    pub binary: String,
+    /// The build mismatch the probe found, if it found one.
+    ///
+    /// Kept because the warning is raised inside `Installer::run`, and the
+    /// whole point of the memo is that `run` does not happen again: without
+    /// this, only the first pane on a connection would ever hear that a
+    /// different build is serving the machine, and every pane after it — every
+    /// window, since a connection outlives one — would attach in silence. That
+    /// is the one way memoizing could quietly cancel the version check, so it
+    /// is the one thing the note carries besides the path.
+    pub mismatch: Option<MismatchedRemoteDaemon>,
+}
+
+impl ProvedServer {
+    fn from_report(report: InstallReport) -> ProvedServer {
+        ProvedServer {
+            binary: report.paths.binary,
+            mismatch: report.mismatch,
+        }
+    }
+}
+
+/// Answer from the note if there is one, otherwise prove it and leave a note.
+///
+/// Two rules the callers depend on:
+///
+/// - A failed probe is not remembered. `prove` returning an error leaves the
+///   slot exactly as it found it, so a host that was briefly unreachable, or an
+///   install the user declined once, is retried by the next pane rather than
+///   pinned into permanent failure for the life of the connection.
+/// - A remembered mismatch is re-filed on every hit. Each route carries its own
+///   mismatch sink (`RouteSetup::mismatches`), drained into a prompt as the
+///   route is set up, so re-filing is what makes the *n*th pane's client hear
+///   what the first pane's probe found.
+fn proved_or_prove(
+    slot: &mut Option<ProvedServer>,
+    prove: impl FnOnce() -> io::Result<ProvedServer>,
+) -> io::Result<String> {
+    if let Some(known) = slot.as_ref() {
+        if let Some(mismatch) = known.mismatch.clone() {
+            record_remote_mismatches(vec![mismatch]);
+        }
+        return Ok(known.binary.clone());
+    }
+    let proved = prove()?;
+    let binary = proved.binary.clone();
+    *slot = Some(proved);
+    Ok(binary)
+}
+
 pub fn ensure_remote_server(conn: &Arc<SshConnection>) -> io::Result<String> {
     let host = connection_label(conn);
     ensure_remote_server_labeled(conn, &host)
 }
 
 pub fn ensure_remote_server_labeled(conn: &Arc<SshConnection>, host: &str) -> io::Result<String> {
-    let ops = ssh_ops::SshRemoteOps::new(conn.clone());
-    let fetch = default_fetcher();
-    let confirm = install_confirm();
-    let source = BundledOrRelease::discover(fetch.as_ref());
-    let report = Installer::with_source(&ops, &source, confirm.as_ref(), host).run()?;
-    log::info!(
-        "remote {host}: {} at {} ({}{})",
-        if report.installed {
-            "installed tty7-server"
-        } else {
-            "tty7-server already present"
-        },
-        report.paths.binary,
-        if report.launched {
-            "daemon launched"
-        } else {
-            "daemon already running"
-        },
-        if report.mismatch.is_some() {
-            ", build mismatch recorded"
-        } else {
-            ""
-        },
-    );
-    Ok(report.paths.binary)
+    // The lock is held across the probe, not just across the read: two panes
+    // opening at once on a cold connection would otherwise both install, and
+    // the loser would be uploading over the very file the winner is renaming
+    // into place. Waiting out an install is what the second pane wants to do
+    // anyway — it needs the same answer.
+    let mut slot = conn.proved_server();
+    if let Some(known) = slot.as_ref() {
+        log::debug!(
+            "remote {host}: tty7-server was already proved at {} on this connection",
+            known.binary,
+        );
+    }
+    proved_or_prove(&mut slot, || {
+        let ops = ssh_ops::SshRemoteOps::new(conn.clone());
+        let fetch = default_fetcher();
+        let confirm = install_confirm();
+        let source = BundledOrRelease::discover(fetch.as_ref());
+        let report = Installer::with_source(&ops, &source, confirm.as_ref(), host).run()?;
+        log::info!(
+            "remote {host}: {} at {} ({}{})",
+            if report.installed {
+                "installed tty7-server"
+            } else {
+                "tty7-server already present"
+            },
+            report.paths.binary,
+            if report.launched {
+                "daemon launched"
+            } else {
+                "daemon already running"
+            },
+            if report.mismatch.is_some() {
+                ", build mismatch recorded"
+            } else {
+                ""
+            },
+        );
+        Ok(ProvedServer::from_report(report))
+    })
+}
+
+/// Drop what we thought we knew about a connection's server, so that the next
+/// `ensure_remote_server` on it proves the whole thing again.
+///
+/// Three callers, and between them they are the memo's correctness argument:
+/// [`restart_remote_daemon`] and [`replace_remote_server`], which change which
+/// build is serving the machine and therefore what the note claims, and the
+/// router, which calls this when a routed link closes without the remote ever
+/// sending a byte — the only way a path that has stopped working is found out.
+/// A reconnect needs no caller at all: the note lives on the connection, and a
+/// new connection has none.
+pub fn forget_remote_server(conn: &SshConnection) {
+    *conn.proved_server() = None;
 }
 
 pub fn restart_remote_daemon(conn: &Arc<SshConnection>) -> io::Result<()> {
@@ -1379,6 +1477,11 @@ pub fn restart_remote_daemon(conn: &Arc<SshConnection>) -> io::Result<()> {
     let ops = ssh_ops::SshRemoteOps::new(conn.clone());
     let fetch = default_fetcher();
     let confirm = install_confirm();
+    // Forget first, not afterwards: this deliberately changes what is running
+    // over there, which is most of what the note claims, and a restart that
+    // fails halfway must leave the next pane looking rather than trusting a
+    // note written before the upheaval.
+    forget_remote_server(conn);
     Installer::new(&ops, fetch.as_ref(), confirm.as_ref(), host).restart_daemon()?;
     Ok(())
 }
@@ -1389,6 +1492,7 @@ pub fn replace_remote_server(conn: &Arc<SshConnection>) -> io::Result<()> {
     let fetch = default_fetcher();
     let confirm = install_confirm();
     let source = BundledOrRelease::discover(fetch.as_ref());
+    forget_remote_server(conn);
     Installer::with_source(&ops, &source, confirm.as_ref(), host).replace()?;
     Ok(())
 }
