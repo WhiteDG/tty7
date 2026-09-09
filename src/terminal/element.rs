@@ -20,6 +20,11 @@ use crate::core::config::Config;
 
 const DIM_OPACITY: f32 = 0.66;
 
+/// How much of the text's own colour a link's underline keeps before the
+/// modifier is down. Low enough to read as a hint rather than as markup, high
+/// enough to survive a light theme.
+const HELD_BACK_LINK_ALPHA: f32 = 0.45;
+
 #[derive(Clone, Copy, PartialEq, Default, Debug)]
 enum UnderlineKind {
     #[default]
@@ -978,6 +983,19 @@ fn powerline_solid_edge(
     ))
 }
 
+/// What colour a hovered link's underline takes.
+///
+/// Until the modifier is down the link is only being pointed out, so it is
+/// drawn as the same underline held back. A cell carrying an underline of its
+/// own keeps the colour it was given: dimming that would be editing the
+/// application's output rather than annotating it.
+fn link_underline_color(cell: &RenderCell, armed: bool) -> Option<Hsla> {
+    if armed || cell.underline != UnderlineKind::None || cell.underline_color.is_some() {
+        return cell.underline_color;
+    }
+    Some(cell.fg.opacity(HELD_BACK_LINK_ALPHA))
+}
+
 fn native_cell_residue(style: &GlyphStyle) -> Option<char> {
     // Special underlines are painted directly from the cell buffer, so a
     // shaped blank is only needed for decorations GPUI owns.
@@ -1746,7 +1764,9 @@ impl TerminalElement {
                 };
                 let mut col = col_start;
                 while col <= col_end && col < cols {
-                    buf[grid_row * cols + col].link_hover = true;
+                    let cell = &mut buf[grid_row * cols + col];
+                    cell.link_hover = true;
+                    cell.underline_color = link_underline_color(cell, link.armed);
                     col += 1;
                 }
             }
@@ -1830,6 +1850,16 @@ impl TerminalElement {
             let button = ev.button;
             let clicks = ev.click_count;
             view.update(cx, |v, cx| {
+                if button == MouseButton::Right {
+                    // Before anything else: gpui-component builds the popup
+                    // from a deferred callback, and by then the pointer is
+                    // only a memory. Reading the grid now is what lets the
+                    // menu name the file that was actually under the click.
+                    match should_show_context_menu(v.mouse_mode(), mods.shift) {
+                        true => v.record_menu_link(col, row, cx),
+                        false => v.forget_menu_link(),
+                    }
+                }
                 let link_modifier = mods.secondary() || v.link_modifier_down();
                 if link_modifier
                     && button == MouseButton::Left
@@ -1873,8 +1903,8 @@ impl TerminalElement {
                         if !mods.shift {
                             v.mouse_motion(col, row, &mods);
                         }
-                        let include_files = mods.secondary() || v.link_modifier_down();
-                        v.hover_link_at(col, row, include_files, cx);
+                        let armed = mods.secondary() || v.link_modifier_down();
+                        v.hover_link_at(col, row, armed, cx);
                     } else {
                         v.clear_hovered_link(cx);
                     }
@@ -2289,7 +2319,7 @@ impl Element for TerminalElement {
         self.register_mouse_handlers(geom, bounds, prepaint.hitbox.id, window);
 
         let view = self.view.read(cx);
-        if view.hovered_link.is_some() {
+        if view.hovered_link.as_ref().is_some_and(|link| link.armed) {
             window.set_cursor_style(CursorStyle::PointingHand, &prepaint.hitbox);
         } else if !view.mouse_mode() {
             window.set_cursor_style(CursorStyle::IBeam, &prepaint.hitbox);
@@ -4012,6 +4042,36 @@ mod tests {
         assert!(
             dashed.iter().all(|r| r.size.width <= px(3.)),
             "each dash is at most three logical pixels wide at 2x"
+        );
+    }
+
+    #[test]
+    fn a_link_is_pointed_out_faintly_until_the_modifier_is_down() {
+        let mut plain = cell('l');
+        plain.fg = gpui::hsla(0., 0., 0.9, 1.);
+
+        assert_eq!(
+            link_underline_color(&plain, true),
+            None,
+            "armed, the underline is the text's own colour"
+        );
+        let held = link_underline_color(&plain, false).expect("a colour of its own");
+        assert!(
+            held.a < plain.fg.a,
+            "held back, it is the same colour with less of it"
+        );
+        assert_eq!(
+            (held.h, held.s, held.l),
+            (plain.fg.h, plain.fg.s, plain.fg.l)
+        );
+
+        let mut own = cell('l');
+        own.underline = UnderlineKind::Curly;
+        own.underline_color = Some(gpui::hsla(0.1, 1., 0.5, 1.));
+        assert_eq!(
+            link_underline_color(&own, false),
+            own.underline_color,
+            "a spelling mistake stays the colour the application painted it"
         );
     }
 
