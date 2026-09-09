@@ -2460,8 +2460,12 @@ mod tests {
     fn a_line_number_written_beside_a_path_is_still_a_location() {
         let path = temp_file("beside/handlers.py");
         let cwd = path.parent().and_then(Path::parent).unwrap();
-        let quoted = format!("  File \"{}\", line 214, in dispatch", path.display());
-        let byte = quoted.find('/').expect("absolute path start");
+        // Found by the whole path rather than by its first separator: a
+        // Windows temp path keeps the `/` this one was built with, and looking
+        // for a separator lands three quarters of the way along it.
+        let shown = path.display().to_string();
+        let quoted = format!("  File \"{shown}\", line 214, in dispatch");
+        let byte = quoted.find(&shown).expect("the path in the line");
         let col = quoted[..byte].chars().count();
 
         assert_file_link(&quoted, col, Path::new("/"), &path, Some(214), None);
