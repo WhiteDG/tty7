@@ -1316,7 +1316,6 @@ impl Tty7App {
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
         ssh: Option<u32>,
-        lit: bool,
         size: f32,
         cx: &App,
     ) -> gpui::AnyElement {
@@ -1339,23 +1338,15 @@ impl Tty7App {
                     Some(state) => format!("{} — {state}", agent.display_name()),
                     None => agent.display_name().to_string(),
                 };
-                // The brand colour is identity, not state, and identity is
-                // not what a column of twenty tabs needs shouted: a solid
-                // orange disc on every Claude row made the brand the loudest
-                // mark in the sidebar while a seven-pixel dot carried the one
-                // thing that changes. So the disc rests as a tint of its
-                // brand with the mark drawn in the brand's own ink, and only
-                // lights up solid where the eye is meant to land — the tab in
-                // front, and an agent that has stopped to ask something.
+                // The disc is a solid fill of the agent's brand on every
+                // row, lit or not: a tint reads as a disabled tab, and the
+                // colour is how the eye tells one agent from another down a
+                // column of twenty.
                 let accent = agent.accent_rgb();
-                let lit = lit || hollow;
                 let surface = cx.theme().background;
                 base.relative()
                     .rounded_full()
-                    .when(lit, |d| d.bg(gpui::rgb(accent)))
-                    .when(!lit, |d| {
-                        d.bg(gpui::Hsla::from(gpui::rgb(accent)).opacity(0.16))
-                    })
+                    .bg(gpui::rgb(accent))
                     // Codex and Grok are both pure black, which is the window
                     // fill on a dark theme — the disc dissolves and leaves the
                     // glyph floating. A hairline keeps it a disc in any theme.
@@ -1370,10 +1361,7 @@ impl Tty7App {
                             // the mark's colour comes from the agent rather
                             // than from the file. The tray icon reads the same
                             // answer.
-                            .text_color(match lit {
-                                true => gpui::Hsla::from(gpui::rgb(agent.icon_rgb())),
-                                false => crate::ui::presets::legible_on(surface, accent),
-                            }),
+                            .text_color(gpui::rgb(agent.icon_rgb())),
                     )
                     .when_some(dot, |b, dot| b.child(dot))
                     .tooltip(move |window, cx| {
@@ -1997,7 +1985,6 @@ impl Tty7App {
                         agent_status,
                         agent_unread,
                         None,
-                        is_active,
                         18.,
                         cx,
                     ))

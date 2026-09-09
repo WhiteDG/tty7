@@ -841,7 +841,6 @@ impl Tty7App {
                         agent_status,
                         agent_unread,
                         ssh_dot,
-                        is_active,
                         22.,
                         cx,
                     ))

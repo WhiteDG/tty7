@@ -621,15 +621,6 @@ pub(crate) fn resting_ink(ink: Hsla, beside: Hsla, surface: Hsla) -> Hsla {
     gpui::rgb(at_least(blend, ink, surface, TEXT_FLOOR)).into()
 }
 
-/// A brand colour as ink on a theme surface: kept as authored when it already
-/// reads there, walked toward black or white only when it does not. What an
-/// agent glyph is drawn in once the disc behind it is no longer a solid brand
-/// fill — Claude's orange is a fill colour, not a text colour, on a light
-/// window, and pure-black Codex vanishes into a dark one.
-pub(crate) fn legible_on(surface: Hsla, seed: u32) -> Hsla {
-    gpui::rgb(legible_ink(pack(surface), seed, ACCENT_FLOOR)).into()
-}
-
 fn pack(c: Hsla) -> u32 {
     let rgb = crate::terminal::palette::hsla_to_rgb(c);
     (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32
