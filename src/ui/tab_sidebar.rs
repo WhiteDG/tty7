@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::core::config::{Config, SidebarGrouping};
 use crate::core::group_key::{GroupKey, collapse_key};
 use crate::terminal::git_status::GitStatusCache;
-use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
+use crate::ui::app::{TITLE_BAR_HEIGHT, Tab, Tty7App};
 use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
@@ -59,6 +59,16 @@ mod row_metrics {
     pub(super) const fn text_budget(width: f32) -> f32 {
         width - BORDER - 2. * LIST_PAD - 2. * ROW_PAD - AVATAR - GAP
     }
+}
+
+/// The branch a whole group shares, lifted off its rows and onto its header.
+struct SharedGit {
+    status: crate::terminal::git_status::GitStatus,
+    /// Where a click on the counts opens the diff overlay, if the setting
+    /// allows one.
+    click: Option<(crate::ui::host_ops::HostId, PathBuf)>,
+    /// Every row the group counts, drawn or folded away.
+    rows: Vec<usize>,
 }
 
 /// What a sidebar row rendered, next to what it had to leave out, so the
@@ -248,6 +258,18 @@ impl Tty7App {
             ..font.clone()
         };
         let rem = window.rem_size().as_f32();
+        // The diff counts in their resting weight: green still means added,
+        // but twelve of them down a column no longer outshout the titles.
+        let added_ink = crate::ui::presets::resting_ink(
+            cx.theme().success,
+            cx.theme().muted_foreground,
+            cx.theme().sidebar,
+        );
+        let removed_ink = crate::ui::presets::resting_ink(
+            cx.theme().danger,
+            cx.theme().muted_foreground,
+            cx.theme().sidebar,
+        );
         let rendered = |ix: &usize| !visible_by_section[*ix].is_empty();
         // Every section that owns a key — a repo root or a custom name — draws
         // a header, and a header is what there is to grab, so these are the
@@ -328,6 +350,36 @@ impl Tty7App {
                 visible.len(),
                 pointer,
             );
+            // A group whose rows all sit on the same branch with the same
+            // diff says so once, on its header, instead of once per row.
+            // Four copies of `pr-818 +94 −26` under one heading describe the
+            // repo, not the tabs, and being the only coloured text in the
+            // column they were also the loudest thing in it. Read off every
+            // row the group counts rather than the ones it draws, so a folded
+            // group still names its branch.
+            let shared_git: Option<SharedGit> = section.name.as_ref().and_then(|_| {
+                let rows = &visible_by_section[group_ix];
+                if rows.len() < 2 {
+                    return None;
+                }
+                // Only rows that *have* a status get a vote. A tab that was
+                // just opened has none until its shell reports a directory
+                // and the poll comes back; counting it as a disagreement
+                // pulled the branch off the header and grew a branch line
+                // under every sibling for the half second it took, then
+                // folded them all back — the column jumped twice for every
+                // ⌘T. Unknown is not different; it is not yet known.
+                let mut known = rows
+                    .iter()
+                    .filter_map(|&i| Some((i, self.tabs[i].git_status(Some(window), cx)?)));
+                let (first, status) = known.next()?;
+                let same = known.all(|(_, other)| other == status);
+                same.then(|| SharedGit {
+                    status,
+                    click: git_click(&self.tabs[first], window, cx),
+                    rows: rows.clone(),
+                })
+            });
             for (slot, i) in visible.into_iter().enumerate() {
                 let badge_pos = badge_pos[i];
                 let tab = &self.tabs[i];
@@ -336,14 +388,7 @@ impl Tty7App {
                 let agent = tab.agent(cx);
                 let agent_status = tab.agent_status(cx);
                 let agent_unread = tab.agent_unread_count(cx);
-                let git_cwd = diff_click_cwd(
-                    cx.global::<Config>(),
-                    tab.pane.focused_or_first(window, cx).and_then(|leaf| {
-                        let view = leaf.read(cx);
-                        let cwd = view.git_status_cwd()?.to_path_buf();
-                        Some((view.host_id(), cwd))
-                    }),
-                );
+                let git_cwd = git_click(tab, window, cx);
                 let badge_extra = if show_badges && badge_pos < 9 {
                     row_metrics::BADGE + row_metrics::GAP
                 } else {
@@ -426,7 +471,11 @@ impl Tty7App {
                     };
                 let mut branch_shown: Option<(SharedString, SharedString, u32, u32)> = None;
                 let mut cwd_shown: Option<(SharedString, SharedString)> = None;
-                let git_line = tab.git_status(Some(window), cx).map(|g| {
+                let git_line = match shared_git.is_some() {
+                    true => None,
+                    false => tab.git_status(Some(window), cx),
+                }
+                .map(|g| {
                     let mut line = h_flex()
                         .id(("sidebar-git", i))
                         .w_full()
@@ -521,16 +570,13 @@ impl Tty7App {
                                     )
                             });
                         if g.added > 0 {
-                            counts = counts.child(
-                                div()
-                                    .text_color(cx.theme().success)
-                                    .child(format!("+{}", g.added)),
-                            );
+                            counts = counts
+                                .child(div().text_color(added_ink).child(format!("+{}", g.added)));
                         }
                         if g.removed > 0 {
                             counts = counts.child(
                                 div()
-                                    .text_color(cx.theme().danger)
+                                    .text_color(removed_ink)
                                     .child(format!("−{}", g.removed)),
                             );
                         }
@@ -541,7 +587,7 @@ impl Tty7App {
                 // Outside a repo there is no branch line; the second line then
                 // carries the compressed cwd with its root marker, so a tab
                 // whose title is just a shell name still says where it lives.
-                if git_line.is_none() {
+                if git_line.is_none() && shared_git.is_none() {
                     cwd_shown = tab
                         .pane
                         .focused_or_first(window, cx)
@@ -582,8 +628,8 @@ impl Tty7App {
                 // Colors are captured by value so the tooltip builder (which
                 // borrows no app state) can style the card on its own.
                 let muted = cx.theme().muted_foreground;
-                let success = cx.theme().success;
-                let danger = cx.theme().danger;
+                let success = added_ink;
+                let danger = removed_ink;
 
                 let label_region = match rename_input {
                     Some(input) => div()
@@ -707,7 +753,7 @@ impl Tty7App {
                                     .items_center()
                                     .gap_1p5()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(div().flex_1().min_w_0().truncate().child(cwd)),
                             )
                         })
@@ -795,6 +841,7 @@ impl Tty7App {
                         agent_status,
                         agent_unread,
                         ssh_dot,
+                        is_active,
                         22.,
                         cx,
                     ))
@@ -951,7 +998,10 @@ impl Tty7App {
                     .gap_1p5()
                     .pl_2()
                     .pr_1p5()
-                    .pt_1p5()
+                    // More above a heading than below it: the 12px is the
+                    // generous interval in a column whose rows sit 2px apart,
+                    // and it is what makes a group a group without a box.
+                    .pt(px(12.))
                     .pb_0p5()
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
@@ -1015,12 +1065,84 @@ impl Tty7App {
                             .child(label)
                             .into_any_element(),
                     })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(cx.theme().muted_foreground.opacity(0.7))
-                            .child(row_count.to_string()),
-                    );
+                    .when_some(shared_git, |bar, shared| {
+                        let SharedGit {
+                            status,
+                            click,
+                            rows,
+                        } = shared;
+                        let mut line = h_flex()
+                            .id(("sidebar-group-git", group_ix))
+                            .flex_shrink(2.)
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                gpui::svg()
+                                    .path("icons/git-branch.svg")
+                                    .flex_shrink_0()
+                                    .size(px(row_metrics::BRANCH_ICON))
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(div().min_w_0().truncate().child(status.branch.clone()));
+                        if status.added > 0 || status.removed > 0 {
+                            let mut counts = h_flex()
+                                .id(("sidebar-group-diff", group_ix))
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap_1p5()
+                                .when_some(click, |counts, (host, cwd)| {
+                                    counts
+                                        .cursor_pointer()
+                                        .hover(|s| s.underline())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, _: &MouseDownEvent, window, cx| {
+                                                    cx.stop_propagation();
+                                                    // The overlay opens over the
+                                                    // active tab; make sure that
+                                                    // is one of this group's,
+                                                    // the same way a row's counts
+                                                    // activate their row first.
+                                                    if !rows.contains(&this.active)
+                                                        && let Some(&first) = rows.first()
+                                                    {
+                                                        this.activate(first, window, cx);
+                                                    }
+                                                    this.toggle_diff_overlay(
+                                                        host,
+                                                        cwd.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        )
+                                });
+                            if status.added > 0 {
+                                counts = counts.child(
+                                    div()
+                                        .text_color(added_ink)
+                                        .child(format!("+{}", status.added)),
+                                );
+                            }
+                            if status.removed > 0 {
+                                counts = counts.child(
+                                    div()
+                                        .text_color(removed_ink)
+                                        .child(format!("−{}", status.removed)),
+                                );
+                            }
+                            line = line.child(counts);
+                        }
+                        bar.child(div().flex_1()).child(line)
+                    })
+                    // The count is redundant while the rows are on screen; it
+                    // is what a shut group has instead of them.
+                    .when(folded, |bar| {
+                        bar.child(div().flex_shrink_0().child(row_count.to_string()))
+                    });
                 // Renaming is offered on a menu rather than a double click:
                 // the first click of a double would fold the group, so the
                 // name would be edited on a box that just shut. A repo group
@@ -1899,6 +2021,23 @@ fn group_names(roots: &[&PathBuf]) -> Vec<String> {
             return names;
         }
     }
+}
+
+/// Where a click on a tab's diff counts opens the overlay: the focused pane's
+/// repo, when the setting allows a preview at all.
+fn git_click(
+    tab: &Tab,
+    window: &Window,
+    cx: &gpui::App,
+) -> Option<(crate::ui::host_ops::HostId, PathBuf)> {
+    diff_click_cwd(
+        cx.global::<Config>(),
+        tab.pane.focused_or_first(window, cx).and_then(|leaf| {
+            let view = leaf.read(cx);
+            let cwd = view.git_status_cwd()?.to_path_buf();
+            Some((view.host_id(), cwd))
+        }),
+    )
 }
 
 /// Whether a `+N −M` is a button, and what it opens if it is.
