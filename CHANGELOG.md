@@ -5,6 +5,16 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **The Info panel's CONVERSATION outline is gone** (#703, #759). The list of an
+  agent's turns, and the click that scrolled a pane back to where one started,
+  are both taken out, along with the anchors the client kept for them. The OSC
+  777 events the hooks send still drive the tab's status dot; nothing else read
+  the rows the outline was built on.
+
 ## [26.9.1] - 2026-09-07
 
 ### Fixed
