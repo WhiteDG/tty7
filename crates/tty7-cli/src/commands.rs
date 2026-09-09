@@ -81,7 +81,9 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
         Some(Command::Capture(args)) => capture(args, ctx, backend),
         Some(Command::Procs { target }) => procs(target.as_deref(), ctx, backend),
         Some(Command::Tab(TabCmd::Ls { ws })) => tab_ls(ws.as_deref(), ctx, backend),
-        Some(Command::Tab(TabCmd::New { ws, cwd })) => tab_new(ws.as_deref(), cwd, ctx, backend),
+        Some(Command::Tab(TabCmd::New { ws, cwd, pane })) => {
+            tab_new(ws.as_deref(), cwd, pane.as_deref(), ctx, backend)
+        }
         Some(Command::Tab(TabCmd::Close { tab })) => tab_close(&tab, backend),
         Some(Command::Tab(TabCmd::Rename { tab, name })) => tab_rename(&tab, name, backend),
         Some(Command::Tab(TabCmd::Move { tab, index })) => tab_move(&tab, index, backend),
@@ -668,12 +670,19 @@ fn tab_ls(explicit: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> R
 fn tab_new(
     explicit: Option<&str>,
     cwd: Option<String>,
+    adopt: Option<&str>,
     ctx: &Context,
     backend: &mut dyn Backend,
 ) -> Result<Outcome> {
     let machine = fetch_machine(backend)?;
-    let id = resolve_ws(explicit, ctx, &machine)?;
-    let pane = backend.spawn_shell(id, cwd.clone())?;
+    let (id, pane, cwd) = match adopt {
+        Some(spec) => adopt_pane(spec, explicit, cwd, ctx, &machine, backend)?,
+        None => {
+            let id = resolve_ws(explicit, ctx, &machine)?;
+            let pane = backend.spawn_shell(id, cwd.clone())?;
+            (id, pane, cwd)
+        }
+    };
     let tab = match backend.control(ControlRequest::TabCreate {
         workspace: id,
         at: None,
@@ -693,6 +702,83 @@ fn tab_new(
         format!("%{pane}"),
         json!({ "tab": tab.id.to_string(), "pane": pane }),
     )
+}
+
+/// Works out which workspace a pane that is already running goes into, and what
+/// to seed the tab around it with.
+///
+/// The seed is rebuilt from the **live pane registry**, not from the tree, and
+/// that is the whole design of this verb. `tab_close` retains the panes it
+/// orphaned out of `m.panes` at the same moment it drops the tab, so by the
+/// time anyone wants a pane back the tree has forgotten its record — its cwd,
+/// its title, the shell it was started with. The registry still has the pane,
+/// because the pane is still running; it is the only place left that knows
+/// anything about it.
+///
+/// What the registry does not carry is `ssh_spec`, `agent` or `shell`, so a
+/// re-homed pane is seeded without them. That costs nothing while the shell
+/// lives — the tab is a view onto a pty that is already there — and only shows
+/// up if the pane later dies and something tries to restore it from the seed.
+/// Reconstructing those from a running pty is a separate problem; a tab you can
+/// see and close beats a shell nobody can reach.
+fn adopt_pane(
+    spec: &str,
+    explicit: Option<&str>,
+    cwd: Option<String>,
+    ctx: &Context,
+    machine: &Machine,
+    backend: &mut dyn Backend,
+) -> Result<(WorkspaceId, u64, Option<String>)> {
+    let pane = address::parse_pane(spec)?;
+    let running = backend.list_panes()?;
+    let info = running
+        .iter()
+        .find(|info| info.pane_id == pane)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no pane %{pane} is running on this machine — \
+                 `tty7 pane ls --all` lists every pane the server holds"
+            )
+        })?;
+    if let Ok(holder) = resolve::workspace_of_pane(machine, pane) {
+        bail!(
+            "%{pane} is already in a tab of workspace {} — `tty7 pane split` adds \
+             to that tab, and `tty7 tab new --pane` is for panes no tab holds",
+            resolve::short_id(&holder.id)
+        );
+    }
+    // A pane the tree still knows nothing about, addressed with no workspace,
+    // goes back to the one it was spawned for: that is what `pane ls --all`
+    // prints as its owner, and the shell being recovered from is by definition
+    // not inside tty7, so `$TTY7_WS` is not going to answer here.
+    let id = match (explicit, ctx.ws.as_deref()) {
+        (None, None) => owner_of(info, machine).ok_or_else(|| {
+            anyhow::anyhow!(
+                "%{pane} does not name a workspace that still exists — \
+                 say which one to re-home it into: `tty7 tab new <workspace> --pane %{pane}`"
+            )
+        })?,
+        _ => resolve_ws(explicit, ctx, machine)?,
+    };
+    // The recorded cwd is a courtesy for a later restore, not something the
+    // running shell is moved to; an explicit `--cwd` overrides it.
+    let cwd = cwd.or_else(|| {
+        info.cwd
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .filter(|dir| !dir.is_empty())
+    });
+    Ok((id, pane, cwd))
+}
+
+/// The workspace a pane was spawned for, if it is still on this machine.
+fn owner_of(info: &tty7_core::daemon::protocol::PaneInfo, machine: &Machine) -> Option<WorkspaceId> {
+    let owner = info.owner.as_deref()?;
+    machine
+        .workspaces
+        .iter()
+        .find(|ws| ws.id.to_string() == owner)
+        .map(|ws| ws.id)
 }
 
 fn tab_close(tab: &str, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -818,8 +904,9 @@ fn pane_ls_all(backend: &mut dyn Backend) -> Result<Outcome> {
     let mut human = output::registry_table(&running, &|pane| holder(pane).map(|ws| ws.to_string()));
     if orphans > 0 {
         human.push_str(&format!(
-            "\n{orphans} pane(s) held by no workspace — `tty7 pane close %<id>` stops one, \
-             `tty7 pane close --orphans` stops all of them\n"
+            "\n{orphans} pane(s) held by no workspace — `tty7 tab new --pane %<id>` puts one \
+             back in a tab, `tty7 pane close %<id>` stops one, `tty7 pane close --orphans` \
+             stops all of them\n"
         ));
     }
     report(human, json!({ "panes": panes, "orphans": orphans }))
@@ -2058,6 +2145,135 @@ mod tests {
             backend.spawned,
             vec![(api.id, Some("C:\\elsewhere".to_string()))]
         );
+    }
+
+    /// The recovery verb from #716. The pane is running and no tab holds it;
+    /// the tab is built around it and no new shell is started.
+    #[test]
+    fn tab_new_with_a_pane_re_homes_an_orphan_instead_of_spawning() {
+        let mut backend = mock();
+        let api = backend.machine.workspaces[0].clone();
+        let mut orphan = pane_info(37, Some(&api.id.to_string()));
+        orphan.cwd = Some("C:\\work".into());
+        backend.registry = vec![orphan];
+        backend
+            .replies
+            .push_back(ReplyOk::TabTree(Box::new(Tab::leaf(37))));
+
+        let out = run_cli(
+            &["tty7", "tab", "new", "--pane", "%37"],
+            &Context::default(),
+            &mut backend,
+        );
+
+        assert_eq!(
+            backend.control_calls[1],
+            ControlRequest::TabCreate {
+                workspace: api.id,
+                at: None,
+                pane: PaneSeed {
+                    pane: 37,
+                    // Rebuilt from the registry: the tree dropped this pane's
+                    // record when the tab holding it closed.
+                    cwd: Some("C:\\work".into()),
+                    ssh_spec: None,
+                    agent: None,
+                    shell: None,
+                },
+                tab: None,
+            },
+            "with no workspace named, the pane goes back to the one it was spawned for"
+        );
+        assert!(
+            backend.spawned.is_empty(),
+            "re-homing must not start a second shell — the point is the one still running"
+        );
+        assert_eq!(human(out), "%37");
+    }
+
+    #[test]
+    fn tab_new_with_a_pane_takes_an_explicit_workspace_and_cwd() {
+        let mut backend = mock();
+        let web = backend.machine.workspaces[1].id;
+        backend.registry = vec![pane_info(37, None)];
+        backend
+            .replies
+            .push_back(ReplyOk::TabTree(Box::new(Tab::leaf(37))));
+
+        run_cli(
+            &["tty7", "tab", "new", "web", "--pane", "%37", "--cwd", "C:\\else"],
+            &Context::default(),
+            &mut backend,
+        );
+
+        assert_eq!(
+            backend.control_calls[1],
+            ControlRequest::TabCreate {
+                workspace: web,
+                at: None,
+                pane: PaneSeed {
+                    pane: 37,
+                    cwd: Some("C:\\else".into()),
+                    ssh_spec: None,
+                    agent: None,
+                    shell: None,
+                },
+                tab: None,
+            },
+            "a pane with no owner still re-homes wherever it is told to"
+        );
+    }
+
+    #[test]
+    fn tab_new_refuses_a_pane_that_is_not_running() {
+        let mut backend = mock();
+        let error = execute(
+            cli(&["tty7", "tab", "new", "api", "--pane", "%99"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect_err("a pane the server does not hold cannot be re-homed");
+        assert!(
+            error.to_string().contains("no pane %99 is running"),
+            "{error:#}"
+        );
+        assert!(
+            !backend
+                .control_calls
+                .iter()
+                .any(|call| matches!(call, ControlRequest::TabCreate { .. })),
+            "and nothing is written to the tree"
+        );
+    }
+
+    /// A pane a tab already holds is not an orphan, and putting it in a second
+    /// tab would leave the tree with one pane in two places.
+    #[test]
+    fn tab_new_refuses_a_pane_a_tab_already_holds() {
+        let mut backend = mock();
+        backend.registry = vec![pane_info(2, None)];
+        let error = execute(
+            cli(&["tty7", "tab", "new", "api", "--pane", "%2"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect_err("%2 is in a tab of api");
+        assert!(error.to_string().contains("already in a tab"), "{error:#}");
+    }
+
+    /// The listing is where an orphan is found, so it is where the way out of
+    /// being one has to be written down.
+    #[test]
+    fn pane_ls_all_points_at_the_way_back_as_well_as_the_way_out() {
+        let mut backend = mock();
+        backend.registry = vec![pane_info(37, None)];
+        let out = human(run_cli(
+            &["tty7", "pane", "ls", "--all"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert!(out.contains("tty7 tab new --pane %<id>"), "{out}");
+        assert!(out.contains("tty7 pane close --orphans"), "{out}");
     }
 
     #[test]

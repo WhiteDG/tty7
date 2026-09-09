@@ -407,7 +407,7 @@ pub enum TabCmd {
         ws: Option<String>,
     },
 
-    #[command(about = "Add a tab with a fresh shell")]
+    #[command(about = "Add a tab with a fresh shell, or around a pane already running")]
     New {
         #[arg(value_name = "WORKSPACE")]
         ws: Option<String>,
@@ -417,6 +417,20 @@ pub enum TabCmd {
             help = "Working directory for the tab's shell"
         )]
         cwd: Option<String>,
+
+        // The recovery half of `pane ls --all`. Until this existed, a pane that
+        // came out from under its tab — an interrupted `run`, or a client that
+        // closed tabs whose shells were still alive (#716) — could only be
+        // listed and killed. The shell is fine; it just has no tab, and
+        // `TabCreate` has always been able to take an existing pane id.
+        #[arg(
+            long,
+            value_name = "%PANE",
+            help = "Re-home a pane that is already running instead of spawning a shell — \
+                    for the orphans `tty7 pane ls --all` lists. Defaults the workspace to \
+                    the one the pane was spawned for"
+        )]
+        pane: Option<String>,
     },
 
     #[command(about = "Close a tab and every pane in it")]
@@ -742,7 +756,12 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["tty7", "tab", "new", "api", "--cwd", "C:\\proj"]).command,
-            Some(Command::Tab(TabCmd::New { ws: Some(w), cwd: Some(c) })) if w == "api" && c == "C:\\proj"
+            Some(Command::Tab(TabCmd::New { ws: Some(w), cwd: Some(c), pane: None }))
+                if w == "api" && c == "C:\\proj"
+        ));
+        assert!(matches!(
+            parse(&["tty7", "tab", "new", "--pane", "%37"]).command,
+            Some(Command::Tab(TabCmd::New { ws: None, cwd: None, pane: Some(p) })) if p == "%37"
         ));
         assert!(matches!(
             parse(&["tty7", "tab", "close", "@7"]).command,
