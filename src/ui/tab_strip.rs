@@ -1182,53 +1182,55 @@ impl Tty7App {
         .into_iter()
         .map(|(tab, icon, label_key)| {
             let current = active_tab == tab;
+            let tile = chrome_tile_marked(
+                Button::new(("right-panel-tab", tab as usize)).icon(icon),
+                current,
+                cx,
+            )
+            .rounded_lg()
+            .tooltip(match (tab, changed) {
+                (RightPanelTab::Scm, Some(n)) => {
+                    SharedString::from(format!("{} · {n}", t(label_key)))
+                }
+                _ => SharedString::from(t(label_key)),
+            })
+            // A tile for another tab switches to it; the lit one puts
+            // the panel away, the way an activity bar behaves
+            // everywhere else. Pressing it used to do nothing at all
+            // — a dead click on the one control in the row that looks
+            // like it should undo itself. (These tiles only exist
+            // while the panel is open, so `ToggleRightPanel` and the
+            // chrome tile beside them are still what brings it back.)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                match this.right_panel_open(cx) && this.right_panel_tab == tab {
+                    true => {
+                        this.toggle_right_panel(cx);
+                        // These tiles live inside the panel, so
+                        // closing from one destroys the element that
+                        // holds the focus and leaves it nowhere —
+                        // and a keymap whose bindings are scoped to a
+                        // focused thing goes quiet with it, so the
+                        // ⌘J that would undo this did nothing at all.
+                        // Hand the terminal back what it lost.
+                        this.focus_active(window, cx);
+                    }
+                    false => this.set_right_panel_tab(tab, cx),
+                }
+            }));
             div()
-                .occlude()
                 .flex_shrink_0()
                 // Full height and `relative` so the bar below can be pinned to
                 // the row's own bottom edge, where it lands on the hairline
                 // that closes the row rather than floating under the glyph.
+                // The `occlude` that keeps a press from dragging the window
+                // stays on the tile: grown to the whole row it would take the
+                // few pixels above and below each glyph out of the drag
+                // region and hand them to nothing.
                 .h_full()
                 .relative()
                 .flex()
                 .items_center()
-                .child(
-                    chrome_tile_marked(
-                        Button::new(("right-panel-tab", tab as usize)).icon(icon),
-                        current,
-                        cx,
-                    )
-                    .rounded_lg()
-                    .tooltip(match (tab, changed) {
-                        (RightPanelTab::Scm, Some(n)) => {
-                            SharedString::from(format!("{} · {n}", t(label_key)))
-                        }
-                        _ => SharedString::from(t(label_key)),
-                    })
-                    // A tile for another tab switches to it; the lit one puts
-                    // the panel away, the way an activity bar behaves
-                    // everywhere else. Pressing it used to do nothing at all
-                    // — a dead click on the one control in the row that looks
-                    // like it should undo itself. (These tiles only exist
-                    // while the panel is open, so `ToggleRightPanel` and the
-                    // chrome tile beside them are still what brings it back.)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        match this.right_panel_open(cx) && this.right_panel_tab == tab {
-                            true => {
-                                this.toggle_right_panel(cx);
-                                // These tiles live inside the panel, so
-                                // closing from one destroys the element that
-                                // holds the focus and leaves it nowhere —
-                                // and a keymap whose bindings are scoped to a
-                                // focused thing goes quiet with it, so the
-                                // ⌘J that would undo this did nothing at all.
-                                // Hand the terminal back what it lost.
-                                this.focus_active(window, cx);
-                            }
-                            false => this.set_right_panel_tab(tab, cx),
-                        }
-                    })),
-                )
+                .child(div().occlude().flex_shrink_0().child(tile))
                 // Narrower than the tile so it reads as underlining the glyph
                 // rather than as the edge of a box around it.
                 .children(current.then(|| {

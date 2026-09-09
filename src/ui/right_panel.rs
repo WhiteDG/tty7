@@ -639,6 +639,12 @@ impl Tty7App {
                 this.child(
                     h_flex()
                         .flex_shrink_0()
+                        // Full height, so the current tile's underline — pinned
+                        // to the bottom of its own box — lands on the rule that
+                        // closes this row, the way it does on macOS. Without it
+                        // the tiles are only as tall as a glyph and the bar
+                        // floats a few pixels above the line.
+                        .h_full()
                         .items_center()
                         .gap(px(2.))
                         .when(has_trailing, |this| this.ml(px(6.)))
