@@ -429,8 +429,14 @@ impl Tty7App {
                         .id("right-panel-titlebar-drag")
                         .flex_none()
                         .h(px(crate::ui::app::TITLE_BAR_HEIGHT))
+                        // `sidebar_border`, the lighter of the two hairline
+                        // tiers and the one the panel's own left edge is drawn
+                        // in. It rules the tiles off from the content below,
+                        // which on macOS starts directly under them: the title
+                        // row that carries this line on other platforms is not
+                        // drawn here.
                         .border_b_1()
-                        .border_color(cx.theme().transparent);
+                        .border_color(cx.theme().sidebar_border);
                     crate::ui::app::window_move_gesture(
                         row,
                         "right-panel-titlebar-drag",
@@ -444,12 +450,18 @@ impl Tty7App {
                     .relative()
                     .children(self.right_panel_tabs(cx))
                     .child(div().flex_1())
-                    .child(self.window_chrome(self.panel_chrome_hover.get(), window, cx))
-                    .child(crate::ui::app::hover_sheet(
-                        "panel-chrome-hover",
-                        &self.panel_chrome_hover,
-                    ))
+                    // Always painted, unlike the sidebar's and the strip's:
+                    // the tab tiles beside them are already there whenever the
+                    // panel is open, so hiding just these two left a row that
+                    // grew two buttons on hover and read as a glitch.
+                    .child(self.window_chrome(true, window, cx))
                 }))
+                // Air under the rule, so the first row of content is not
+                // sitting on the line. On the other platforms the title row
+                // holds this line and its own text keeps that distance; here
+                // the tiles are in the window's title bar and the content
+                // would start against the hairline.
+                .children(cfg!(target_os = "macos").then(|| div().flex_none().h(px(8.))))
                 .child(body)
                 .children(self.sftp_transfers_footer(cx))
                 .child(handle)
@@ -627,6 +639,12 @@ impl Tty7App {
                 this.child(
                     h_flex()
                         .flex_shrink_0()
+                        // Full height, so the current tile's underline — pinned
+                        // to the bottom of its own box — lands on the rule that
+                        // closes this row, the way it does on macOS. Without it
+                        // the tiles are only as tall as a glyph and the bar
+                        // floats a few pixels above the line.
+                        .h_full()
                         .items_center()
                         .gap(px(2.))
                         .when(has_trailing, |this| this.ml(px(6.)))
