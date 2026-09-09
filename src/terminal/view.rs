@@ -5632,6 +5632,13 @@ impl TerminalView {
     /// pointer, and asking the grid then would be asking about wherever the
     /// mouse has since gone.
     pub fn record_menu_link(&mut self, col: usize, row: usize, cx: &mut Context<Self>) {
+        // The same switch that decides whether a path underlines and whether a
+        // click follows one. Without this the menu would go on offering to
+        // open files in a pane where link detection is turned off.
+        if !cx.global::<Config>().link_url {
+            self.menu_link = None;
+            return;
+        }
         let include_loopback = self.can_forward_loopback(cx);
         self.menu_link = match self.resolve_link_at(col, row, true, include_loopback, cx) {
             LinkAt::Found(target @ LinkTarget::File { .. }, ..) => Some(target),
@@ -5907,11 +5914,26 @@ impl TerminalView {
     /// Whether the cell under the pointer holds anything a link could be made
     /// of.
     fn cell_is_blank(&self, col: usize, row: usize) -> bool {
+        use alacritty_terminal::term::cell::Flags;
+
         let term = self.terminal.term.lock();
         let Some(line) = Self::grid_line(&term, row) else {
             return true;
         };
-        col >= term.columns() || term.grid()[line][Column(col)].c.is_whitespace()
+        if col >= term.columns() {
+            return true;
+        }
+        let cell = &term.grid()[line][Column(col)];
+        // The second column of a wide glyph is written as a space, and the
+        // logical line hands a click there back to the character that owns it.
+        // Reading it as empty would drop the underline on every other column
+        // of a path spelled in CJK or emoji.
+        if cell.flags.intersects(
+            Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::WIDE_CHAR,
+        ) {
+            return false;
+        }
+        cell.c.is_whitespace()
     }
 
     pub fn refresh_link_hover(&mut self, armed: bool, cx: &mut Context<Self>) -> bool {
@@ -7289,15 +7311,25 @@ pub(crate) fn open_file_path(path: &std::path::Path) -> std::io::Result<()> {
 /// no desktop-neutral Linux equivalent exists, so there the folder is opened
 /// and the file is left for the eye to find.
 pub(crate) fn reveal_file_path(path: &std::path::Path) -> std::io::Result<()> {
-    let mut command = if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    let mut command = {
         let mut c = std::process::Command::new("open");
         c.arg("-R").arg(path);
         c
-    } else if cfg!(windows) {
+    };
+    // Explorer wants `/select,` bare and the path quoted behind it. `arg`
+    // quotes the whole thing the moment the path holds a space, and Explorer
+    // answers a quoted switch by opening Documents and reporting success —
+    // so the command line is written out by hand.
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
         let mut c = std::process::Command::new("explorer");
-        c.arg(format!("/select,{}", path.display()));
+        c.raw_arg(format!("/select,\"{}\"", path.display()));
         c
-    } else {
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut command = {
         let mut c = std::process::Command::new("xdg-open");
         c.arg(path.parent().unwrap_or(path));
         c
@@ -10286,6 +10318,17 @@ mod gpui_tests {
                     "and a right click over `ready` opens the ordinary one"
                 );
 
+                let mut off = cx.global::<Config>().clone();
+                off.link_url = false;
+                cx.set_global(off);
+                view.record_menu_link(7, 0, cx);
+                assert!(
+                    view.menu_link_path().is_none(),
+                    "and with link detection turned off the menu offers nothing \
+                     the underline and the click both refuse"
+                );
+                cx.set_global(Config::default());
+
                 // `ready (scratchpad...`: the blank between the two words.
                 assert!(!view.hover_link_at(5, 0, false, cx));
                 assert!(view.hovered_link.is_none(), "a blank holds no link");
@@ -10600,6 +10643,48 @@ mod gpui_tests {
                         "and the span the element paints covers both rows"
                     );
                     assert_eq!(link.start.column, Column(4), "starting at the path itself");
+                }
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wide character owns two columns, and the second one holds a space.
+    /// The hover has to read that as part of the glyph, or the underline goes
+    /// out on every other column of a path written in CJK.
+    #[gpui::test]
+    fn the_second_column_of_a_wide_character_still_hovers(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("tty7-view-wide-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("文档")).expect("create dirs");
+        std::fs::write(dir.join("文档/笔记.md"), b"# notes").expect("create notes");
+
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
+        DaemonMsg::Output("see 文档/笔记.md here\r\n".as_bytes().to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            let seen = window
+                .update(cx, |view, _, _| {
+                    view.cwd().is_some()
+                        && view.terminal.term.lock().grid()[Line(0)][Column(4)].c == '文'
+                })
+                .unwrap();
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, _, cx| {
+                // `see 文档/…`: column 4 carries 文, column 5 is its spacer.
+                assert!(!view.cell_is_blank(5, 0), "the spacer belongs to the glyph");
+                for col in [4, 5] {
+                    assert!(
+                        view.hover_link_at(col, 0, true, cx),
+                        "column {col} of the same character is the same link"
+                    );
                 }
             })
             .unwrap();

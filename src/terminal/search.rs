@@ -1087,13 +1087,19 @@ fn left_cuts(chars: &[char]) -> Vec<usize> {
         }
         // `note:src/main.rs`. Only a plain word may sit in front: one letter
         // is a Windows drive (`C:\src`), and a prefix carrying a `/` or a `.`
-        // is more likely a path with a line number written onto it.
+        // is more likely a path with a line number written onto it. What
+        // follows has to be spelled like a path too, or `branch:main` and
+        // `remote:origin` become links the moment the pane's directory holds
+        // a `main/` or an `origin/`.
         if let Some(i) = rest.iter().position(|&c| c == ':')
             && i >= 2
             && rest[0].is_ascii_alphabetic()
             && rest[..i]
                 .iter()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+            && rest[i + 1..]
+                .iter()
+                .any(|c| matches!(c, '/' | '\\' | '.' | '~'))
         {
             offsets.push(i + 1);
         }
@@ -2503,6 +2509,29 @@ mod tests {
             }
             LinkTarget::Url(url) => panic!("expected directory link, got URL {url}"),
         }
+    }
+
+    /// A label in front of a colon only peels off when what follows is
+    /// written like a path. Otherwise a prompt segment turns into a link the
+    /// moment the directory happens to hold a folder by that name.
+    #[test]
+    fn a_label_in_front_of_a_bare_word_is_not_a_path() {
+        let file = temp_file("labelled/main/keep.txt");
+        // `<tmp>/labelled`, the one directory that holds a `main/`.
+        let labelled = file.parent().and_then(Path::parent).unwrap();
+
+        assert!(
+            local_link_at("on main/keep.txt", 4, &one_root(labelled), true).is_some(),
+            "the directory itself is still reachable"
+        );
+        assert!(
+            local_link_at("branch:main", 8, &one_root(labelled), true).is_none(),
+            "but the branch a prompt is reporting is not a link"
+        );
+        assert!(
+            local_link_at("note:main/keep.txt", 6, &one_root(labelled), true).is_some(),
+            "a label in front of something written like a path still peels"
+        );
     }
 
     /// Every reading of one token is worth at most a handful of questions.
