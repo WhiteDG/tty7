@@ -10553,6 +10553,59 @@ mod gpui_tests {
             .unwrap();
     }
 
+    /// The seam is invisible to the user, so it has to be invisible to the
+    /// hover too: pointing at either half underlines the whole path, and the
+    /// span the element paints reaches across both rows.
+    #[gpui::test]
+    fn a_path_the_terminal_wrapped_is_hovered_as_one_link(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("tty7-view-wrap-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/bb/ccc/dddd")).expect("create dirs");
+        std::fs::write(dir.join("a/bb/ccc/dddd/notes.md"), b"# notes").expect("create notes.md");
+
+        let (window, mut daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.set_grid_size(20, 6, px(8.), px(17.), 1., cx);
+            })
+            .unwrap();
+        DaemonMsg::Cwd(dir.clone()).encode(&mut daemon).unwrap();
+        DaemonMsg::Output(b"see a/bb/ccc/dddd/notes.md here\r\n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        for _ in 0..200 {
+            let seen = window
+                .update(cx, |view, _, _| {
+                    view.cwd().is_some()
+                        && view.terminal.term.lock().grid()[Line(1)][Column(0)].c == 'e'
+                })
+                .unwrap();
+            if seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        window
+            .update(cx, |view, _, cx| {
+                // Row 0 holds `see a/bb/ccc/dddd/n`, row 1 the rest.
+                for (col, row, where_) in [(6, 0, "before the seam"), (2, 1, "after it")] {
+                    assert!(
+                        view.hover_link_at(col, row, true, cx),
+                        "the wrapped path is a link from {where_}"
+                    );
+                    let link = view.hovered_link.as_ref().expect("a span");
+                    assert_eq!(
+                        (link.start.line, link.end.line),
+                        (Line(0), Line(1)),
+                        "and the span the element paints covers both rows"
+                    );
+                    assert_eq!(link.start.column, Column(4), "starting at the path itself");
+                }
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A full-screen application drew the grid and is watching the mouse
     /// itself, so tty7 stays out of it until asked.
     #[gpui::test]
