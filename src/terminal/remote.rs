@@ -4064,6 +4064,58 @@ mod parked_cursor_tests {
     }
 }
 
+/// Issue #774, from the client's end. A full-screen tool sets its modes once
+/// and the replay ring drops them, so the daemon re-sends them from what it
+/// folded out of the stream ([`tty7_core::core::term_modes`]). This is the
+/// other half of that: the bytes it re-sends have to land the emulator back
+/// where the application left it, because those are the modes `wheel_route`
+/// reads before it decides the pane has a scrollback to move at all.
+#[cfg(test)]
+mod replayed_mode_tests {
+    use super::replay_tests::socket_pair;
+    use super::*;
+    use std::io::Write as _;
+    use tty7_core::core::term_modes::TerminalModes;
+
+    #[test]
+    fn a_replayed_mode_frame_puts_the_client_back_on_the_alternate_screen() {
+        crate::core::config::pin_test_config_dir();
+        // `btop`'s startup prefix, folded the way the daemon folds it out of
+        // the pty — and then re-sent from the fold, the ring having dropped
+        // the bytes themselves hours ago.
+        let mut modes = TerminalModes::new();
+        modes.feed(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
+
+        let (client_side, mut daemon_side) = socket_pair();
+        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+        DaemonMsg::Snapshot(modes.restore_bytes().expect("a fold with modes in it"))
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+
+        for _ in 0..600 {
+            if term.term.lock().mode().contains(TermMode::ALT_SCREEN) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let mode = *term.term.lock().mode();
+        assert!(
+            mode.contains(TermMode::ALT_SCREEN),
+            "the pane belongs on the alternate screen it never left: {mode:?}"
+        );
+        // Reporting first, SGR encoding with it: `wheel_route` sends the wheel
+        // to the application on the first and encodes the report with the
+        // second — see `wheel_routes_by_negotiated_mode_with_reporting_first`.
+        assert!(
+            mode.intersects(TermMode::MOUSE_MODE),
+            "mouse reporting is what keeps the wheel off the scrollback: {mode:?}"
+        );
+        assert!(mode.contains(TermMode::SGR_MOUSE), "{mode:?}");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -15,6 +15,7 @@ use crate::core::clipboard::{
 };
 use crate::core::kitty_graphics::{GraphicsSniffer, Segment, Sniffed};
 use crate::core::osc::OscTokenizer;
+use crate::core::term_modes::TerminalModes;
 use crate::daemon::protocol::{
     AuthResponse, DaemonMsg, MAX_FRAME, NativeSshSpec, PaneInfo, RemoteContext, RemoteKind,
     ShellSpec, WinSize,
@@ -693,6 +694,12 @@ struct PaneState {
     /// record. See [`crate::core::machine::PaneRecord::osc_title`].
     osc_title: Option<String>,
     shell: ShellState,
+    /// The private modes the pane's output has switched on — the alternate
+    /// screen and mouse reporting above all. Folded from the same bytes the
+    /// ring gets, because the ring cannot be trusted to still hold them: a
+    /// full-screen tool sets them once at startup and the ring drops its front
+    /// (#774). See [`TerminalModes`].
+    modes: TerminalModes,
     /// What this pane is running, for the machine tree to record. Distinct from
     /// `shell` above, which is the shell-integration state.
     shell_spec: Option<ShellSpec>,
@@ -1461,6 +1468,7 @@ impl DaemonPane {
                 cwd: spawn.initial_cwd,
                 osc_title: restored_title,
                 shell: ShellState::default(),
+                modes: TerminalModes::default(),
                 shell_spec: spawn.shell.clone(),
                 remote: spawn.remote.clone(),
                 agent: None,
@@ -1683,6 +1691,7 @@ impl DaemonPane {
                     last_exit_code: carried.last_exit,
                     command: None,
                 },
+                modes: TerminalModes::default(),
                 remote: carried.remote,
                 agent: carried.agent,
                 agent_session: carried.agent_session,
@@ -1735,6 +1744,7 @@ impl DaemonPane {
             cwd: None,
             osc_title: None,
             shell: ShellState::default(),
+            modes: TerminalModes::default(),
             remote: Some(remote),
             agent: None,
             agent_session: None,
@@ -2035,7 +2045,7 @@ impl DaemonPane {
                                 || probed_cwd.is_some();
                             let mut st = state.lock().unwrap();
                             let facts_before = may_change_facts.then(|| observed_facts(&st));
-                            st.ring.append(bytes);
+                            record_output(&mut st, bytes);
                             fan_out_output(&mut st, bytes, frames, &gate);
                             apply_signals(&mut st, signals);
                             if let Some(remote) = remote {
@@ -2575,7 +2585,26 @@ impl ReplayRing {
     }
 }
 
+/// Everything the pane remembers about a chunk of output: the bytes
+/// themselves, and the modes they switched on. One function so the two can
+/// never drift apart — the modes are only worth anything if they were folded
+/// from exactly the bytes the ring was given.
+fn record_output(st: &mut PaneState, bytes: &[u8]) {
+    st.ring.append(bytes);
+    st.modes.feed(bytes);
+}
+
 fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
+    // Ahead of the ring, not after it: a client that is put into the alternate
+    // screen first paints the replayed frames into the buffer they belong to,
+    // and re-entering an alternate screen the ring turns out to still carry is
+    // a no-op in the emulator, so the two cannot fight. What the ring does
+    // carry always wins on its own terms — the fold is over every byte the
+    // pane ever wrote, so any mode the ring still toggles ends where the fold
+    // says it ends.
+    if let Some(modes) = st.modes.restore_bytes() {
+        let _ = subscriber.send(DaemonMsg::Snapshot(modes));
+    }
     st.ring.replay(subscriber);
     if let Some(cwd) = &st.cwd {
         let _ = subscriber.send(DaemonMsg::Cwd(cwd.clone()));
@@ -4376,6 +4405,7 @@ mod tests {
             cwd: None,
             osc_title: None,
             shell: ShellState::default(),
+            modes: TerminalModes::default(),
             remote: None,
             agent: None,
             agent_session: None,
@@ -4768,6 +4798,64 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(DaemonMsg::Cwd(p)) if p == PathBuf::from("/Users/alice/clone/tty7"))
         );
+    }
+
+    /// Issue #774: `btop` sends its alternate-screen and mouse-reporting
+    /// prefix once, when it starts, and then refreshes for hours. The ring
+    /// holds the last few megabytes of those refreshes and nothing of the
+    /// prefix, so a client that rebuilt its terminal from replayed bytes alone
+    /// came back on the primary screen with reporting off — and its wheel,
+    /// reading those modes, scrolled the scrollback of a screen that has none.
+    #[test]
+    fn attach_restores_modes_whose_bytes_the_ring_has_dropped() {
+        let mut st = test_state(true);
+        record_output(&mut st, b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
+        // A long enough run of refreshes to push the prefix out of the front.
+        record_output(&mut st, &vec![b'.'; RING_CAP]);
+        assert!(
+            !st.ring.flatten().windows(8).any(|w| w == b"\x1b[?1049h"),
+            "the point of the test is that the prefix is gone from the ring"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber(&mut st, tx);
+
+        // Ahead of the replayed screen, so the frames land in the buffer the
+        // modes put the client on.
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h\x1b[?1002h\x1b[?1006h"),
+            "the modes the ring lost must be re-sent, in the order they were set"
+        );
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
+    }
+
+    #[test]
+    fn a_pane_that_left_the_alternate_screen_restores_no_modes() {
+        let mut st = test_state(true);
+        record_output(&mut st, b"\x1b[?1049h\x1b[?1002hvim\x1b[?1002l\x1b[?1049l");
+        record_output(&mut st, b"$ ");
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber(&mut st, tx);
+
+        // Straight to the ring: a shell prompt is not owed a mode frame, and
+        // sending one would put the pane on a screen it had left.
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An observer joins mid-session too, and reads the same pane state.
+    #[test]
+    fn observers_are_told_the_pane_modes_as_well() {
+        let mut st = test_state(true);
+        record_output(&mut st, b"\x1b[?1049h");
+        record_output(&mut st, &vec![b'.'; RING_CAP]);
+
+        let (tx, rx) = mpsc::channel();
+        observe_subscriber(&mut st, tx, Arc::new(OutputGate::new()));
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h"));
     }
 
     #[test]
