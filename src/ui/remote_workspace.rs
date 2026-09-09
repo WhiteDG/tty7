@@ -1276,6 +1276,9 @@ pub(crate) struct RemoteLinks {
     /// times a second and the request's deadline is ten seconds, so without
     /// this one reclaim would be sent forty times.
     attaching: std::collections::HashSet<WorkspaceId>,
+    /// Machines the pump leaves alone until a person asks for them again:
+    /// disconnected from the switcher, or — since #820 — an authentication
+    /// the user closed the sheet on rather than answered.
     suspended: std::collections::HashSet<HostId>,
     instances: std::collections::HashMap<HostId, String>,
     #[allow(
@@ -2020,8 +2023,17 @@ fn finish_attempt(
             // for the rest of the session. Park it and give the user the move
             // that actually changes the answer.
             let parked = crate::daemon::control::is_dialect_refusal(&e);
+            // Somebody closed the password sheet. Retrying that is retrying a
+            // question the user has already answered, and the backoff answers
+            // it again a second later and every thirty seconds after that —
+            // which is the half of #820 where the window "cannot be closed".
+            // Suspend the machine instead: the strip says why and offers
+            // Retry, which is the user asking to be asked again.
+            let declined = !parked && crate::daemon::ssh::is_auth_declined(&e);
             if parked {
                 log::warn!("{label} is served by a build this one cannot speak to: {e}");
+            } else if declined {
+                log::info!("not reconnecting to {label}: {e}");
             } else {
                 log::warn!("reconnect to {label} failed: {e}");
             }
@@ -2029,10 +2041,12 @@ fn finish_attempt(
                 link.attempting = false;
                 link.state = if parked {
                     LinkState::Mismatched(e.clone())
+                } else if declined {
+                    LinkState::Failed(e.clone())
                 } else {
                     LinkState::Reconnecting
                 };
-                if !parked {
+                if !parked && !declined {
                     // The counter is the number of attempts that came back
                     // wrong. It moves here, not when the pump schedules one:
                     // a first try still in flight is attempt 1 on the strip,
@@ -2042,6 +2056,13 @@ fn finish_attempt(
                 link.next_attempt = None;
                 link.last_error = Some(e.clone());
             });
+            // `Failed` on its own is not a park — the pump rewrites every
+            // state but `Mismatched` back to `Reconnecting` on its next tick.
+            // This is what actually stops the clock, and `retry_now` and the
+            // switcher's own connect are what start it again.
+            if declined {
+                cx.default_global::<RemoteLinks>().suspended.insert(host);
+            }
         }
     }
     cx.refresh_windows();
@@ -3203,6 +3224,90 @@ mod tests {
                     Some(RemoteStatus::Reconnecting { .. })
                 ),
                 "asking by hand un-parks it"
+            );
+        });
+    }
+
+    /// What `connect_blocking` hands back when the person at the keyboard
+    /// closed the password sheet instead of filling it in, localised wrapper
+    /// and all.
+    fn a_decline() -> String {
+        t_fmt(
+            L10nKey::RemoteHostUnreachable,
+            &[
+                ("machine", "build-box"),
+                ("error", crate::daemon::ssh::AUTH_DECLINED),
+            ],
+        )
+    }
+
+    /// #820. Closing the sheet is an answer. The backoff put the same question
+    /// back a second later and every thirty seconds after that, so the window
+    /// could not be got rid of — which is what the report calls "无法关闭".
+    #[gpui::test]
+    fn a_declined_password_stops_the_reconnect_clock(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::core::config::pin_test_config_dir();
+            cx.set_global(crate::core::config::Config::default());
+            crate::ui::windows::WindowRegistry::init(cx);
+
+            let (host, target) = resolvable_machine("build-box");
+            let mut entry = crate::core::session::WindowView::on_remote(RemoteRef::new(
+                target.clone(),
+                WorkspaceId::new(),
+            ));
+            entry.open = true;
+            let id = entry.id;
+            WorkspaceStore::install_for_test(
+                cx,
+                crate::core::session::WindowViews {
+                    views: vec![entry],
+                    active: None,
+                },
+            );
+
+            finish_attempt(cx, host, &target, Err(a_decline()));
+            let after = RemoteLinks::status_of(cx, id);
+            assert!(
+                matches!(after, Some(RemoteStatus::Failed(_))),
+                "a refusal to authenticate is not a machine that could not be \
+                 reached: {after:?}"
+            );
+
+            for _ in 0..4 {
+                pump_tick(cx);
+            }
+            let link = cx.default_global::<RemoteLinks>().machines.get(&host);
+            let link = link.expect("the machine is still known");
+            assert!(
+                matches!(link.state, LinkState::Failed(_)),
+                "four ticks later the sheet has not been raised again"
+            );
+            assert!(!link.attempting, "and nothing is dialling behind it");
+            assert_eq!(
+                link.backoff.attempt(),
+                0,
+                "declining is not a failed attempt, so nothing counted one"
+            );
+
+            // Retry is the user asking to be asked again, and it is the action
+            // the strip already offers on a `Failed` link.
+            assert_eq!(
+                RemoteStatus::Failed(a_decline()).action_label(),
+                Some(t(L10nKey::RemoteActionRetry))
+            );
+            RemoteLinks::retry_now(cx, id);
+            assert!(
+                !cx.default_global::<RemoteLinks>().suspended.contains(&host),
+                "asking by hand puts the machine back on the clock"
+            );
+            pump_tick(cx);
+            assert!(
+                cx.default_global::<RemoteLinks>()
+                    .machines
+                    .get(&host)
+                    .is_some_and(|l| l.attempting || l.state == LinkState::Reconnecting),
+                "and the pump picks it up again"
             );
         });
     }
