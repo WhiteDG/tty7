@@ -2160,8 +2160,14 @@ impl Tty7App {
         });
 
         let panel_open = self.right_panel_open(cx);
+        // With the panel open these two tiles stand in the band above it, over
+        // the panel's own header — and that header's tab tiles are painted
+        // whenever the panel is, so a band that grew two buttons on hover read
+        // as a glitch beside them. Same bargain macOS struck when it moved
+        // these tiles into the panel's title bar: once the panel is open they
+        // are part of its chrome, not part of the strip's.
         let right_chrome = (!panel_open || !cfg!(target_os = "macos"))
-            .then(|| self.window_chrome(strip_chrome_shown, window, cx));
+            .then(|| self.window_chrome(strip_chrome_shown || panel_open, window, cx));
 
         h_flex()
             .id("tab-strip")
