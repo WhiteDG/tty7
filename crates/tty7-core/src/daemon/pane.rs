@@ -1989,7 +1989,23 @@ impl DaemonPane {
                                 signals.shell.dedup();
                             }
 
-                            let poll_now = std::time::Instant::now() >= next_remote_check;
+                            // A prompt mark that survived the suppression above
+                            // is the shell saying the command it ran is over, so
+                            // the foreground has just gone back to being the
+                            // shell itself. Probe right then rather than waiting
+                            // out the interval: the probe is what clears the
+                            // remote context an `ssh` left behind, and the
+                            // interval alone can miss it forever. Polling only
+                            // runs on output, and the prompt the shell just drew
+                            // is the last output a pane produces until the user
+                            // types again — so a pane whose `ssh` exited inside
+                            // the interval kept reporting itself as remote, and
+                            // everything keyed off that (the history scope ↑
+                            // reads, most visibly) stayed on the far end until
+                            // some unrelated output arrived (#817).
+                            let back_at_prompt = signals.shell.iter().any(|s| s.at_prompt);
+                            let poll_now =
+                                back_at_prompt || std::time::Instant::now() >= next_remote_check;
                             if poll_now {
                                 next_remote_check =
                                     std::time::Instant::now() + REMOTE_CONTEXT_POLL_INTERVAL;
@@ -5039,6 +5055,91 @@ mod tests {
         assert_eq!(snap.agent, Some(CLIAgent::Claude));
         assert_eq!(snap.state.status, AgentStatus::Waiting);
         assert_eq!(snap.state.session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// The foreground probe only ever runs on output, and the prompt a shell
+    /// draws after a command is the last output a pane produces until the user
+    /// types again. So an `ssh` that exited inside the poll interval used to
+    /// leave the pane reporting itself as remote indefinitely: nothing came
+    /// along to probe on. A prompt mark now forces the probe (#817).
+    #[test]
+    fn a_prompt_mark_reprobes_the_foreground_inside_the_poll_interval() {
+        /// Hands the reader one chunk per `read`, so two prompt marks arrive as
+        /// two passes through the loop a few microseconds apart — well inside
+        /// `REMOTE_CONTEXT_POLL_INTERVAL`.
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(chunk) => {
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let state = Arc::new(Mutex::new(test_state(true)));
+        let (sub_tx, sub_rx) = mpsc::channel();
+        state.lock().unwrap().subscriber = Some(sub_tx);
+
+        let probes_taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let taken = probes_taken.clone();
+        let remote = Box::new(move || {
+            // First probe: `ssh` holds the pty. Every one after: it is gone.
+            (taken.fetch_add(1, Ordering::SeqCst) == 0).then(|| RemoteContext {
+                kind: RemoteKind::Ssh,
+                argv: vec!["ssh".into(), "box".into()],
+                target: "box".into(),
+            })
+        });
+
+        let handle = DaemonPane::spawn_reader(
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(OutputGate::new()),
+            Box::new(Chunks(
+                [
+                    b"\x1b]133;C;ssh box\x07".to_vec(),
+                    b"\x1b]133;D;0\x07".to_vec(),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            null_writer(),
+            || false,
+            ForegroundProbes {
+                remote,
+                agent: Box::new(|| None),
+                cwd: Box::new(|| None),
+            },
+            Arc::new(DeathReporter::new(|| {})),
+        );
+        handle.join().unwrap();
+
+        assert_eq!(
+            probes_taken.load(Ordering::SeqCst),
+            2,
+            "the prompt mark did not force a second probe"
+        );
+        assert!(
+            state.lock().unwrap().remote.is_none(),
+            "the pane still reports the ssh session it has already left"
+        );
+        let reported: Vec<Option<String>> = sub_rx
+            .try_iter()
+            .filter_map(|msg| match msg {
+                DaemonMsg::RemoteContext(ctx) => Some(ctx.map(|c| c.target)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![Some("box".to_string()), None],
+            "the client was never told the pane came home"
+        );
     }
 
     #[test]
