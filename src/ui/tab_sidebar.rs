@@ -54,11 +54,68 @@ mod row_metrics {
     pub(super) const META_GAP: f32 = 6.;
     /// The branch icon.
     pub(super) const BRANCH_ICON: f32 = 11.;
+    /// `pl_2` + `pr_1p5` on a group header.
+    pub(super) const HEADER_PAD: f32 = 8. + 6.;
+    /// The chevron a header opens with, and the asterisk that marks a custom
+    /// group: both `xsmall` icons, which resolve to 12px.
+    pub(super) const HEADER_ICON: f32 = 12.;
 
     /// What a row can spend on text, before the badge is taken out.
     pub(super) const fn text_budget(width: f32) -> f32 {
         width - BORDER - 2. * LIST_PAD - 2. * ROW_PAD - AVATAR - GAP
     }
+
+    /// What a group header can spend on its name and the branch beside it,
+    /// with the chevron and its gap already taken out. The pin and the folded
+    /// row count come off at the call site, which knows whether they are drawn.
+    pub(super) const fn header_budget(width: f32) -> f32 {
+        width - BORDER - 2. * LIST_PAD - HEADER_PAD - HEADER_ICON - META_GAP
+    }
+}
+
+/// The narrowest a group's heading is allowed to get: three or four capitals
+/// and an ellipsis, which is still a name and not a stub.
+const HEADER_NAME_FLOOR: f32 = 40.;
+
+/// How a group header divides its line between the heading and the branch its
+/// rows share. The branch takes what it wants up to half the line, and the
+/// heading keeps the rest — so a long branch can no longer crush the name
+/// (flex used to hand the overflow to them in proportion to what each asked
+/// for, which gave the longer string the smaller cut), and a long custom name
+/// cannot crush the branch in return. `git_want` is `None` for a header with
+/// no shared branch on it, which then owns the whole line.
+fn header_name_avail(avail: f32, git_want: Option<f32>) -> f32 {
+    match git_want {
+        Some(want) => (avail - want.min(avail * 0.5)).max(HEADER_NAME_FLOOR),
+        None => avail,
+    }
+}
+
+/// What a diff's counts occupy on a line, measured against real glyphs: the
+/// two numbers, the gap between them when both are drawn, and the gap that
+/// separates them from the branch. They never wrap and never shrink, so this
+/// is the width a branch has to be elided around — on a row and on the group
+/// header that lifts the branch off its rows alike.
+fn counts_width(
+    ts: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    status: &crate::terminal::git_status::GitStatus,
+) -> f32 {
+    let mut w = 0.;
+    if status.added > 0 {
+        w += measure_text(ts, font, size, &format!("+{}", status.added));
+    }
+    if status.removed > 0 {
+        w += measure_text(ts, font, size, &format!("−{}", status.removed));
+    }
+    if status.added > 0 && status.removed > 0 {
+        w += row_metrics::META_GAP;
+    }
+    if w > 0. {
+        w += row_metrics::META_GAP;
+    }
+    w
 }
 
 /// The branch a whole group shares, lifted off its rows and onto its header.
@@ -258,6 +315,14 @@ impl Tty7App {
             ..font.clone()
         };
         let rem = window.rem_size().as_f32();
+        // A group header draws at a fixed 11px, its name semibold and the
+        // branch beside it regular. Resolved here so the header measures
+        // itself in the face it is about to be painted in, the way a row does.
+        let header_size = 11.;
+        let header_font = gpui::Font {
+            weight: FontWeight::SEMIBOLD,
+            ..font.clone()
+        };
         // The diff counts in their resting weight: green still means added,
         // but twelve of them down a column no longer outshout the titles.
         let added_ink = crate::ui::presets::resting_ink(
@@ -490,36 +555,7 @@ impl Tty7App {
                                 .size(px(row_metrics::BRANCH_ICON))
                                 .text_color(cx.theme().muted_foreground),
                         );
-                    // The diff counts are measured against real glyphs so the
-                    // branch can be elided to exactly the space they leave;
-                    // the counts themselves never wrap or shrink. They render
-                    // as two children of a `gap_1p5` row, so the gap between
-                    // them is measured rather than a space that stands in for
-                    // it.
-                    let mut counts_w = 0.;
-                    if g.added > 0 {
-                        counts_w += measure_text(
-                            &window.text_system(),
-                            &font,
-                            meta_size,
-                            &format!("+{}", g.added),
-                        );
-                    }
-                    if g.removed > 0 {
-                        counts_w += measure_text(
-                            &window.text_system(),
-                            &font,
-                            meta_size,
-                            &format!("−{}", g.removed),
-                        );
-                    }
-                    if g.added > 0 && g.removed > 0 {
-                        counts_w += row_metrics::META_GAP;
-                    }
-                    if counts_w > 0. {
-                        // The gap between the branch and the counts.
-                        counts_w += row_metrics::META_GAP;
-                    }
+                    let counts_w = counts_width(&window.text_system(), &font, meta_size, &g);
                     // Branch: keep both ends (`window-…backdrop`) so its
                     // identifying tail survives a narrow sidebar.
                     let branch_avail =
@@ -989,7 +1025,48 @@ impl Tty7App {
                 .filter(|r| Some(&r.key) == group_key.as_ref())
                 .map(|r| r.input.clone());
             let header = section.name.clone().map(|name| {
-                let label: SharedString = name.to_uppercase().into();
+                // The header packs a heading and the branch its whole group
+                // shares onto one 11px line, and the branch is the unbounded
+                // half of it: beside `fix/rpc-proxy-and-error-classification`,
+                // `DELTA-NEUTRAL-BOT` came out as `DEL…`. Flex splits an
+                // overflow between the two in proportion to how much room each
+                // asked for, which is backwards here — the name is what the
+                // group *is*, the branch only what it happens to be sitting
+                // on. So both are measured against the header's real chrome:
+                // the branch gets what it needs up to half the line, the name
+                // keeps the rest, and each is elided into its share the way a
+                // row already elides its own.
+                let ts = window.text_system();
+                let mut avail = row_metrics::header_budget(width);
+                if pinned {
+                    avail -= row_metrics::HEADER_ICON + row_metrics::META_GAP;
+                }
+                let count_label = row_count.to_string();
+                if folded {
+                    avail -=
+                        measure_text(&ts, &font, header_size, &count_label) + row_metrics::META_GAP;
+                }
+                let avail = avail.max(HEADER_NAME_FLOOR);
+                // What the shared branch would take if nothing were in its
+                // way: the icon, the gap after it, the branch itself, the
+                // counts, and the two gaps the spacer between the name and
+                // the branch sits in.
+                let git_want = shared_git.as_ref().map(|shared| {
+                    let counts = counts_width(&ts, &font, header_size, &shared.status);
+                    row_metrics::BRANCH_ICON
+                        + 3. * row_metrics::META_GAP
+                        + measure_text(&ts, &font, header_size, &shared.status.branch)
+                        + counts
+                });
+                let name_avail = header_name_avail(avail, git_want);
+                let label = elide_label(
+                    &ts,
+                    &header_font,
+                    header_size,
+                    &name.to_uppercase(),
+                    name_avail,
+                );
+                let name_w = measure_text(&ts, &header_font, header_size, &label);
                 let bar = h_flex()
                     .id(("sidebar-group", group_ix))
                     .w_full()
@@ -1056,8 +1133,11 @@ impl Tty7App {
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .child(Input::new(&input).appearance(false))
                             .into_any_element(),
+                        // Elided above, so the truncation here is only the
+                        // backstop for a face that measures wider than it
+                        // paints; the name no longer gives room to the branch.
                         None => div()
-                            .flex_shrink(1.)
+                            .flex_shrink_0()
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -1070,9 +1150,19 @@ impl Tty7App {
                             click,
                             rows,
                         } = shared;
+                        let branch_avail = (avail
+                            - name_w
+                            - row_metrics::BRANCH_ICON
+                            - 3. * row_metrics::META_GAP
+                            - counts_width(&ts, &font, header_size, &status))
+                        .max(0.);
+                        // Both ends, like a row's: the tail is what tells two
+                        // branches off the same prefix apart.
+                        let branch =
+                            elide_keep_edges(&ts, &font, header_size, &status.branch, branch_avail);
                         let mut line = h_flex()
                             .id(("sidebar-group-git", group_ix))
-                            .flex_shrink(2.)
+                            .flex_shrink(1.)
                             .min_w_0()
                             .items_center()
                             .gap_1p5()
@@ -1083,7 +1173,7 @@ impl Tty7App {
                                     .size(px(row_metrics::BRANCH_ICON))
                                     .text_color(cx.theme().muted_foreground),
                             )
-                            .child(div().min_w_0().truncate().child(status.branch.clone()));
+                            .child(div().min_w_0().truncate().child(branch));
                         if status.added > 0 || status.removed > 0 {
                             let mut counts = h_flex()
                                 .id(("sidebar-group-diff", group_ix))
@@ -1140,7 +1230,7 @@ impl Tty7App {
                     // The count is redundant while the rows are on screen; it
                     // is what a shut group has instead of them.
                     .when(folded, |bar| {
-                        bar.child(div().flex_shrink_0().child(row_count.to_string()))
+                        bar.child(div().flex_shrink_0().child(count_label))
                     });
                 // Renaming is offered on a menu rather than a double click:
                 // the first click of a double would fold the group, so the
@@ -2785,5 +2875,29 @@ mod tests {
         let (short, long) = (p("/app"), p("/x/app"));
         let names = group_names(&[&short, &long]);
         assert_eq!(names, vec!["app", "x/app"]);
+    }
+
+    /// A header with a long branch on it used to leave the heading as `DEL…`
+    /// while the branch kept thirty characters. The name is the group; the
+    /// branch is what it happens to be sitting on, and it may take at most
+    /// half the line before the heading starts paying for it.
+    #[test]
+    fn a_long_branch_takes_half_the_header_and_no_more() {
+        let avail = 200.;
+        assert_eq!(header_name_avail(avail, Some(400.)), 100.);
+        assert_eq!(header_name_avail(avail, Some(100.)), 100.);
+    }
+
+    #[test]
+    fn a_short_branch_leaves_the_heading_the_rest_of_the_header() {
+        assert_eq!(header_name_avail(200., Some(40.)), 160.);
+        assert_eq!(header_name_avail(200., None), 200.);
+    }
+
+    /// Even a header narrow enough that the branch's half swallows the line
+    /// keeps a readable stub of the name, rather than eliding it away.
+    #[test]
+    fn the_heading_keeps_a_floor_on_a_narrow_sidebar() {
+        assert_eq!(header_name_avail(60., Some(400.)), HEADER_NAME_FLOOR);
     }
 }
