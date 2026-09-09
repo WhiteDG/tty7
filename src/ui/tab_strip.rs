@@ -593,6 +593,22 @@ pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> But
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
 }
 
+/// A chrome tile whose current state is said with a rule under it rather than
+/// with a fill: the ink still steps up to full strength, the pill never
+/// appears, and the caller draws the bar.
+///
+/// The fill is what an activity bar of three tiles cannot afford. It is the
+/// same grey block the hover state paints, so the lit tab and the tile under
+/// the pointer read as the same thing, and it sits in a title bar where every
+/// other tile is a bare glyph.
+pub(crate) fn chrome_tile_marked(button: Button, current: bool, cx: &gpui::App) -> Button {
+    button
+        .custom(chrome_tile_variant_for(current, cx))
+        .with_size(px(TILE_GLYPH / BUTTON_ICON_SCALE))
+        .w(px(TILE_SIZE))
+        .h(px(TILE_SIZE))
+}
+
 /// How wide the two chrome tiles at the trailing end of the title bar are, with
 /// the padding around them.
 pub(crate) fn trailing_chrome_tiles_w() -> f32 {
@@ -1165,13 +1181,21 @@ impl Tty7App {
         ]
         .into_iter()
         .map(|(tab, icon, label_key)| {
+            let current = active_tab == tab;
             div()
                 .occlude()
                 .flex_shrink_0()
+                // Full height and `relative` so the bar below can be pinned to
+                // the row's own bottom edge, where it lands on the hairline
+                // that closes the row rather than floating under the glyph.
+                .h_full()
+                .relative()
+                .flex()
+                .items_center()
                 .child(
-                    chrome_tile(
+                    chrome_tile_marked(
                         Button::new(("right-panel-tab", tab as usize)).icon(icon),
-                        active_tab == tab,
+                        current,
                         cx,
                     )
                     .rounded_lg()
@@ -1205,6 +1229,18 @@ impl Tty7App {
                         }
                     })),
                 )
+                // Narrower than the tile so it reads as underlining the glyph
+                // rather than as the edge of a box around it.
+                .children(current.then(|| {
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(6.))
+                        .right(px(6.))
+                        .h(px(2.))
+                        .rounded_t(px(1.))
+                        .bg(cx.theme().foreground)
+                }))
                 .into_any_element()
         })
         .collect()

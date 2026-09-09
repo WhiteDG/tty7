@@ -863,13 +863,13 @@ pub struct Tty7App {
     pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     pub(crate) sidebar_width: Rc<Cell<f32>>,
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
-    /// Whether the pointer is over the sidebar, the tab strip and the right
-    /// panel's own title bar. The chrome tiles in each — new tab, the two
-    /// panel toggles, the app menu — are drawn only while its own flag is set,
-    /// so a window nobody is pointing at carries no buttons at all.
+    /// Whether the pointer is over the sidebar and over the tab strip. The
+    /// chrome tiles in each — new tab, the panel toggles, the app menu — are
+    /// drawn only while its own flag is set, so a window nobody is pointing at
+    /// carries no buttons at all. The right panel's own title bar is the
+    /// exception: its tiles are always painted while the panel is open.
     pub(crate) sidebar_chrome_hover: Rc<Cell<bool>>,
     pub(crate) strip_chrome_hover: Rc<Cell<bool>>,
-    pub(crate) panel_chrome_hover: Rc<Cell<bool>>,
     /// How much width a settings row will actually get, measured once per
     /// render. `settings_row` is called from page builders that never see the
     /// window, and the answer differs per page — the SSH page spends a host
@@ -1489,7 +1489,6 @@ impl Tty7App {
             sidebar_dragging: Rc::new(Cell::new(false)),
             sidebar_chrome_hover: Rc::new(Cell::new(false)),
             strip_chrome_hover: Rc::new(Cell::new(false)),
-            panel_chrome_hover: Rc::new(Cell::new(false)),
             settings_row_width: Cell::new(f32::MAX),
             settings_viewport_w: Cell::new(f32::MAX),
             settings_hit_anchored: Cell::new(false),
