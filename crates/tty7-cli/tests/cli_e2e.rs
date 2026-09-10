@@ -75,6 +75,10 @@ fn main() {
             "capture_plain_returns_text_not_escapes",
             capture_plain_returns_text_not_escapes,
         ),
+        (
+            "capture_still_answers_after_a_resize",
+            capture_still_answers_after_a_resize,
+        ),
     ];
 
     let mut failed = 0;
@@ -825,4 +829,79 @@ fn capture_plain_returns_text_not_escapes(daemon: &Daemon) {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// A resize must not empty `capture`.
+///
+/// The daemon's replay ring seals its segment on every resize and opens an
+/// empty one at the new geometry, and it replays every segment it holds. The
+/// default form keeps "the newest segment", which was that empty placeholder
+/// for any pane resized since it last printed — so `capture` answered a live
+/// pane with zero bytes and exit `0`, indistinguishable from a blank one
+/// (#841). Nothing about the pane changes here between the two captures except
+/// its size, which is what makes the assertion a statement about the replay
+/// rather than about timing.
+fn capture_still_answers_after_a_resize(daemon: &Daemon) {
+    let mut pane = PaneClient::at(daemon.pane_endpoint())
+        .spawn(
+            None,
+            WinSize {
+                cols: 100,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 16,
+            },
+            None,
+            Some("resize-capture-e2e".into()),
+            None,
+        )
+        .expect("spawn a pane to resize");
+    let address = format!("%{}", pane.pane_id());
+
+    daemon.run_ok(&["send", &address, "echo tty7_e2e_resize_marker", "--enter"]);
+    let deadline = Instant::now() + SETTLE_WITHIN;
+    loop {
+        if daemon
+            .run_ok(&["capture", &address])
+            .contains("tty7_e2e_resize_marker")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the marker never reached the pane's newest segment"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    pane.resize(WinSize {
+        cols: 80,
+        rows: 24,
+        cell_w: 8,
+        cell_h: 16,
+    })
+    .expect("resize the pane");
+    // Long enough for the daemon to have sealed the segment, and for any
+    // repaint the shell answers a resize with to have landed either way.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    for form in [
+        vec!["capture", &address],
+        vec!["capture", &address, "--plain"],
+        vec!["capture", &address, "--scrollback"],
+    ] {
+        let out = daemon.run_json(&form);
+        let text = out["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("tty7_e2e_resize_marker"),
+            "tty7 {form:?} lost the pane's output to the empty segment the \
+             resize opened: {out}"
+        );
+        assert!(
+            out["bytes"].as_u64().is_some_and(|n| n > 0),
+            "a capture that carried text has to report the bytes it carried: {out}"
+        );
+    }
+
+    let _ = pane.detach();
 }

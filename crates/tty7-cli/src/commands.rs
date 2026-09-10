@@ -595,16 +595,37 @@ fn tried_to_write_an_address(s: &str) -> bool {
 fn capture(args: CaptureArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
     let pane = address::pane_or_context(args.target.as_deref(), ctx)?;
     let segments = backend.capture(pane, args.scrollback)?;
+    // How much the replay actually carried, counted before anything renders or
+    // trims it. An empty answer used to be one fact — "nothing came back" — and
+    // a caller could not tell a blank pane from a capture that lost its bytes
+    // on the way (#841). With this beside it the two read differently: zero
+    // bytes is a pane that printed nothing, and bytes with no text is a screen
+    // whose content did not survive the grid.
+    let replayed: usize = segments.iter().map(|segment| segment.bytes.len()).sum();
     // Raw is the default and stays byte-for-byte what the daemon stored, joined
     // in replay order; `--plain` hands the same bytes to a grid instead. Either
     // way `--json` carries whatever was printed, so a caller reads one field.
-    let text = if args.plain {
+    let rendered = if args.plain {
         screen::render(&segments)
     } else {
         let bytes: Vec<u8> = segments.into_iter().flat_map(|s| s.bytes).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    report(text.clone(), json!({ "pane": pane, "text": text }))
+    // Said once, on stderr, where it cannot corrupt stdout or the JSON line —
+    // and reported as the observation it is, not as a diagnosis. Only `--plain`
+    // can reach it: lossy UTF-8 never turns bytes into an empty string, so the
+    // raw form's text is empty exactly when the replay was.
+    if rendered.is_empty() && replayed > 0 {
+        eprintln!(
+            "tty7: capture %{pane}: {replayed} bytes replayed and the grid they \
+             drive is blank — this empty result is the pane's screen, not a \
+             capture that came back short"
+        );
+    }
+    report(
+        rendered.clone(),
+        json!({ "pane": pane, "text": rendered, "bytes": replayed }),
+    )
 }
 
 fn procs(target: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -2583,6 +2604,48 @@ mod tests {
         ));
         assert_eq!(plain["text"], json!("red"));
         assert_eq!(plain["pane"], json!(2));
+    }
+
+    #[test]
+    fn capture_json_counts_the_bytes_the_replay_carried() {
+        // The whole point of the field: `text` is empty in both of these, and
+        // only `bytes` says which of the two happened. The first is a pane that
+        // printed nothing; the second printed a screenful and then cleared it,
+        // so the bytes are real and the grid they drive is blank.
+        let mut backend = mock();
+        let blank = json_of(run_cli(
+            &["tty7", "capture", "%2", "--plain"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(blank["text"], json!(""));
+        assert_eq!(blank["bytes"], json!(0));
+
+        let cleared = b"\x1b[2J\x1b[3J\x1b[H";
+        backend.capture_segments = vec![segment(cleared)];
+        let wiped = json_of(run_cli(
+            &["tty7", "capture", "%2", "--plain"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(wiped["text"], json!(""));
+        assert_eq!(
+            wiped["bytes"],
+            json!(cleared.len()),
+            "an empty render has to be told apart from an empty replay"
+        );
+
+        // And the count is of the replay, not of what came out of the grid:
+        // escapes are bytes the pane produced even though no text survives them.
+        let coloured_bytes = b"\x1b[31mred\x1b[0m\r\n";
+        backend.capture_segments = vec![segment(coloured_bytes)];
+        let coloured = json_of(run_cli(
+            &["tty7", "capture", "%2", "--plain"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(coloured["text"], json!("red"));
+        assert_eq!(coloured["bytes"], json!(coloured_bytes.len()));
     }
 
     #[test]

@@ -144,7 +144,13 @@ replayed through a terminal grid and printed as the text they produced.
 
 Either way it is a snapshot, not a stream: it collects the replay, settles for
 ~300 ms, and returns. Call it again for a newer one.
-JSON: `{"pane","text"}`.
+
+JSON: `{"pane","text","bytes"}` — `bytes` is how much the replay carried, counted
+before `--plain` rendered it. It is what tells an empty `text` apart: `0` is a
+pane that has printed nothing, and a non-zero count with no text is a screen
+whose bytes produced nothing visible (a pane that was cleared, say). The same
+case also prints one line on stderr, so a script that never reads the JSON still
+sees it.
 
 ### `tty7 procs [%PANE]`
 
