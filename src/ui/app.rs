@@ -3455,6 +3455,16 @@ impl Tty7App {
         }
     }
 
+    /// Sample which pane holds focus right now and record it against the
+    /// active tab.
+    ///
+    /// A sample only ever writes the truth, but it can only write it when
+    /// there is one to read: with focus one handle off the panes it finds no
+    /// leaf and leaves the field alone. That is why it is no longer the only
+    /// writer (see [`Tty7App::remember_focused_leaf`]) — it stays because the
+    /// callers below want the answer settled at a named moment, before a pane
+    /// is detached or a tab is torn down and the layout stops being able to
+    /// answer at all.
     pub(crate) fn remember_active_pane(&mut self, window: &Window, cx: &App) {
         let active = self.active;
         if let Some(tab) = self.tabs.get_mut(active) {
@@ -3462,6 +3472,24 @@ impl Tty7App {
                 tab.last_focused = Some(leaf.entity_id());
             }
         }
+    }
+
+    /// Record `leaf` as the pane its tab comes back to, as focus arrives in it.
+    ///
+    /// Sampling at switch time asks which leaf holds focus *at that instant*,
+    /// and by then focus is routinely somewhere else: the switcher's own
+    /// search input, a palette that just closed, the tab strip, a pane
+    /// restored and never clicked. The sample then wrote nothing and the tab
+    /// kept a stale pane — or the `None` it was born with — and came back to
+    /// its first leaf instead of the one the reader was working in (#843).
+    ///
+    /// Focus-in is the one moment that knows the answer without having to
+    /// guess when to look, so it is the primary writer now. The tab is found
+    /// by the leaf rather than assumed to be the active one: a pane dragged
+    /// into another tab is focused after the move, and it is the tab holding
+    /// it now that has to remember it.
+    pub(crate) fn remember_focused_leaf(&mut self, leaf: gpui::EntityId) {
+        remember_leaf_in(&mut self.tabs, leaf);
     }
 
     fn focus_leaf(&self, leaf: &PaneSlot, window: &mut Window, cx: &mut App) {
@@ -8525,6 +8553,8 @@ pub(crate) fn new_terminal(
         },
     )
     .detach();
+    let handle = pending.read(cx).focus_handle.clone();
+    watch_pane_focus(&handle, pending.entity_id(), window, cx);
     start_pane_spawn(pending.clone(), window, cx);
     Ok(PaneSlot::Connecting(pending))
 }
@@ -8590,7 +8620,8 @@ fn build_terminal_view(
     )
     .detach();
     watch_open_file_requests(&view, window, cx);
-    watch_pane_focus(&view, window, cx);
+    let handle = view.read(cx).focus_handle.clone();
+    watch_pane_focus(&handle, view.entity_id(), window, cx);
     view
 }
 
@@ -8618,13 +8649,42 @@ fn watch_open_file_requests(
     .detach();
 }
 
-fn watch_pane_focus(view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Tty7App>) {
-    let handle = view.read(cx).focus_handle.clone();
+/// Record `leaf` as the pane the tab holding it comes back to.
+///
+/// Which tab that is gets asked of the layout rather than assumed to be the
+/// active one: a pane dragged into another tab takes focus with it, and it is
+/// the tab holding it now whose memory the arrival should change. A leaf no
+/// tab holds — one that has just closed, or arrived after its slot went away —
+/// is recorded nowhere.
+fn remember_leaf_in(tabs: &mut [Tab], leaf: gpui::EntityId) {
+    let held = tabs
+        .iter_mut()
+        .find(|tab| tab.pane.leaves().iter().any(|l| l.entity_id() == leaf));
+    if let Some(tab) = held {
+        tab.last_focused = Some(leaf);
+    }
+}
+
+/// Repaint the chrome that marks the focused pane, and record the leaf as the
+/// one its tab returns to (#843).
+///
+/// Every leaf is watched, connecting slots included: a pane can be focused
+/// while it is still coming up, and if the tab is left in that moment the
+/// answer has to already be written down.
+fn watch_pane_focus(
+    handle: &gpui::FocusHandle,
+    leaf: gpui::EntityId,
+    window: &mut Window,
+    cx: &mut Context<Tty7App>,
+) {
     let app = cx.weak_entity();
     window
-        .on_focus_in(&handle, cx, move |_window, cx| {
+        .on_focus_in(handle, cx, move |_window, cx| {
             if let Some(app) = app.upgrade() {
-                app.update(cx, |_, cx| cx.notify());
+                app.update(cx, |app, cx| {
+                    app.remember_focused_leaf(leaf);
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -8656,7 +8716,8 @@ pub(crate) fn new_terminal_native(
     )
     .detach();
     watch_open_file_requests(&view, window, cx);
-    watch_pane_focus(&view, window, cx);
+    let handle = view.read(cx).focus_handle.clone();
+    watch_pane_focus(&handle, view.entity_id(), window, cx);
     Ok(view)
 }
 
@@ -11057,6 +11118,175 @@ mod close_window_action_tests {
             cx.update(|cx| WindowRegistry::open_windows(cx).is_empty()),
             "the close has to run the same cleanup the red button runs, \
              which is what takes the window out of the registry"
+        );
+    }
+}
+
+/// #843: which pane a tab comes back to.
+#[cfg(test)]
+mod tab_focus_memory_tests {
+    use super::{Pane, PaneSlot, Tab, remember_leaf_in};
+    use crate::ui::pending_pane::{PendingPane, PendingSpawn};
+    use gpui::{
+        AppContext as _, Axis, Context, Entity, IntoElement, Render, Styled as _, TestAppContext,
+        Window, div,
+    };
+
+    /// A window has to exist for focus to live in, but nothing this file asks
+    /// is about what a pane paints.
+    struct Blank;
+    impl Render for Blank {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    /// A leaf that owns a real focus handle without owning a shell. Focus
+    /// tracking asks the slot, not the terminal behind it, so a connecting
+    /// pane answers every question here exactly as a running one would — and
+    /// connecting panes are watched for focus now too, so this is not a
+    /// stand-in for the case under test but one of its cases.
+    fn leaf(cx: &mut Context<Blank>) -> Entity<PendingPane> {
+        cx.new(|cx| {
+            PendingPane::new(
+                "test",
+                PendingSpawn {
+                    workspace: None,
+                    working_directory: None,
+                    restore_pane: None,
+                    shell: None,
+                    agent: None,
+                    agent_session_id: None,
+                    agent_launch_argv: None,
+                    owner: None,
+                    font_size: 14.,
+                },
+                cx,
+            )
+        })
+    }
+
+    fn two_pane_tab(a: &Entity<PendingPane>, b: &Entity<PendingPane>) -> Tab {
+        Tab::new(Pane::split_node(
+            Axis::Horizontal,
+            0.5,
+            Pane::Leaf(PaneSlot::Connecting(a.clone())),
+            Pane::Leaf(PaneSlot::Connecting(b.clone())),
+        ))
+    }
+
+    fn one_pane_tab(a: &Entity<PendingPane>) -> Tab {
+        Tab::new(Pane::Leaf(PaneSlot::Connecting(a.clone())))
+    }
+
+    /// The mechanism behind the report: `remember_active_pane`'s sample asks
+    /// which leaf holds focus *at that instant*, and a switch begun with focus
+    /// one handle away — the switcher's own search input, a palette closing,
+    /// the tab strip — finds no leaf and has nothing to write. This is why the
+    /// sample cannot be the only writer, and it is pinned here so that a change
+    /// making `focused_leaf` tolerant would have to argue with a test rather
+    /// than silently make this fix look unnecessary.
+    #[gpui::test]
+    fn a_switch_begun_off_the_panes_samples_nothing(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Blank);
+        let (a, b, elsewhere) = window
+            .update(cx, |_, _, cx| (leaf(cx), leaf(cx), cx.focus_handle()))
+            .unwrap();
+        let tab = two_pane_tab(&a, &b);
+
+        window
+            .update(cx, |_, window, cx| {
+                let on_b = b.read(cx).focus_handle.clone();
+                window.focus(&on_b, cx);
+                assert_eq!(
+                    tab.pane.focused_leaf(window, cx).map(|l| l.entity_id()),
+                    Some(b.entity_id()),
+                    "with focus in the pane the sample would have found it"
+                );
+
+                window.focus(&elsewhere, cx);
+                assert!(
+                    tab.pane.focused_leaf(window, cx).is_none(),
+                    "one handle off the pane and the switch-away sample has \
+                     nothing to write"
+                );
+            })
+            .unwrap();
+    }
+
+    /// So focus-in writes instead, and the tab comes back to the pane focus
+    /// was last in even though it had wandered off the panes before the switch
+    /// ever started.
+    #[gpui::test]
+    fn a_tab_comes_back_to_the_pane_focus_was_last_in(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Blank);
+        let (a, b) = window.update(cx, |_, _, cx| (leaf(cx), leaf(cx))).unwrap();
+        let mut tabs = vec![two_pane_tab(&a, &b)];
+        assert_eq!(
+            tabs[0].focus_target().map(|l| l.entity_id()),
+            Some(a.entity_id()),
+            "a tab nobody has worked in yet still opens on its first leaf"
+        );
+
+        // The reader clicks into the right-hand pane: focus arrives, and that
+        // is the moment the tab is told.
+        remember_leaf_in(&mut tabs, b.entity_id());
+
+        // Focus then leaves the panes — the switcher opens, a palette closes —
+        // and the tab is switched away from. `remember_active_pane` finds no
+        // focused leaf and writes nothing, which is now harmless.
+        assert_eq!(
+            tabs[0].focus_target().map(|l| l.entity_id()),
+            Some(b.entity_id()),
+            "#843: the tab has to come back to the pane the reader was in"
+        );
+    }
+
+    /// A pane dragged into another tab is focused where it lands, so the
+    /// arrival has to change that tab's memory and not the one it left — the
+    /// reason the tab is found by the leaf rather than taken to be the active
+    /// one.
+    #[gpui::test]
+    fn a_moved_pane_is_remembered_by_the_tab_that_holds_it_now(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Blank);
+        let (a, b, c) = window
+            .update(cx, |_, _, cx| (leaf(cx), leaf(cx), leaf(cx)))
+            .unwrap();
+        // Tab 0 is the active one and holds `a`; `b` and `c` live in tab 1.
+        let mut tabs = vec![one_pane_tab(&a), two_pane_tab(&b, &c)];
+
+        remember_leaf_in(&mut tabs, c.entity_id());
+
+        assert_eq!(
+            tabs[1].focus_target().map(|l| l.entity_id()),
+            Some(c.entity_id()),
+            "the tab holding the focused pane is the one that remembers it"
+        );
+        assert_eq!(
+            tabs[0].focus_target().map(|l| l.entity_id()),
+            Some(a.entity_id()),
+            "and no other tab's memory is touched"
+        );
+    }
+
+    /// A pane that arrives after its slot has gone — a spawn landing on a
+    /// closed tab, a leaf killed mid-flight — belongs to no tab, and must not
+    /// leave a memory behind for the first tab that happens to be looked at.
+    #[gpui::test]
+    fn a_leaf_no_tab_holds_is_recorded_nowhere(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Blank);
+        let (a, b, gone) = window
+            .update(cx, |_, _, cx| (leaf(cx), leaf(cx), leaf(cx)))
+            .unwrap();
+        let mut tabs = vec![two_pane_tab(&a, &b)];
+
+        remember_leaf_in(&mut tabs, b.entity_id());
+        remember_leaf_in(&mut tabs, gone.entity_id());
+
+        assert_eq!(
+            tabs[0].focus_target().map(|l| l.entity_id()),
+            Some(b.entity_id()),
+            "a stranger's arrival leaves the tab's own answer alone"
         );
     }
 }
