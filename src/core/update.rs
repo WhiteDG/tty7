@@ -1904,7 +1904,9 @@ fn github_http_error(
     let message = serde_json::from_slice::<GitHubError>(body)
         .ok()
         .map(|error| sanitize_github_message(&error.message));
-    let rate_limited = status == 403
+    // 403 is what the REST API has always answered a spent quota with; 429 is
+    // what it increasingly answers instead, and both carry the same headers.
+    let rate_limited = matches!(status, 403 | 429)
         && (rate_remaining == Some("0")
             || message.as_deref().is_some_and(|message| {
                 message.to_ascii_lowercase().contains("rate limit exceeded")
@@ -2982,6 +2984,25 @@ mod tests {
         assert_eq!(
             error,
             "GitHub API rate limit exceeded; try again in about 60 minutes (HTTP 403)"
+        );
+    }
+
+    /// GitHub answers a spent quota with 403 or 429 depending on the endpoint
+    /// and the era. Only the 403 spelling used to reach the retry advice, so a
+    /// 429 told the reader the quota was gone without saying when it returns.
+    #[test]
+    fn a_429_is_a_rate_limit_too() {
+        let error = github_http_error(
+            429,
+            Some("0"),
+            Some("1600"),
+            br#"{"message":"API rate limit exceeded for 203.0.113.1."}"#,
+            1000,
+        );
+
+        assert_eq!(
+            error,
+            "GitHub API rate limit exceeded; try again in about 10 minutes (HTTP 429)"
         );
     }
 
