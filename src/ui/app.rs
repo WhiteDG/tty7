@@ -3543,9 +3543,7 @@ impl Tty7App {
             view.read(cx).run_command_line(&cmd);
         }
         let slot = PaneSlot::Ready(view.clone());
-        self.tabs
-            .iter_mut()
-            .any(|tab| tab.pane.replace_leaf(slot_id, slot.clone()));
+        replace_leaf_in(&mut self.tabs, slot_id, slot.clone());
         if was_focused {
             self.focus_leaf(&slot, window, cx);
         }
@@ -3749,14 +3747,11 @@ impl Tty7App {
                 return;
             }
         };
-        for tab in &mut self.tabs {
-            if tab
-                .pane
-                .replace_leaf(dead.entity_id(), PaneSlot::Ready(fresh.clone()))
-            {
-                break;
-            }
-        }
+        replace_leaf_in(
+            &mut self.tabs,
+            dead.entity_id(),
+            PaneSlot::Ready(fresh.clone()),
+        );
         self.maximized = None;
         self.focus_leaf(&PaneSlot::Ready(fresh), window, cx);
         self.save_session(cx);
@@ -8665,6 +8660,30 @@ fn remember_leaf_in(tabs: &mut [Tab], leaf: gpui::EntityId) {
     }
 }
 
+/// Put `new` where the slot `old` named stood, carrying that tab's focus
+/// memory across with it.
+///
+/// The memory has to move because the id it holds does not survive the swap.
+/// Focus arriving in a pane that is still coming up is recorded against the
+/// *pending* slot — that is why connecting slots are watched at all — and that
+/// slot's id dies the moment the pane lands. Left behind, the memory names an
+/// entity no tab holds, `focus_target` falls through `leaf_matching_or_first`,
+/// and the tab comes back to its first leaf: #843 again, one landing later.
+///
+/// Nothing else writes the answer down in that case. `land_pane` re-focuses
+/// the pane it built only when the pending slot still held focus, and with
+/// focus off the panes the switch-away sample has nothing to read either.
+fn replace_leaf_in(tabs: &mut [Tab], old: gpui::EntityId, new: PaneSlot) {
+    for tab in tabs.iter_mut() {
+        if tab.pane.replace_leaf(old, new.clone()) {
+            if tab.last_focused == Some(old) {
+                tab.last_focused = Some(new.entity_id());
+            }
+            break;
+        }
+    }
+}
+
 /// Repaint the chrome that marks the focused pane, and record the leaf as the
 /// one its tab returns to (#843).
 ///
@@ -11125,7 +11144,7 @@ mod close_window_action_tests {
 /// #843: which pane a tab comes back to.
 #[cfg(test)]
 mod tab_focus_memory_tests {
-    use super::{Pane, PaneSlot, Tab, remember_leaf_in};
+    use super::{Pane, PaneSlot, Tab, remember_leaf_in, replace_leaf_in};
     use crate::ui::pending_pane::{PendingPane, PendingSpawn};
     use gpui::{
         AppContext as _, Axis, Context, Entity, IntoElement, Render, Styled as _, TestAppContext,
@@ -11288,5 +11307,114 @@ mod tab_focus_memory_tests {
             Some(b.entity_id()),
             "a stranger's arrival leaves the tab's own answer alone"
         );
+    }
+
+    /// A pane focused while it was still coming up is remembered under its
+    /// *pending* slot, and that id dies the moment the pane lands in its
+    /// place. The memory has to come along with the swap, or the landing is
+    /// itself what puts the tab back on its first leaf.
+    ///
+    /// What lands here is another slot rather than a running pane: the swap has
+    /// to move an id from one slot to another, and which kind of slot arrived
+    /// is no part of the question.
+    #[gpui::test]
+    fn a_landing_pane_inherits_what_its_pending_slot_was_told(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Blank);
+        let (a, connecting, landed, other) = window
+            .update(cx, |_, _, cx| (leaf(cx), leaf(cx), leaf(cx), leaf(cx)))
+            .unwrap();
+        let mut tabs = vec![two_pane_tab(&a, &connecting)];
+
+        // Focus arrives while the pane is still connecting, then the pane it
+        // was waiting for lands in that slot.
+        remember_leaf_in(&mut tabs, connecting.entity_id());
+        replace_leaf_in(
+            &mut tabs,
+            connecting.entity_id(),
+            PaneSlot::Connecting(landed.clone()),
+        );
+
+        assert_eq!(
+            tabs[0].focus_target().map(|l| l.entity_id()),
+            Some(landed.entity_id()),
+            "#843: the memory follows the pane, not the slot it arrived in"
+        );
+
+        // A landing somewhere else in the tab is not an answer to this
+        // question and does not touch it.
+        replace_leaf_in(&mut tabs, a.entity_id(), PaneSlot::Connecting(other));
+        assert_eq!(
+            tabs[0].focus_target().map(|l| l.entity_id()),
+            Some(landed.entity_id()),
+            "another pane landing leaves the tab's answer alone"
+        );
+    }
+
+    /// The wiring, end to end. `watch_pane_focus` is the subscription that
+    /// writes the record, and a real round trip through `activate` has to come
+    /// back to the pane focus last arrived in — with focus off the panes well
+    /// before the switch was made, which is the moment the switch-away sample
+    /// cannot see (#843).
+    #[gpui::test]
+    fn a_tab_switch_returns_to_the_pane_focus_arrived_in(cx: &mut TestAppContext) {
+        use super::{test_window::harness, watch_pane_focus};
+        use crate::terminal::view::quiet_test_pane;
+
+        let (app, mut vcx) = harness(cx);
+        let (left, right, elsewhere, _held) = app.update_in(&mut vcx, |app, window, cx| {
+            let (left, left_stream) = quiet_test_pane(1, window, cx);
+            let (right, right_stream) = quiet_test_pane(2, window, cx);
+            let (only, only_stream) = quiet_test_pane(3, window, cx);
+            app.tabs.push(Tab::new(Pane::split_node(
+                Axis::Horizontal,
+                0.5,
+                Pane::leaf(PaneSlot::Ready(left.clone())),
+                Pane::leaf(PaneSlot::Ready(right.clone())),
+            )));
+            app.tabs.push(Tab::new(Pane::leaf(PaneSlot::Ready(only))));
+            app.active = 0;
+            // The subscription every spawn path registers for the pane it
+            // built.
+            for view in [&left, &right] {
+                let handle = view.read(cx).focus_handle.clone();
+                watch_pane_focus(&handle, view.entity_id(), window, cx);
+            }
+            cx.notify();
+            (
+                left,
+                right,
+                cx.focus_handle(),
+                (left_stream, right_stream, only_stream),
+            )
+        });
+        vcx.background_executor.run_until_parked();
+
+        // The reader clicks into the right-hand pane.
+        app.update_in(&mut vcx, |_, window, cx| {
+            let handle = right.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+        });
+        vcx.background_executor.run_until_parked();
+
+        // Focus then leaves the panes altogether — a palette closing, the tab
+        // strip, the switcher's own search input — before the tab is left.
+        app.update_in(&mut vcx, |_, window, cx| elsewhere.focus(window, cx));
+        vcx.background_executor.run_until_parked();
+
+        app.update_in(&mut vcx, |app, window, cx| app.activate(1, window, cx));
+        vcx.background_executor.run_until_parked();
+        app.update_in(&mut vcx, |app, window, cx| app.activate(0, window, cx));
+        vcx.background_executor.run_until_parked();
+
+        app.update_in(&mut vcx, |_, window, cx| {
+            assert!(
+                right.read(cx).focus_handle.is_focused(window),
+                "#843: the tab has to come back to the pane the reader was in"
+            );
+            assert!(
+                !left.read(cx).focus_handle.is_focused(window),
+                "and not to the first leaf"
+            );
+        });
     }
 }
