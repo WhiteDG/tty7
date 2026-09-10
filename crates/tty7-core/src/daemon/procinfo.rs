@@ -29,9 +29,50 @@ pub fn snapshot(shell_pid: u32, fg_pgid: Option<i32>) -> PaneProcs {
         false => probe,
     };
     if let PortProbe::Unavailable(detail) = &probe {
-        log::warn!("listening-port probe failed for pane shell {shell_pid}: {detail}");
+        note_probe_failure(shell_pid, detail);
     }
     finish(procs, ports, probe)
+}
+
+/// How long the same probe failure waits before it is written down again.
+///
+/// `snapshot` answers one `QueryProcs`, and the Info panel sends one every two
+/// seconds for as long as it is open — a probe that cannot run now will not
+/// have started working two seconds later. Logging every attempt turns one
+/// standing fact into thirty lines a minute in a file that truncates itself at
+/// 4 MiB, which costs the reporter the rest of the session they turned logging
+/// on to capture. Once a minute still leaves a trail for a failure that
+/// outlives the panel.
+const PROBE_LOG_GAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn note_probe_failure(shell_pid: u32, detail: &str) {
+    static LAST: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let line = format!("listening-port probe failed for pane shell {shell_pid}: {detail}");
+    let Ok(mut last) = LAST.lock() else { return };
+    if probe_log_due(&mut last, &line, std::time::Instant::now(), PROBE_LOG_GAP) {
+        log::warn!("{line}");
+    }
+}
+
+/// Whether `line` is worth a log entry now, given what was written last.
+///
+/// A line that has not been said before is always worth saying — a probe that
+/// starts failing for a second reason, or a second pane failing for the same
+/// one, is news. Repeating one is worth it only once per `gap`.
+fn probe_log_due(
+    last: &mut Option<(String, std::time::Instant)>,
+    line: &str,
+    now: std::time::Instant,
+    gap: std::time::Duration,
+) -> bool {
+    if let Some((said, at)) = last.as_ref() {
+        if said == line && now.duration_since(*at) < gap {
+            return false;
+        }
+    }
+    *last = Some((line.to_string(), now));
+    true
 }
 
 /// The answer as the panel gets it: the process list trimmed to what a sidebar
@@ -64,9 +105,58 @@ fn tree_has_foreign_uid(table: &HashMap<u32, Row>, procs: &[ProcEntry], me: u32)
     if me == 0 {
         return false;
     }
-    procs
-        .iter()
-        .any(|p| table.get(&p.pid).is_some_and(|row| row.uid != me))
+    procs.iter().any(|p| {
+        table
+            .get(&p.pid)
+            .is_some_and(|row| row.uid != me && confirm_foreign(p.pid, me))
+    })
+}
+
+/// A second opinion on a row that looks like another user's.
+///
+/// Asked only about the pane's own tree, and only about the rows that already
+/// look foreign, so an ordinary pane pays nothing for it and a `sudo` pays one
+/// file read.
+///
+/// Linux needs it because the owner of `/proc/<pid>` is not always the process's
+/// uid: the kernel makes that directory `root:root` whenever a process's
+/// dumpable attribute has been cleared, which is what executing a set-user-ID
+/// binary or one carrying file capabilities does. A plain `ping` in a pane is
+/// the user's own process behind a root-owned `/proc` entry, and taking the
+/// directory's word for it would have the panel apologise for sockets it can
+/// read perfectly well — the opposite mistake to the one this file is fixing,
+/// and just as wrong. `Uid:` in `/proc/<pid>/status` is the real answer and is
+/// readable either way.
+#[cfg(target_os = "linux")]
+fn confirm_foreign(pid: u32, me: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(text) => status_euid(&text).is_none_or(|uid| uid != me),
+        // Gone, or unreadable: keep the directory's verdict rather than
+        // inventing a second one out of a failed read.
+        Err(_) => true,
+    }
+}
+
+/// macOS reads the effective uid straight out of `PROC_PIDTBSDINFO`, and
+/// Windows has no uid to be wrong about, so there is nothing to confirm.
+#[cfg(not(target_os = "linux"))]
+fn confirm_foreign(_pid: u32, _me: u32) -> bool {
+    true
+}
+
+/// The effective uid on the `Uid:` line of a `/proc/<pid>/status`, which reads
+/// `Uid:\t<real>\t<effective>\t<saved>\t<filesystem>`.
+///
+/// The effective one is the second: it is the credential the kernel checks when
+/// something asks to read the process's sockets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn status_euid(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 #[cfg(unix)]
@@ -88,7 +178,9 @@ struct Row {
     ppid: u32,
     pgid: u32,
     /// The effective uid of the process, which is what decides whether this
-    /// daemon may look at its sockets. 0 on platforms that have no such thing.
+    /// daemon may look at its sockets. 0 on platforms that have no such thing,
+    /// and on Linux the cheapest reading of it rather than the last word — see
+    /// `confirm_foreign`.
     uid: u32,
     name: String,
 }
@@ -224,11 +316,14 @@ fn process_table() -> HashMap<u32, Row> {
                 .rfind('(')
                 .map_or_else(|| String::new(), |open| stat[open + 1..close].to_string())
         });
-        // `/proc/<pid>` is owned by the process's effective uid, which is the
-        // one that governs who may read its sockets. A stat that fails on a
-        // pid whose `stat` file just parsed is a race with the process
-        // exiting; calling that "mine" keeps a dying process from being
-        // mistaken for another user's.
+        // `/proc/<pid>` is normally owned by the process's effective uid, which
+        // is the one that governs who may read its sockets. Normally: the
+        // kernel hands the directory to `root` for a process whose dumpable
+        // attribute it cleared, so this is a cheap first pass over every pid on
+        // the machine and `confirm_foreign` settles the few that look foreign
+        // and are in a pane's tree. A stat that fails on a pid whose `stat`
+        // file just parsed is a race with the process exiting; calling that
+        // "mine" keeps a dying process from being mistaken for another user's.
         let uid = std::fs::metadata(format!("/proc/{pid}"))
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
             .unwrap_or_else(|_| current_uid());
@@ -510,9 +605,12 @@ fn parse_lsof(text: &str, procs: &[ProcEntry]) -> Vec<PortEntry> {
 /// seconds while it is open, so this is a fixed handful of microseconds, with
 /// no process spawn and nothing allocated per pid.
 ///
-/// The probe state is always `Ok` here. There is no tool to be missing and no
-/// subprocess to hang: `GetExtendedTcpTable` either answers or the family is
-/// skipped, and a machine with IPv6 off still gets its IPv4 ports.
+/// There is no tool to be missing here and no subprocess to hang, so the state
+/// is `Ok` whenever the kernel answered at all — including for a machine with
+/// IPv6 off, which is answered for by its IPv4 table alone. The one case left
+/// is a `GetExtendedTcpTable` that would not answer for either family, and that
+/// is `Unavailable` for the same reason a missing `lsof` is: nothing looked, so
+/// the empty list is not an answer.
 #[cfg(windows)]
 fn listening_ports(procs: &[ProcEntry]) -> (Vec<PortEntry>, PortProbe) {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -529,12 +627,13 @@ fn listening_ports(procs: &[ProcEntry]) -> (Vec<PortEntry>, PortProbe) {
     let mut ports: Vec<PortEntry> = Vec::new();
 
     let v4 = tcp_table(AF_INET);
-    // SAFETY: `tcp_table` hands back either an empty buffer or one the kernel
-    // filled with a `MIB_TCPTABLE_OWNER_PID`; the `Vec<u32>` gives it the 4-byte
-    // alignment every field of that struct wants, and `rows` is clamped to what
-    // the buffer can actually hold before anything is read out of it.
+    // SAFETY: `tcp_table` hands back a buffer the kernel filled with a
+    // `MIB_TCPTABLE_OWNER_PID`, or nothing at all; the `Vec<u32>` gives it the
+    // 4-byte alignment every field of that struct wants, and `rows` is clamped
+    // to what the buffer can actually hold before anything is read out of it.
     unsafe {
-        if let Some((rows, count)) = table_rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(&v4)
+        if let Some((rows, count)) =
+            table_rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(v4.as_deref().unwrap_or(&[]))
         {
             for i in 0..count {
                 let row = &*rows.add(i);
@@ -559,9 +658,9 @@ fn listening_ports(procs: &[ProcEntry]) -> (Vec<PortEntry>, PortProbe) {
     let v6 = tcp_table(AF_INET6);
     // SAFETY: as above, for the IPv6 shape of the same table.
     unsafe {
-        if let Some((rows, count)) =
-            table_rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(&v6)
-        {
+        if let Some((rows, count)) = table_rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(
+            v6.as_deref().unwrap_or(&[]),
+        ) {
             for i in 0..count {
                 let row = &*rows.add(i);
                 let Some(name) = by_pid.get(&row.dwOwningPid) else {
@@ -580,7 +679,25 @@ fn listening_ports(procs: &[ProcEntry]) -> (Vec<PortEntry>, PortProbe) {
     }
 
     ports.sort_by_key(|e| (e.port, e.pid));
-    (ports, PortProbe::Ok)
+    (ports, windows_probe(v4.is_some(), v6.is_some()))
+}
+
+/// What a Windows probe is worth, given whether each family's table could be
+/// read.
+///
+/// One family refusing is not a broken probe: a machine with IPv6 switched off
+/// is an ordinary machine, and its IPv4 listeners are the whole truth about it.
+/// Both refusing is the failure this file is about — nothing was looked at, and
+/// an empty list then means "we do not know", which is the one thing #731 says
+/// the panel must not spell as "None".
+#[cfg(windows)]
+fn windows_probe(v4: bool, v6: bool) -> PortProbe {
+    match v4 || v6 {
+        true => PortProbe::Ok,
+        false => PortProbe::Unavailable(
+            "GetExtendedTcpTable would not answer for either address family".to_string(),
+        ),
+    }
 }
 
 /// The two Winsock address families, named here rather than by switching on
@@ -592,13 +709,17 @@ const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
 
 /// One `GetExtendedTcpTable` snapshot of the listening sockets in `family`, as
-/// the raw buffer the kernel filled, or an empty buffer if it would not answer.
+/// the raw buffer the kernel filled, or `None` if it would not answer.
 ///
-/// Failure is soft, the way an absent `lsof` is soft on unix: the panel shows no
-/// ports rather than an error. A machine with IPv6 disabled takes that path for
-/// `AF_INET6` alone and still gets its IPv4 ports.
+/// A machine with IPv6 disabled takes the `None` path for `AF_INET6` alone and
+/// still gets its IPv4 ports. What `None` must not do is disappear: it used to
+/// come back as an empty buffer that read exactly like a family with no
+/// listeners, so a table the kernel refused twice — or refused outright, which
+/// a filter driver sitting on `iphlpapi` is enough to cause — left the panel
+/// saying "None" about ports it never looked for. The caller turns "neither
+/// family answered" into `PortProbe::Unavailable` instead.
 #[cfg(windows)]
-fn tcp_table(family: u32) -> Vec<u32> {
+fn tcp_table(family: u32) -> Option<Vec<u32>> {
     use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
@@ -627,14 +748,14 @@ fn tcp_table(family: u32) -> Vec<u32> {
             )
         };
         match rc {
-            NO_ERROR => return buf,
+            NO_ERROR => return Some(buf),
             ERROR_INSUFFICIENT_BUFFER => {
                 buf = vec![0u32; (size as usize).div_ceil(std::mem::size_of::<u32>()) + 64]
             }
             _ => break,
         }
     }
-    Vec::new()
+    None
 }
 
 /// Where the rows of a `MIB_*TABLE_OWNER_PID` start in `buf`, and how many of
@@ -973,6 +1094,78 @@ mod tests {
         );
     }
 
+    /// A failure that stands still is one fact, and `snapshot` is asked again
+    /// every two seconds for as long as the Info panel is open.
+    #[test]
+    fn a_standing_probe_failure_is_logged_once_a_minute_not_once_a_poll() {
+        let mut last = None;
+        let t0 = std::time::Instant::now();
+        let gap = std::time::Duration::from_secs(60);
+        let line = "shell 100: lsof: program not found";
+        assert!(
+            probe_log_due(&mut last, line, t0, gap),
+            "the first one talks"
+        );
+        for poll in 1..30u64 {
+            let now = t0 + std::time::Duration::from_secs(poll * 2);
+            assert!(
+                !probe_log_due(&mut last, line, now, gap),
+                "the same reason again at +{}s",
+                poll * 2
+            );
+        }
+        assert!(
+            probe_log_due(&mut last, "shell 100: lsof: permission denied", t0, gap),
+            "a different reason is news even in the same breath"
+        );
+        assert!(
+            probe_log_due(&mut last, line, t0 + gap, gap),
+            "and a failure that outlives the gap still leaves a trail"
+        );
+    }
+
+    /// A `/proc/<pid>` the kernel handed to root is not evidence of another
+    /// user: `ping`, and anything else carrying file capabilities, is the
+    /// caller's own process behind one.
+    #[test]
+    fn the_status_files_effective_uid_is_the_one_that_counts() {
+        let ping = "Name:\tping\nState:\tS (sleeping)\nTgid:\t4242\n\
+                    Uid:\t501\t501\t501\t501\nGid:\t20\t20\t20\t20\n";
+        assert_eq!(status_euid(ping), Some(501));
+
+        let sudo = "Name:\tmain\nUid:\t501\t0\t0\t0\n";
+        assert_eq!(
+            status_euid(sudo),
+            Some(0),
+            "the effective uid, not the real one that typed the password"
+        );
+
+        assert_eq!(status_euid("Name:\tzsh\n"), None);
+        assert_eq!(
+            status_euid("Uid:\t501\n"),
+            None,
+            "a truncated line is no answer"
+        );
+    }
+
+    /// Windows has no tool to be missing, but it does have a kernel call that
+    /// can refuse, and a refusal used to arrive as an empty table — the same
+    /// silence #731 is about, on the platform the panel was written on.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_table_that_would_not_answer_is_not_an_empty_one() {
+        assert_eq!(windows_probe(true, true), PortProbe::Ok);
+        assert_eq!(
+            windows_probe(true, false),
+            PortProbe::Ok,
+            "IPv6 switched off is an ordinary machine, not a broken probe"
+        );
+        assert!(
+            matches!(windows_probe(false, false), PortProbe::Unavailable(_)),
+            "neither family answered, so the empty list is not an answer"
+        );
+    }
+
     fn describe(run: &std::io::Result<Run>) -> String {
         match run {
             Ok(Run::Finished(out)) => format!("finished with {}", out.status),
@@ -1196,6 +1389,11 @@ mod windows_tests {
             got.procs.iter().any(|p| p.depth > 0),
             "the chain must be walked past its root: {:?}",
             got.procs
+        );
+        assert!(
+            got.probe.is_ok(),
+            "a kernel that answered has nothing to apologise for: {:?}",
+            got.probe
         );
         let found = got
             .ports
