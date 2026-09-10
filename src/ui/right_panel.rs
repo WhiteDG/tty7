@@ -278,8 +278,11 @@ fn format_rtt(rtt: std::time::Duration) -> String {
         // "0 ms" would read as a failed measurement rather than a fast one.
         return "<1 ms".to_string();
     }
-    if ms < 1000. {
-        return format!("{} ms", ms.round() as u64);
+    // Rounded before the comparison, so 999.6 ms is not shown as "1000 ms" —
+    // a millisecond reading that has run past the unit's own range.
+    let rounded = ms.round() as u64;
+    if rounded < 1000 {
+        return format!("{rounded} ms");
     }
     format!("{:.1} s", rtt.as_secs_f64())
 }
@@ -2006,6 +2009,9 @@ mod tests {
         assert_eq!(format_rtt(Duration::from_millis(1)), "1 ms");
         assert_eq!(format_rtt(Duration::from_micros(23_400)), "23 ms");
         assert_eq!(format_rtt(Duration::from_millis(999)), "999 ms");
+        // Rounding up out of the millisecond's own range hands the number to
+        // the unit above rather than printing a four-digit millisecond.
+        assert_eq!(format_rtt(Duration::from_micros(999_600)), "1.0 s");
         // Past a second the millisecond has stopped carrying information, and
         // the second is the unit anyone would say the number in.
         assert_eq!(format_rtt(Duration::from_millis(1_450)), "1.4 s");

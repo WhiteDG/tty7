@@ -253,10 +253,6 @@ impl Host for RemoteHost {
         })
     }
 
-    /// The peer owns these panes' PTYs, so it is the one that can walk their
-    /// process trees. A peer that does not announce the feature is not asked:
-    /// it would answer `Err` and the caller cannot tell that apart from a pane
-    /// serving nothing.
     fn link_rtt(&self) -> Option<std::time::Duration> {
         // A ping of our own rather than whatever the keepalive last left
         // behind: that one only fires on an idle link, and a link being polled
@@ -273,6 +269,10 @@ impl Host for RemoteHost {
         self.client.last_rtt()
     }
 
+    /// The peer owns these panes' PTYs, so it is the one that can walk their
+    /// process trees. A peer that does not announce the feature is not asked:
+    /// it would answer `Err` and the caller cannot tell that apart from a pane
+    /// serving nothing.
     fn pane_procs(&self, pane_id: u64) -> Option<crate::daemon::protocol::PaneProcs> {
         if !self
             .peer()
