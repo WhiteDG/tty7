@@ -772,7 +772,10 @@ fn adopt_pane(
 }
 
 /// The workspace a pane was spawned for, if it is still on this machine.
-fn owner_of(info: &tty7_core::daemon::protocol::PaneInfo, machine: &Machine) -> Option<WorkspaceId> {
+fn owner_of(
+    info: &tty7_core::daemon::protocol::PaneInfo,
+    machine: &Machine,
+) -> Option<WorkspaceId> {
     let owner = info.owner.as_deref()?;
     machine
         .workspaces
@@ -2201,7 +2204,9 @@ mod tests {
             .push_back(ReplyOk::TabTree(Box::new(Tab::leaf(37))));
 
         run_cli(
-            &["tty7", "tab", "new", "web", "--pane", "%37", "--cwd", "C:\\else"],
+            &[
+                "tty7", "tab", "new", "web", "--pane", "%37", "--cwd", "C:\\else",
+            ],
             &Context::default(),
             &mut backend,
         );

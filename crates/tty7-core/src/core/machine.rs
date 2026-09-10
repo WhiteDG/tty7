@@ -1304,12 +1304,9 @@ fn backup_path(path: &Path, generation: usize) -> PathBuf {
 /// Returns `Ok(())` when there was nothing to do: no tree yet, or the newest
 /// generation is younger than `spacing`.
 fn keep_a_generation(path: &Path, spacing: Duration) -> io::Result<()> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        // Nothing has been written yet, so there is no previous generation.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    // Asked before the tree is read: this runs on every persist and answers
+    // "nothing to do" on almost all of them, so reading the whole document
+    // first would be a full read per write for one copy every five minutes.
     let newest = backup_path(path, 0);
     let too_soon = std::fs::metadata(&newest)
         .and_then(|meta| meta.modified())
@@ -1318,6 +1315,12 @@ fn keep_a_generation(path: &Path, spacing: Duration) -> io::Result<()> {
     if too_soon {
         return Ok(());
     }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        // Nothing has been written yet, so there is no previous generation.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
     // Oldest first, so nothing is overwritten before it has been moved down.
     // A generation that is not there yet simply has nothing to move.
     for generation in (1..BACKUP_GENERATIONS).rev() {
@@ -2701,8 +2704,12 @@ mod tests {
         let store = MachineStore::open(&path);
 
         let ws = store.workspace_create(None, None, None).unwrap();
-        store.tab_create(ws.id, None, seed(1, "/work"), None, None).unwrap();
-        store.tab_create(ws.id, None, seed(2, "/work"), None, None).unwrap();
+        store
+            .tab_create(ws.id, None, seed(1, "/work"), None, None)
+            .unwrap();
+        store
+            .tab_create(ws.id, None, seed(2, "/work"), None, None)
+            .unwrap();
 
         let kept = backup_path(&path, 0);
         assert!(

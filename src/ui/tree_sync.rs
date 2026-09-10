@@ -2909,7 +2909,8 @@ mod tests {
             assert_eq!(parked.name, "deploy");
             assert_eq!(
                 parked.workspace, ws,
-                "and it is parked against the workspace it was typed for, so a window                  that walks into a different one cannot spend it (#716)"
+                "and it is parked against the workspace it was typed for, so a window \
+                 that walks into a different one cannot spend it (#716)"
             );
         });
     }
