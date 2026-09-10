@@ -3221,6 +3221,90 @@ mod replay_tests {
         drop(daemon);
     }
 
+    /// Issue #711: what a prompt report costs a replay that ended inside the
+    /// alternate screen.
+    ///
+    /// A re-attach replays the pane's ring and then the pane's *state*, and
+    /// the state ends with the shell's prompt status. `active && at_prompt`
+    /// makes the reader scrub the TUI modes it finds in the grid, alternate
+    /// screen first — see `prompt_report_scrubs_stale_tui_modes`, which is the
+    /// case that is meant to reach it: a program that died without its
+    /// `?1049l` leaves the grid stranded on a screen nothing owns, and the
+    /// shell's next prompt is what proves it stale.
+    ///
+    /// On a replay the alternate screen the scrub finds is the one the ring
+    /// just rebuilt, and `?1049l` does not undo it — it swaps it away. The
+    /// grid is left holding the primary screen underneath: the banner and the
+    /// command line the pane was born with, which is exactly what #711's
+    /// reporter photographed. The client cannot tell the two apart from the
+    /// frame, so the daemon decides — it declines to claim a prompt while a
+    /// foreground command owns the pty (`daemon::pane::replayed_at_prompt`).
+    /// Both halves of that contract are pinned here, from the side that pays
+    /// for it.
+    #[test]
+    fn a_replayed_prompt_report_decides_whether_the_alternate_screen_survives() {
+        crate::core::config::pin_test_config_dir();
+
+        // A re-attach, as the daemon writes one: the shell's banner on the
+        // primary screen, the agent's alternate screen drawn over it, then the
+        // pane's stored state. The trailing `Output` is a barrier — frames are
+        // applied in order, so a grid that holds it has already been through
+        // the prompt report, and neither half can pass on a race.
+        let replayed_pane = |at_prompt: bool| {
+            let (client_side, mut daemon) = socket_pair();
+            let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+            DaemonMsg::Size(ws(80, 24)).encode(&mut daemon).unwrap();
+            DaemonMsg::Snapshot(
+                b"BIRTH-BANNER\r\nMac:Accounts joe$ claude --resume --fork-session\r\n".to_vec(),
+            )
+            .encode(&mut daemon)
+            .unwrap();
+            DaemonMsg::Snapshot(b"\x1b[?1049h\x1b[2J\x1b[HAGENT-SCREEN\r\n".to_vec())
+                .encode(&mut daemon)
+                .unwrap();
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt,
+                last_exit: Some(0),
+            }
+            .encode(&mut daemon)
+            .unwrap();
+            DaemonMsg::Output(b"REPORT-APPLIED\r\n".to_vec())
+                .encode(&mut daemon)
+                .unwrap();
+            let text = settled(&term, &["REPORT-APPLIED"]);
+            drop(daemon);
+            text
+        };
+
+        // A program owns the pane, so the replay reports no prompt and the
+        // screen the ring rebuilt is the screen the pane shows.
+        let text = replayed_pane(false);
+        assert!(
+            text.contains("REPORT-APPLIED"),
+            "the barrier never arrived, so nothing below is tested; grid held:\n{text}"
+        );
+        assert!(
+            text.contains("AGENT-SCREEN"),
+            "a replay that does not claim a prompt must leave the alternate screen it \
+             rebuilt alone; grid held:\n{text}"
+        );
+
+        // The same replay under the stale claim: the scrub swaps the agent's
+        // screen away, and what the pane comes back showing is the banner it
+        // was born with. That is #711.
+        let text = replayed_pane(true);
+        assert!(
+            !text.contains("AGENT-SCREEN"),
+            "a prompt report still has to scrub a stranded alternate screen, or the daemon's \
+             gate is load-bearing for nothing; grid held:\n{text}"
+        );
+        assert!(
+            text.contains("BIRTH-BANNER"),
+            "what the scrub leaves is the primary screen underneath; grid held:\n{text}"
+        );
+    }
+
     // ---- The switch, end to end, with a real daemon pane ----------------
     //
     // Everything above drives the client half against a scripted daemon. This
