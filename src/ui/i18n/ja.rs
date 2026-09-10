@@ -1129,6 +1129,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::PanelSessionSubtitle => "セッション",
         L10nKey::PanelProcessesSubtitle => "プロセス",
         L10nKey::PanelPortsSubtitle => "ポート",
+        L10nKey::PanelLatency => "遅延",
         L10nKey::PanelPortsUnsupported => "リモートの tty7-server が古く、ポートを列挙できません。",
         L10nKey::PanelPortsProbeFailed => {
             "このペインが何をリッスンしているか確認できませんでした。"
