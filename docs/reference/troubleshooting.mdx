@@ -81,12 +81,12 @@ shell:
 - **Settings → Input → Prompt → History search**
 
 If they do nothing at all in a particular pane, the shell there probably has no
-[shell integration](/reference/shell-integration) — nushell, elvish, xonsh and
-friends run fine but do not get the prompt layer.
+[shell integration](/reference/shell-integration) — elvish, xonsh and friends
+run fine but do not get the prompt layer.
 
 ## The directory stopped following my shell
 
-The file panel, new splits, and the sidebar's repo grouping all follow the
+The Files panel, new splits, and the sidebar's repo grouping all follow the
 directory the pane's shell reports (`OSC 7`). If the pane is frozen on one
 directory while you `cd` around, something in the pane is not reporting it.
 
@@ -94,7 +94,8 @@ The usual cause is a shell you started by hand. tty7 injects its
 [shell integration](/reference/shell-integration) into the shell it launches
 for the pane, and nothing else: run `zsh` at a bash prompt and that nested
 shell has none. Locally you rarely notice, because oh-my-zsh reports the
-directory itself — but its `lib/termsupport.zsh` begins with
+directory itself — but the cwd reporter sits at the end of its
+`lib/termsupport.zsh`, behind
 
 ```zsh
 if [[ -n "$INSIDE_EMACS" || -n "$SSH_CLIENT" || -n "$SSH_TTY" ]]; then
@@ -102,9 +103,10 @@ if [[ -n "$INSIDE_EMACS" || -n "$SSH_CLIENT" || -n "$SSH_TTY" ]]; then
 fi
 ```
 
-so over SSH, where sshd sets those, oh-my-zsh does not define the reporter at
-all. A nested zsh on a remote host therefore reports nothing, from either
-side, and the pane keeps showing wherever the outer shell was.
+so over SSH, where sshd sets those, sourcing stops there and the reporter is
+never defined — only the title hooks above that line still run. A nested zsh
+on a remote host therefore reports nothing, from either side, and the pane
+keeps showing wherever the outer shell was.
 
 **Make it the shell tty7 starts.** On the remote host:
 
@@ -140,9 +142,9 @@ PROMPT_COMMAND="__tty7_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 Two other reasons a pane never reports its directory:
 
-- **The shell is one tty7 does not integrate.** Locally: zsh, bash, fish,
-  PowerShell, nushell. Over SSH: zsh, bash, fish. A remote host whose
-  `$SHELL` is anything else gets no bootstrap, silently.
+- **The shell is not one tty7 integrates.** It injects into zsh, bash, fish,
+  PowerShell and nushell locally, and into zsh, bash and fish over SSH — a
+  remote host whose `$SHELL` is anything else gets no bootstrap, silently.
 - **You gave the shell your own arguments** in `shell` or a `custom_shells`
   entry, which turns the injection off by design.
 
