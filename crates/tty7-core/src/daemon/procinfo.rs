@@ -10,7 +10,13 @@ pub fn snapshot(shell_pid: u32, fg_pgid: Option<i32>) -> PaneProcs {
     let table = process_table();
     let procs = walk(&table, shell_pid, fg_pgid);
     let ports = listening_ports(&procs);
-    PaneProcs { procs, ports }
+    // The caller fills `context`: only the pane knows where its session lives,
+    // and this module only ever walks *this* machine's table.
+    PaneProcs {
+        procs,
+        ports,
+        context: None,
+    }
 }
 
 struct Row {

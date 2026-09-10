@@ -551,6 +551,7 @@ mod tests {
                 addr: "*".into(),
                 name: "node".into(),
             }],
+            context: None,
         };
         let rendered = procs_tables(&procs);
         assert!(

@@ -1014,6 +1014,17 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
     /// at all", which is itself a position: an agent appearing is a change.
     type Cursor = Option<(AgentStatus, u64)>;
 
+    /// How many polls in a row must fail to determine freeness before the wait
+    /// calls it structural and stops.
+    ///
+    /// One is not enough: a pane whose `ssh` handshake is still in flight has
+    /// no far-side prompt mark yet and no local tree worth reading, and that
+    /// window is shorter than a poll. Two consecutive misses is one `--interval`
+    /// of grace — long enough for the transient, short enough that a wait with
+    /// no `--timeout` at all still ends rather than hanging on a question this
+    /// machine cannot answer.
+    const UNKNOWN_POLLS: u32 = 2;
+
     let pane = address::pane_or_context(args.target.as_deref(), ctx)?;
     // `checked_add` rather than `+`: an absurd `--timeout` must not panic.
     let deadline = args
@@ -1021,10 +1032,25 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
         .and_then(|t| Instant::now().checked_add(Duration::from_secs(t)));
     let interval = Duration::from_millis(args.interval);
     let watch_free = args.until.contains(&WaitState::Free);
+    // `free` is the only state this wait computes rather than reads. When it is
+    // also the only thing that could still answer, an undeterminable freeness
+    // ends the wait instead of riding out the deadline — `exit` does not count,
+    // because it arrives on its own whether it was asked for or not.
+    let free_is_the_only_hope = watch_free
+        && args
+            .until
+            .iter()
+            .all(|s| matches!(s, WaitState::Free | WaitState::Exit));
     let mut baseline: Option<Cursor> = None;
     // Sticky: has the pane been seen running something since the wait began?
     // This is `--changed`'s edge for `free` — see the flag's own comment.
     let mut seen_busy = false;
+    // Why freeness could not be read, and for how many polls running. Cleared
+    // the moment a verdict does arrive: a wait that timed out on a pane it
+    // could read perfectly well by then must not blame the handshake it
+    // watched go by.
+    let mut unknown: Option<String> = None;
+    let mut unknown_polls: u32 = 0;
     let mut polls: u32 = 0;
     loop {
         let states = match backend.control(ControlRequest::AgentStates)? {
@@ -1055,18 +1081,30 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
         let baseline = *baseline.get_or_insert(cursor);
         let mut changed = cursor != baseline;
 
-        // `free` is a fact about the process tree, not the agent ladder, so it
-        // is asked separately, only when requested, and only once the ladder
-        // has failed to answer. A state the caller listed is their answer:
-        // overwriting a real `waiting` with a process-tree fact would strand a
-        // pane whose depth-0 process *is* the agent (see `pane_is_free`), where
-        // the tree reads free for the whole turn.
+        // `free` is a fact about the pane, not the agent ladder, so it is asked
+        // separately, only when requested, and only once the ladder has failed
+        // to answer. A state the caller listed is their answer: overwriting a
+        // real `waiting` with a process-tree fact would strand a pane whose
+        // depth-0 process *is* the agent (see `pane_freeness`), where the tree
+        // reads free for the whole turn.
         if watch_free && current != WaitState::Exit && !args.until.contains(&current) {
-            if pane_is_free(backend, pane)? {
-                current = WaitState::Free;
-                changed = seen_busy;
-            } else {
-                seen_busy = true;
+            match pane_freeness(backend, pane)? {
+                Freeness::Free => {
+                    current = WaitState::Free;
+                    changed = seen_busy;
+                    (unknown, unknown_polls) = (None, 0);
+                }
+                Freeness::Busy => {
+                    seen_busy = true;
+                    (unknown, unknown_polls) = (None, 0);
+                }
+                // Not `seen_busy`: "we could not look" is not "something was
+                // running", and letting it set that flag was what suppressed
+                // the one hint that would have pointed at the gap (#840).
+                Freeness::Unknown(why) => {
+                    unknown_polls += 1;
+                    unknown = Some(why);
+                }
             }
         }
 
@@ -1131,6 +1169,38 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
             }
             return report(human, json);
         }
+
+        // Nothing here can answer, and `free` was the only thing left that
+        // could. Say so now: polling harder cannot turn "we cannot see the far
+        // side" into a verdict, and a wait with no `--timeout` would otherwise
+        // sit on this question until the caller killed it.
+        if free_is_the_only_hope && unknown_polls >= UNKNOWN_POLLS {
+            let why = unknown.as_deref().unwrap_or("no reason recorded");
+            let human = format!("pane %{pane}: cannot determine whether it is free — {why}");
+            eprintln!("tty7: pane %{pane}: cannot determine whether it is free");
+            let session = entry.as_ref().map(|e| &e.state);
+            return Ok(Outcome::Exit(
+                1,
+                Report {
+                    human,
+                    // The success path's shape, so a consumer written against
+                    // it does not find its fields missing on the one branch it
+                    // wrote error handling for (#589) — plus the reason, which
+                    // is the only thing this branch actually knows.
+                    json: json!({
+                        "pane": pane,
+                        "status": WaitState::Unknown.name(),
+                        "matched": false,
+                        "stale": !changed,
+                        "free_unknown": why,
+                        "activity": session.map(|s| s.activity),
+                        "message": session.and_then(|s| s.message.clone()),
+                        "session_id": session.and_then(|s| s.session_id.clone()),
+                    }),
+                },
+            ));
+        }
+
         if deadline.is_some_and(|d| Instant::now() >= d) {
             // 124 = the `timeout(1)` convention: "gave up", distinct from
             // both success and error, so orchestration scripts can branch.
@@ -1139,12 +1209,26 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
             // "there is no agent here" and "the agent's hooks are missing",
             // and neither is visible from a timeout alone. Say which door to
             // try rather than leaving the caller to poll harder.
-            if current == WaitState::NoAgent {
+            //
+            // Only for a caller who has not already tried that door. Sending
+            // someone back to `--until free` when `--until free` is what just
+            // timed out is the part of this message that cost an agent a
+            // session (#840); when they did ask, the hint below carries the
+            // reason freeness never answered instead.
+            if current == WaitState::NoAgent && !watch_free {
                 human.push_str(
                     "\nnothing is reporting agent status in this pane — for a plain command \
                      wait `--until free`, and for an agent check `tty7 agents` for a missing \
                      status hook",
                 );
+            }
+            // Freeness was asked for and never came back with a verdict. This
+            // is the whole answer to "why did nothing happen for --timeout
+            // seconds", so it goes first among the `free` hints.
+            if let Some(why) = &unknown {
+                human.push_str(&format!(
+                    "\ncould not determine whether this pane is free — {why}"
+                ));
             }
             // `--changed` needs to have *seen* the pane busy, and a command
             // that starts and finishes inside one interval never is. That
@@ -1176,6 +1260,10 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
                             "matched": false,
                             "stale": !changed,
                             "timed_out": true,
+                            // Present only when `free` was asked for and never
+                            // resolved. A script that reads it knows the
+                            // timeout says nothing about the pane.
+                            "free_unknown": unknown,
                             "activity": session.map(|s| s.activity),
                             "message": session.and_then(|s| s.message.clone()),
                             "session_id": session.and_then(|s| s.session_id.clone()),
@@ -1196,21 +1284,102 @@ fn wait(args: WaitArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
 
 /// Whether the pane is back to its bare shell — nothing running in front of it.
 ///
-/// Depth, not count: the pane's own shell sits at depth 0 and everything it
-/// launched hangs below, so "nothing deeper than the shell" holds however many
-/// shells the pane ended up with, and does not have to guess at process names.
-/// It is also the portable question — Windows has no foreground process group
-/// to ask about, so `ProcEntry::foreground` is never true there.
+/// Three answers, not two. `Busy` and `Unknown` used to be the same `false`,
+/// and that is the whole of #840: on a pane where the question is structurally
+/// unanswerable the wait read "still busy" on every poll, rode the full
+/// `--timeout`, and then recommended the flag that had just failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Freeness {
+    Free,
+    Busy,
+    /// Nothing here can answer. The string is the reason, written for the
+    /// caller: it is what the wait prints instead of a timeout.
+    Unknown(String),
+}
+
+/// Read the pane's freeness.
 ///
-/// What it cannot see, both by construction: a pane whose depth-0 process *is*
-/// the command — which is what `tty7 run` spawns — reads free for as long as it
-/// runs, and a backgrounded job keeps a pane busy after the foreground command
-/// is long gone. An empty tree is "we could not see in" rather than "free":
-/// answering free there would be the same false success `no-agent` exists to
-/// remove.
-fn pane_is_free(backend: &mut dyn Backend, pane: u64) -> Result<bool> {
-    let procs = backend.procs(pane)?.procs;
-    Ok(!procs.is_empty() && procs.iter().all(|p| p.depth == 0))
+/// Two sources, and which one leads depends on where the pane's session is.
+///
+/// **The process tree**, for a pane whose pty is on this machine. Depth, not
+/// count: the pane's own shell sits at depth 0 and everything it launched hangs
+/// below, so "nothing deeper than the shell" holds however many shells the pane
+/// ended up with, and does not have to guess at process names. It is also the
+/// portable question — Windows has no foreground process group to ask about, so
+/// `ProcEntry::foreground` is never true there. What it cannot see, both by
+/// construction: a pane whose depth-0 process *is* the command — which is what
+/// `tty7 run` spawns — reads free for as long as it runs, and a backgrounded
+/// job keeps a pane busy after the foreground command is long gone.
+///
+/// **The shell's own OSC 133 marks**, which are the only thing that can speak
+/// for a pane that is the near end of a connection. There the local tree
+/// describes the tunnel: a native-SSH pane has no local tree at all, and a pane
+/// running `ssh` has one whose depth-1 process is the `ssh` itself, busy for as
+/// long as you are logged in. A prompt mark on such a pane can only have come
+/// from the far shell — the near one cannot be at a prompt while the connection
+/// owns its pty — so it is both trustworthy and the only evidence available.
+///
+/// Where they disagree on a local pane, a prompt mark outranks a deeper
+/// process, because the process drawing that prompt is a shell: a `sudo -i`, a
+/// nested `bash`, an `ssh` on a platform where the daemon cannot name it as
+/// remote. It does not work the other way round — the absence of a mark proves
+/// nothing, and the tree keeps the verdict there.
+fn pane_freeness(backend: &mut dyn Backend, pane: u64) -> Result<Freeness> {
+    let answer = backend.procs(pane)?;
+    let bare_tree = !answer.procs.is_empty() && answer.procs.iter().all(|p| p.depth == 0);
+    let Some(ctx) = &answer.context else {
+        // A daemon from before the field existed. It can only be answering for
+        // a pty of its own, so the tree is all there was and all there is.
+        return Ok(match (bare_tree, answer.procs.is_empty()) {
+            (true, _) => Freeness::Free,
+            (false, false) => Freeness::Busy,
+            (false, true) => Freeness::Unknown(
+                "this server is too old to say where the pane's session lives, and its \
+                 process tree came back empty"
+                    .into(),
+            ),
+        });
+    };
+
+    let remote = ctx.remote.as_ref();
+    if remote.is_some() || !ctx.local_pty {
+        let whereabouts = match remote {
+            Some(r) => format!("connected to {}", r.target),
+            // A pane with no pty here and no context to name: the daemon knows
+            // the session is elsewhere without knowing where.
+            None => "not backed by a pty on this machine".to_string(),
+        };
+        return Ok(match ctx.at_prompt {
+            // Only the far shell can be at a prompt while the near end is busy
+            // holding the connection open.
+            Some(true) => Freeness::Free,
+            // The connection is over and the near shell is bare again — the
+            // remote context just has not been re-probed yet.
+            _ if ctx.local_pty && bare_tree => Freeness::Free,
+            // Once the far side has proved it reports, its silence means work.
+            Some(false) if ctx.remote_prompt_seen => Freeness::Busy,
+            _ => Freeness::Unknown(format!(
+                "this pane is {whereabouts}, so its local process tree describes this end of \
+                 the connection, not what is running on the far one — and the far shell has \
+                 sent no prompt mark, so nothing here can tell an idle remote prompt from a \
+                 running remote command. Install tty7's shell integration on the remote host, \
+                 or wait on something observable from here (`--until exit`, or an agent status)"
+            )),
+        });
+    }
+
+    // A local pane. The tree leads; a prompt mark only ever adds to it.
+    if bare_tree || ctx.at_prompt == Some(true) {
+        return Ok(Freeness::Free);
+    }
+    if !answer.procs.is_empty() || ctx.at_prompt == Some(false) {
+        return Ok(Freeness::Busy);
+    }
+    Ok(Freeness::Unknown(
+        "the pane's process tree came back empty and its shell has sent no prompt marks, so \
+         there is nothing here to read freeness off — check `tty7 procs` on this pane"
+            .into(),
+    ))
 }
 
 /// Whether the daemon still has a live pane behind this id. Absent from the
@@ -2881,6 +3050,7 @@ mod tests {
         tty7_core::daemon::protocol::PaneProcs {
             procs: vec![proc_entry(100, "zsh", 0, true)],
             ports: Vec::new(),
+            context: Some(local_context(None)),
         }
     }
 
@@ -2892,6 +3062,64 @@ mod tests {
                 proc_entry(101, "cargo", 1, true),
             ],
             ports: Vec::new(),
+            context: Some(local_context(None)),
+        }
+    }
+
+    /// A pane whose pty is on this machine, optionally with a shell that is
+    /// reporting prompt marks.
+    fn local_context(at_prompt: Option<bool>) -> tty7_core::daemon::protocol::PaneContext {
+        tty7_core::daemon::protocol::PaneContext {
+            remote: None,
+            local_pty: true,
+            at_prompt,
+            remote_prompt_seen: false,
+        }
+    }
+
+    /// A pane whose shell is running `ssh`: the local tree has the connection
+    /// in it, and everything that matters is on the far end.
+    fn ssh_procs(
+        at_prompt: Option<bool>,
+        remote_prompt_seen: bool,
+    ) -> tty7_core::daemon::protocol::PaneProcs {
+        use tty7_core::daemon::protocol::{RemoteContext, RemoteKind};
+        tty7_core::daemon::protocol::PaneProcs {
+            procs: vec![
+                proc_entry(100, "zsh", 0, false),
+                proc_entry(101, "ssh", 1, true),
+            ],
+            ports: Vec::new(),
+            context: Some(tty7_core::daemon::protocol::PaneContext {
+                remote: Some(RemoteContext {
+                    kind: RemoteKind::Ssh,
+                    argv: vec!["ssh".into(), "build-box".into()],
+                    target: "build-box".into(),
+                }),
+                local_pty: true,
+                at_prompt,
+                remote_prompt_seen,
+            }),
+        }
+    }
+
+    /// A pane routed to a remote tty7 daemon: no pty on this machine at all,
+    /// so the process list is empty by construction rather than by failure.
+    fn routed_procs(at_prompt: Option<bool>) -> tty7_core::daemon::protocol::PaneProcs {
+        use tty7_core::daemon::protocol::{RemoteContext, RemoteKind};
+        tty7_core::daemon::protocol::PaneProcs {
+            procs: Vec::new(),
+            ports: Vec::new(),
+            context: Some(tty7_core::daemon::protocol::PaneContext {
+                remote: Some(RemoteContext {
+                    kind: RemoteKind::NativeSsh,
+                    argv: Vec::new(),
+                    target: "me@build-box".into(),
+                }),
+                local_pty: false,
+                at_prompt,
+                remote_prompt_seen: at_prompt == Some(true),
+            }),
         }
     }
 
@@ -3310,6 +3538,10 @@ mod tests {
     /// An unreadable process tree is not an idle one. Answering `free` on an
     /// empty reply would be the same false success `no-agent` was added to
     /// remove, one layer down.
+    ///
+    /// A bare `PaneProcs` is also what a server from before `context` existed
+    /// sends, so this pins the fallback: no context means the tree was all
+    /// there ever was, and an empty one is still "we could not look".
     #[test]
     fn wait_free_does_not_read_an_empty_process_tree_as_finished() {
         let mut backend = mock();
@@ -3326,6 +3558,230 @@ mod tests {
             matches!(out, Outcome::Exit(124, _)),
             "nothing was seen, so nothing can be claimed"
         );
+
+        // Without a deadline to hide behind it says so rather than spinning.
+        let mut backend = mock();
+        for _ in 0..4 {
+            backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        }
+        backend.procs_reply = tty7_core::daemon::protocol::PaneProcs::default();
+        let out = execute(
+            cli(&["tty7", "wait", "%3", "--until", "free", "--interval", "50"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect("an undeterminable pane is an exit code, not an error");
+        let Outcome::Exit(1, r) = out else {
+            panic!("expected exit 1 with a reason, got {out:?}");
+        };
+        assert_eq!(r.json["status"], "unknown");
+        assert!(
+            r.json["free_unknown"]
+                .as_str()
+                .is_some_and(|w| w.contains("too old")),
+            "an old server's silence is named as such: {:?}",
+            r.json["free_unknown"]
+        );
+    }
+
+    /// The heart of #840. A pane sitting at an idle prompt over `ssh` has a
+    /// local process tree that is busy for as long as you are logged in — the
+    /// `ssh` itself — so the tree can never report the pane free. The far
+    /// shell's own prompt mark can, and it is trustworthy precisely because
+    /// the near shell cannot be at a prompt while the connection holds its pty.
+    #[test]
+    fn wait_free_answers_from_the_far_shells_prompt_on_an_ssh_pane() {
+        let mut backend = mock();
+        for _ in 0..3 {
+            backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        }
+        // The tree is identical on all three polls — `ssh` at depth 1 — and
+        // only the marks move.
+        backend
+            .procs_replies
+            .push_back(ssh_procs(Some(false), true));
+        backend
+            .procs_replies
+            .push_back(ssh_procs(Some(false), true));
+        backend.procs_replies.push_back(ssh_procs(Some(true), true));
+
+        let json = json_of(run_cli(
+            &["tty7", "wait", "%3", "--until", "free", "--interval", "50"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(json["status"], "free");
+        assert_eq!(json["matched"], true);
+        assert_eq!(json["stale"], false, "we watched the remote command finish");
+    }
+
+    /// A pane routed to a remote daemon has no local tree at all. Its far
+    /// shell's prompt mark is the entire answer, and an empty `procs` beside
+    /// it must not read as either "free" or "busy".
+    #[test]
+    fn wait_free_reads_a_routed_panes_prompt_mark() {
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        backend.procs_reply = routed_procs(Some(true));
+
+        let json = json_of(run_cli(
+            &["tty7", "wait", "%3", "--until", "free"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(json["status"], "free");
+        assert_eq!(json["matched"], true);
+    }
+
+    /// The other half of #840: when the far shell sends no marks there is
+    /// nothing on this machine that can tell an idle remote prompt from a
+    /// running remote command. Saying so — and saying it without a `--timeout`
+    /// to hide behind — beats polling until the caller gives up.
+    #[test]
+    fn wait_free_refuses_to_guess_on_a_remote_pane_with_no_integration() {
+        let mut backend = mock();
+        for _ in 0..4 {
+            backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        }
+        backend.procs_reply = ssh_procs(Some(false), false);
+
+        // Deliberately no `--timeout`: the old code would have polled here
+        // until something killed it.
+        let out = execute(
+            cli(&["tty7", "wait", "%3", "--until", "free", "--interval", "50"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect("an undeterminable pane is an exit code, not an error");
+        let Outcome::Exit(1, r) = out else {
+            panic!("expected exit 1 with a reason, got {out:?}");
+        };
+        assert_eq!(r.json["status"], "unknown");
+        assert_eq!(r.json["matched"], false);
+        let why = r.json["free_unknown"].as_str().expect("a recorded reason");
+        assert!(
+            why.contains("build-box") && why.contains("shell integration"),
+            "the reason names the host and the thing that is missing: {why}"
+        );
+        assert_eq!(
+            backend.procs_calls.len(),
+            2,
+            "one poll of grace for a handshake in flight, then it stops"
+        );
+    }
+
+    /// A structurally undeterminable `free` must not cancel a wait that has
+    /// another state still able to answer — the agent ladder is read from a
+    /// different source and knows nothing about the far shell.
+    #[test]
+    fn wait_unknown_free_does_not_cancel_a_wait_on_an_agent_state() {
+        use tty7_core::core::cli_agent::AgentStatus;
+        let mut backend = mock();
+        for _ in 0..3 {
+            backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        }
+        backend
+            .replies
+            .push_back(ReplyOk::AgentStates(vec![agent_state(
+                3,
+                AgentStatus::Done,
+            )]));
+        backend.procs_reply = routed_procs(None);
+
+        let json = json_of(run_cli(
+            &[
+                "tty7",
+                "wait",
+                "%3",
+                "--until",
+                "done,free",
+                "--interval",
+                "50",
+            ],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(
+            json["status"], "done",
+            "the ladder answered while `free` could not"
+        );
+    }
+
+    /// The insult on top of the injury: the timeout hint used to send a caller
+    /// to `--until free` when `--until free` was what had just timed out.
+    #[test]
+    fn wait_timeout_does_not_recommend_the_flag_that_just_failed() {
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        backend.procs_reply = ssh_procs(Some(false), false);
+
+        let out = execute(
+            cli(&["tty7", "wait", "%3", "--until", "free", "--timeout", "0"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect("a timeout is an exit code, not an error");
+        let Outcome::Exit(124, r) = out else {
+            panic!("expected exit 124, got {out:?}");
+        };
+        assert!(
+            !r.human.contains("--until free"),
+            "it must not recommend the flag it was given: {}",
+            r.human
+        );
+        assert!(
+            r.human
+                .contains("could not determine whether this pane is free"),
+            "it must say what it could not determine: {}",
+            r.human
+        );
+        assert_eq!(
+            r.json["free_unknown"]
+                .as_str()
+                .map(|s| s.contains("build-box")),
+            Some(true),
+            "the JSON carries the reason too"
+        );
+    }
+
+    /// `no-agent` still points at `--until free` for the caller who has not
+    /// tried it — that hint is the right one, it was only wrong when repeated
+    /// back at someone who already used it.
+    #[test]
+    fn wait_timeout_still_points_an_agentless_wait_at_free() {
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+
+        let out = execute(
+            cli(&["tty7", "wait", "%3", "--until", "done", "--timeout", "0"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .expect("a timeout is an exit code, not an error");
+        let Outcome::Exit(124, r) = out else {
+            panic!("expected exit 124, got {out:?}");
+        };
+        assert!(r.human.contains("--until free"), "{}", r.human);
+    }
+
+    /// A prompt mark outranks a deeper process on a local pane too: whatever
+    /// drew that prompt is a shell, not work. This is the shape a plain `ssh`
+    /// takes on a platform where the daemon cannot name the pane as remote —
+    /// Windows has no foreground process group to read the invocation from.
+    #[test]
+    fn wait_free_lets_a_prompt_mark_outrank_a_deeper_process() {
+        let mut backend = mock();
+        backend.replies.push_back(ReplyOk::AgentStates(Vec::new()));
+        let mut procs = busy_procs();
+        procs.context = Some(local_context(Some(true)));
+        backend.procs_reply = procs;
+
+        let json = json_of(run_cli(
+            &["tty7", "wait", "%3", "--until", "free"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(json["status"], "free");
     }
 
     /// Watching `free` must not cost anything for callers who did not ask:

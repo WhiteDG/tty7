@@ -1711,6 +1711,7 @@ mod aggregate_tests {
                     name: "node".into(),
                     addr: "*".into(),
                 }],
+                context: None,
             }
         }
 

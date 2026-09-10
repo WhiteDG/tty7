@@ -693,6 +693,16 @@ struct PaneState {
     /// record. See [`crate::core::machine::PaneRecord::osc_title`].
     osc_title: Option<String>,
     shell: ShellState,
+    /// Whether a prompt mark has arrived since `remote` was last set.
+    ///
+    /// The near shell cannot be at a prompt while a connection owns its pty,
+    /// so a mark that says "at a prompt" on a remote pane can only be the far
+    /// shell's — and that is the proof that the far side runs tty7's shell
+    /// integration. Until it lands, the newest mark on the pane is the near
+    /// shell's own "I started `ssh`", which says nothing about the far side
+    /// and will never be superseded. Cleared whenever `remote` changes, so a
+    /// second hop is proved on its own terms.
+    remote_prompt_seen: bool,
     /// What this pane is running, for the machine tree to record. Distinct from
     /// `shell` above, which is the shell-integration state.
     shell_spec: Option<ShellSpec>,
@@ -1461,6 +1471,7 @@ impl DaemonPane {
                 cwd: spawn.initial_cwd,
                 osc_title: restored_title,
                 shell: ShellState::default(),
+                remote_prompt_seen: false,
                 shell_spec: spawn.shell.clone(),
                 remote: spawn.remote.clone(),
                 agent: None,
@@ -1682,7 +1693,14 @@ impl DaemonPane {
                     at_prompt: carried.at_prompt,
                     last_exit_code: carried.last_exit,
                     command: None,
+                    // Not carried: the handoff record is a wire format shared
+                    // with older images, and a pane mid-`ssh` that comes back
+                    // claiming a prompt it cannot vouch for would be worse
+                    // than one that says it does not know. It re-latches on
+                    // the far side's next prompt.
+                    mark_at_prompt: false,
                 },
+                remote_prompt_seen: false,
                 remote: carried.remote,
                 agent: carried.agent,
                 agent_session: carried.agent_session,
@@ -1735,6 +1753,7 @@ impl DaemonPane {
             cwd: None,
             osc_title: None,
             shell: ShellState::default(),
+            remote_prompt_seen: false,
             remote: Some(remote),
             agent: None,
             agent_session: None,
@@ -1982,11 +2001,10 @@ impl DaemonPane {
                             // cwd/prompt change to emit while we hold the lock.
                             let mut signals = sniffer.feed(bytes);
 
+                            // `any` first: `foreground_running` is a syscall,
+                            // and most reads carry no prompt mark at all.
                             if signals.shell.iter().any(|s| s.at_prompt) && foreground_running() {
-                                for s in signals.shell.iter_mut() {
-                                    s.at_prompt = false;
-                                }
-                                signals.shell.dedup();
+                                suppress_relayed_prompt_marks(&mut signals.shell);
                             }
 
                             // A prompt mark that survived the suppression above
@@ -2033,6 +2051,10 @@ impl DaemonPane {
                                 || remote.is_some()
                                 || agent.is_some()
                                 || probed_cwd.is_some();
+                            // Read off `signals` before `apply_signals` consumes
+                            // it; spent after the hop below — see the function.
+                            let saw_prompt_mark =
+                                signals.shell.iter().any(|s| s.mark_at_prompt);
                             let mut st = state.lock().unwrap();
                             let facts_before = may_change_facts.then(|| observed_facts(&st));
                             st.ring.append(bytes);
@@ -2041,6 +2063,7 @@ impl DaemonPane {
                             if let Some(remote) = remote {
                                 apply_remote_context(&mut st, remote);
                             }
+                            latch_remote_prompt(&mut st, saw_prompt_mark);
                             // Keep kitty file/shm transfer gated on the pane's
                             // *current* locality: an `ssh` that just took the PTY
                             // must stop us honoring host-local object names. Cheap
@@ -2147,13 +2170,35 @@ impl DaemonPane {
     }
 
     pub fn procs(&self) -> crate::daemon::protocol::PaneProcs {
-        let Some(pty) = self.pty() else {
-            return Default::default();
+        let mut out = match self.pty().and_then(|pty| {
+            pty.shell_pid
+                .map(|pid| crate::daemon::procinfo::snapshot(pid, pty_foreground_pgid(&pty.master)))
+        }) {
+            Some(procs) => procs,
+            None => Default::default(),
         };
-        let Some(shell_pid) = pty.shell_pid else {
-            return Default::default();
-        };
-        crate::daemon::procinfo::snapshot(shell_pid, pty_foreground_pgid(&pty.master))
+        out.context = Some(self.context());
+        out
+    }
+
+    /// What the pane knows about itself beyond its process list.
+    ///
+    /// Always filled, including on the branches above that have no tree to
+    /// walk — a native-SSH pane's empty `procs` is exactly the answer this has
+    /// to qualify, and returning `Default::default()` there would have said
+    /// "nothing is running" in the same shape as "we could not look".
+    fn context(&self) -> crate::daemon::protocol::PaneContext {
+        let st = self.state.lock().unwrap();
+        crate::daemon::protocol::PaneContext {
+            // The cached value only. `remote_context()` falls back to probing
+            // the pty, and this is answered on a poll: paying a `/proc` walk
+            // per tick for a fact the reader already refreshes on every prompt
+            // would put the cost on the wrong side.
+            remote: st.remote.clone(),
+            local_pty: matches!(self.backend, PaneBackend::Pty(_)),
+            at_prompt: st.shell.active.then_some(st.shell.mark_at_prompt),
+            remote_prompt_seen: st.remote_prompt_seen,
+        }
     }
 
     fn pty(&self) -> Option<&PtyBackend> {
@@ -2823,13 +2868,55 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         }
 }
 
+/// Take a batch of prompt marks out of the local line editor's reach.
+///
+/// Called when a foreground program owns the pty, which means the marks are
+/// being relayed — an `ssh` passing the far shell's prompt through, a nested
+/// shell drawing its own. The local editor must not engage on those, so
+/// `at_prompt` is cleared across the whole batch.
+///
+/// [`ShellState::mark_at_prompt`] is deliberately left standing: it is the
+/// same marks read for a different question, and on a remote pane it is the
+/// only thing this machine knows about the far shell (#840). Because of it,
+/// dedup has to compare what is actually emitted rather than the whole struct
+/// — two marks that used to collapse into one `Prompt` message must still
+/// collapse when only their unsuppressed twin tells them apart.
+fn suppress_relayed_prompt_marks(shell: &mut Vec<ShellState>) {
+    for s in shell.iter_mut() {
+        s.at_prompt = false;
+    }
+    shell.dedup_by(|a, b| {
+        a.active == b.active
+            && a.at_prompt == b.at_prompt
+            && a.last_exit_code == b.last_exit_code
+            && a.command == b.command
+    });
+}
+
 fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
     if st.remote == remote {
         return;
     }
     st.cwd = None;
+    // A new far side has to prove its own shell integration. The mark that is
+    // standing right now belongs to whatever the pane was before this hop —
+    // the near shell's "I started `ssh`", or the previous host's prompt.
+    st.remote_prompt_seen = false;
     notify(st, DaemonMsg::RemoteContext(remote.clone()));
     st.remote = remote;
+}
+
+/// Record that this read carried a prompt mark while the pane was remote.
+///
+/// Called *after* [`apply_remote_context`], not with the signals: the read that
+/// first sees a pane as remote is very often the one carrying the far shell's
+/// opening prompt, and latching before the hop was applied would throw exactly
+/// that mark away — the reset above would clear it a line later. Ordering it
+/// here means the far side's first prompt counts, which is what makes a later
+/// "not at a prompt" mean "the remote is busy" rather than "we never heard
+/// from it" (#840).
+fn latch_remote_prompt(st: &mut PaneState, saw_prompt_mark: bool) {
+    st.remote_prompt_seen |= saw_prompt_mark && st.remote.is_some();
 }
 
 fn apply_agent(
@@ -3014,6 +3101,17 @@ fn foreground_agent(
 struct ShellState {
     active: bool,
     at_prompt: bool,
+    /// `at_prompt` as the marks themselves read it, kept out of the
+    /// suppression the reader applies when a foreground program is running.
+    ///
+    /// Two different questions share one pair of marks. "Should the local line
+    /// editor engage?" must say no while `ssh` owns the pty, whoever drew the
+    /// prompt — that is `at_prompt`. "Is anything running in this pane?" wants
+    /// the opposite: the prompt an `ssh` is relaying belongs to the shell that
+    /// is actually driving the pane, and it is the only thing this side can
+    /// read about the far one. Keeping both means neither answer has to be
+    /// derived from the other's.
+    mark_at_prompt: bool,
     last_exit_code: Option<i32>,
     command: Option<String>,
 }
@@ -3093,6 +3191,10 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
         }
         _ => return false,
     }
+    // The unsuppressed twin, set here so every arm gets it and no future arm
+    // can forget to. Suppression happens later, on the reader thread, and only
+    // ever touches `at_prompt`.
+    shell.mark_at_prompt = shell.at_prompt;
     true
 }
 
@@ -4193,23 +4295,102 @@ mod tests {
 
         let ssh_running = is_foreground_command(Some(2000), Some(1000));
         if signals.shell.iter().any(|st| st.at_prompt) && ssh_running {
-            for st in signals.shell.iter_mut() {
-                st.at_prompt = false;
-            }
+            suppress_relayed_prompt_marks(&mut signals.shell);
         }
         assert!(
             !signals.shell.last().unwrap().at_prompt,
             "a foreground program's prompt marks must not engage the local editor"
         );
+        assert!(
+            signals.shell.last().unwrap().mark_at_prompt,
+            "the mark's own reading survives: over `ssh` it is the far shell speaking, and \
+             the only thing this side knows about whether it is busy (#840)"
+        );
 
         let mut local = s.feed(b"\x1b]133;A\x1b]133;B\x07");
         let shell_idle = is_foreground_command(Some(1000), Some(1000));
         if local.shell.iter().any(|st| st.at_prompt) && shell_idle {
-            for st in local.shell.iter_mut() {
-                st.at_prompt = false;
-            }
+            suppress_relayed_prompt_marks(&mut local.shell);
         }
         assert!(local.shell.last().unwrap().at_prompt);
+    }
+
+    /// A prompt mark that arrives while the pane is pointed at a remote host
+    /// can only be the far shell's — the near one cannot be at a prompt while
+    /// the connection owns its pty. That is what proves the far side runs the
+    /// shell integration, and it is the difference between "the remote is
+    /// busy" and "we cannot tell" (#840).
+    #[test]
+    fn a_remote_panes_prompt_mark_latches_and_a_new_hop_clears_it() {
+        let mark = |mark_at_prompt: bool, command: Option<&str>| ShellState {
+            active: true,
+            at_prompt: false,
+            mark_at_prompt,
+            last_exit_code: None,
+            command: command.map(str::to_string),
+        };
+        let hop = |target: &str| RemoteContext {
+            kind: RemoteKind::Ssh,
+            argv: vec!["ssh".into(), target.into()],
+            target: target.into(),
+        };
+        /// One pass of the reader's ordering: signals, then the hop the same
+        /// read detected, then the latch.
+        fn read(st: &mut PaneState, shell: Vec<ShellState>, remote: Option<Option<RemoteContext>>) {
+            let saw_prompt_mark = shell.iter().any(|s| s.mark_at_prompt);
+            apply_signals(
+                st,
+                SniffSignals {
+                    shell,
+                    ..SniffSignals::default()
+                },
+            );
+            if let Some(remote) = remote {
+                apply_remote_context(st, remote);
+            }
+            latch_remote_prompt(st, saw_prompt_mark);
+        }
+
+        // Local: the same mark proves nothing about any far side.
+        let mut st = test_state(true);
+        read(&mut st, vec![mark(true, None)], None);
+        assert!(!st.remote_prompt_seen);
+
+        // The near shell's own "I started `ssh`" — no prompt in it — must not
+        // latch, even though the hop lands in the same read.
+        read(
+            &mut st,
+            vec![mark(false, Some("ssh build-box"))],
+            Some(Some(hop("build-box"))),
+        );
+        assert!(
+            !st.remote_prompt_seen,
+            "starting the connection is not evidence about what is behind it"
+        );
+
+        // The far shell's opening prompt does — including when it arrives in
+        // the very read that first sees the pane as remote, which on a unix
+        // host is the common case: the relayed prompt is suppressed, so it
+        // cannot trigger the immediate re-probe that would have split the two.
+        let mut fresh = test_state(true);
+        read(
+            &mut fresh,
+            vec![mark(true, None)],
+            Some(Some(hop("build-box"))),
+        );
+        assert!(fresh.remote_prompt_seen);
+        read(&mut st, vec![mark(true, None)], None);
+        assert!(st.remote_prompt_seen);
+
+        // A second hop has to prove itself over again.
+        read(&mut st, Vec::new(), Some(Some(hop("other-box"))));
+        assert!(!st.remote_prompt_seen);
+
+        // And coming back to the local shell clears it too.
+        read(&mut st, vec![mark(true, None)], None);
+        assert!(st.remote_prompt_seen);
+        read(&mut st, Vec::new(), Some(None));
+        assert!(!st.remote_prompt_seen);
     }
 
     #[test]
@@ -4376,6 +4557,7 @@ mod tests {
             cwd: None,
             osc_title: None,
             shell: ShellState::default(),
+            remote_prompt_seen: false,
             remote: None,
             agent: None,
             agent_session: None,
@@ -6335,6 +6517,7 @@ mod tests {
                 shell: vec![ShellState {
                     active: true,
                     at_prompt: true,
+                    mark_at_prompt: true,
                     last_exit_code: Some(0),
                     command: None,
                 }],

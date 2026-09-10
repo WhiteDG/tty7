@@ -247,6 +247,16 @@ pub enum WaitState {
     /// Costs one extra request per poll, so it is only checked when asked for.
     Free,
     Exit,
+    /// Freeness could not be determined for this pane at all — the usual cause
+    /// is a remote or SSH pane whose far shell sends no prompt marks, where
+    /// the local process tree only describes this end of the connection.
+    ///
+    /// Reported, never awaited: `#[value(skip)]` keeps it out of `--until`,
+    /// because "wait until I cannot tell" is not a thing to wait for. It
+    /// exists so `--json` has a `status` to name the one outcome that is
+    /// neither an answer nor a timeout.
+    #[value(skip)]
+    Unknown,
 }
 
 impl WaitState {
@@ -262,6 +272,7 @@ impl WaitState {
             WaitState::NoAgent => "no-agent",
             WaitState::Free => "free",
             WaitState::Exit => "exit",
+            WaitState::Unknown => "unknown",
         }
     }
 }
