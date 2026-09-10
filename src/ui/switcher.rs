@@ -1687,6 +1687,14 @@ impl Tty7App {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        // The scrim covers the whole window, the tile that
+                        // opens the switcher included. Without this the press
+                        // dismissed here and then carried on down to that
+                        // tile, whose click toggled the switcher straight back
+                        // open — so clicking it a second time looked like it
+                        // did nothing. A dismissing click is spent on the
+                        // dismissal and reaches nothing beneath it.
+                        cx.stop_propagation();
                         this.close_switcher(window, cx)
                     }),
                 )
