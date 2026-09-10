@@ -1348,12 +1348,19 @@ pub fn retitle(title: &str) -> Vec<u8> {
 /// in the common case: the primary buffer still holds the pre-`vim` scrollback
 /// from earlier in the same snapshot.
 ///
+/// The same argument reaches further than the four resets it started with, and
+/// [`INPUT_MODE_RESETS`] is the rest of it: a snapshot that ends inside a
+/// full-screen program replays that program's `?1002h` and nothing to undo it,
+/// and the emulator then reports every pointer move into a shell that never
+/// asked (#850).
+///
 /// On Windows it ends by scrolling the restored screen out of the viewport
 /// ([`SCROLL_RESTORED_AWAY`]), which is a correctness requirement rather than a
 /// matter of taste — see that constant.
 pub fn restore_preamble(banner: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
+    out.extend_from_slice(INPUT_MODE_RESETS);
     if let Some(banner) = banner.map(str::trim).filter(|b| !b.is_empty()) {
         out.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 ");
         // A newline inside the banner would be a client writing multiple lines
@@ -1366,6 +1373,45 @@ pub fn restore_preamble(banner: Option<&str>) -> Vec<u8> {
     }
     out
 }
+
+/// Turn off every mode that makes a terminal *send* bytes on its own, or encode
+/// keys in a way the incoming shell cannot read.
+///
+/// A restored pane is a snapshot of a dead process replayed at a brand-new
+/// shell. The process that switched these on was killed by a hangup with no
+/// grace period, so it never emitted its own `l` counterparts, and the snapshot
+/// was photographed before it could have anyway. What is left is a byte stream
+/// whose last word on mouse reporting is "on", replayed verbatim into an
+/// emulator that obeys it: the pointer crossing the pane types SGR reports into
+/// the shell's line, and the line grows for as long as the pointer is there
+/// (#850).
+///
+/// Unconditional on purpose. The state to land in is not "whatever the dead
+/// program had" but a constant — the new shell asked for none of these, and it
+/// is not running yet, so there is nothing here to preserve. Switching off a
+/// mode that is already off is a no-op in every emulator, which makes the blunt
+/// version the one that cannot fail: a fold over the snapshot's bytes that
+/// misreads one sequence leaves the mode on and the bug exactly as it is today.
+///
+/// - `9`/`1000`/`1002`/`1003` are the mouse reporting level, `1005`/`1006`/
+///   `1015`/`1016` its encodings. Our own emulator knows `1000`, `1002`, `1003`,
+///   `1005` and `1006` and ignores the rest; `9`, `1015` and `1016` are here for
+///   the terminals downstream of a CLI consumer replaying the same ring, which
+///   do know them.
+/// - `1004` is focus reporting — the other mode that makes the terminal write
+///   into the pty unprompted, on every window activation.
+/// - `2004` is bracketed paste: a paste into a shell that does not know the
+///   protocol arrives with `ESC[200~` typed around it.
+/// - `1` is DECCKM, which sends the arrow keys as `ESC O A` instead of `ESC[A`.
+/// - `CSI = 0 ; 1 u` sets the kitty keyboard flags to none, the same reset
+///   `stale_mode_resets` in the client uses.
+///
+/// Deliberately absent: `1007` (alternate scroll), which this emulator has *on*
+/// by default, so clearing it would walk away from the default rather than back
+/// to it; and `2026` (synchronised update), which the client's processor closes
+/// out itself the moment a replayed frame ends inside one.
+pub const INPUT_MODE_RESETS: &[u8] = b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\
+\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b[=0;1u";
 
 /// Push the restored screen into the client's scrollback and put the cursor
 /// back at the top-left, so the incoming shell starts on a blank viewport.
@@ -3798,6 +3844,95 @@ mod tests {
         assert!(text.contains("\x1b[?7h"), "put autowrap back");
         assert!(text.contains("\x1b[0m"), "drop any colour left mid-run");
         assert!(text.contains("this shell is new"));
+
+        // #850: the same argument, for the modes that make the terminal talk
+        // back. The snapshot ends inside a program that enabled mouse
+        // reporting and was killed before it could disable it, so replaying it
+        // leaves the emulator reporting every pointer move into a shell that
+        // never asked — the line fills with SGR reports as long as the pointer
+        // is over the pane. Focus reporting writes unprompted for the same
+        // reason; bracketed paste and DECCKM mangle what the user types.
+        for (seq, what) in [
+            ("\x1b[?9l", "X10 mouse reporting"),
+            ("\x1b[?1000l", "click reporting"),
+            ("\x1b[?1002l", "cell-motion reporting"),
+            ("\x1b[?1003l", "all-motion reporting"),
+            ("\x1b[?1005l", "the UTF-8 mouse encoding"),
+            ("\x1b[?1006l", "the SGR mouse encoding"),
+            ("\x1b[?1015l", "the urxvt mouse encoding"),
+            ("\x1b[?1016l", "the SGR-pixel mouse encoding"),
+            ("\x1b[?1004l", "focus reporting"),
+            ("\x1b[?2004l", "bracketed paste"),
+            ("\x1b[?1l", "application cursor keys"),
+            ("\x1b[=0;1u", "the kitty keyboard flags"),
+        ] {
+            assert!(
+                text.contains(seq),
+                "the preamble has to turn {what} off: the process that turned it \
+                 on was killed by a hangup with no grace period and never sent \
+                 its own reset, so the replay's last word on it is `on`"
+            );
+        }
+
+        // Not reset: alternate scroll is on in a default terminal, so clearing
+        // it would leave the pane further from the default than it started.
+        assert!(
+            !text.contains("\x1b[?1007l"),
+            "?1007 defaults to on; resetting it walks away from the default"
+        );
+    }
+
+    /// Whether the stream's last word on a private mode is `h`, `l`, or
+    /// nothing — which is all a client's emulator ends up remembering of it.
+    fn last_mode_switch(stream: &[u8], mode: &str) -> Option<u8> {
+        let last = |needle: Vec<u8>| {
+            stream
+                .windows(needle.len())
+                .rposition(|w| w == needle.as_slice())
+        };
+        let on = last(format!("\x1b[?{mode}h").into_bytes());
+        let off = last(format!("\x1b[?{mode}l").into_bytes());
+        match (on, off) {
+            (Some(h), Some(l)) => Some(if h > l { b'h' } else { b'l' }),
+            (Some(_), None) => Some(b'h'),
+            (None, Some(_)) => Some(b'l'),
+            (None, None) => None,
+        }
+    }
+
+    /// Issue #850, along the whole chain rather than at the preamble alone: a
+    /// snapshot is a raw byte stream, it seeds the restored pane's ring
+    /// verbatim, and the client feeds it straight to its parser. So a snapshot
+    /// whose last word on mouse reporting is `h` puts the *client* into mouse
+    /// reporting, against a shell that never asked, and every pointer move
+    /// over the pane is typed into its line as an SGR report.
+    #[test]
+    fn a_ring_restored_from_a_full_screen_snapshot_ends_with_reporting_off() {
+        let size = ws(80, 24);
+        // What the photograph of a pane running `claude`, `vim` or `btop`
+        // actually holds. There is no epilogue: `DaemonPane::kill` is a hangup
+        // with no grace period, so the program never sent its own `?1002l`,
+        // and the snapshot was taken before it could have anyway.
+        let snapshot = crate::daemon::scrollback::Segment {
+            size,
+            bytes: b"\x1b[?1049h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\
+\x1b[?2004hframe one\x1b[Hframe two"
+                .to_vec(),
+        };
+        let mut ring = ReplayRing::seeded(vec![snapshot], size);
+        ring.append(&restore_preamble(Some("the shell below is new")));
+        let replayed = ring.flatten();
+
+        for mode in [
+            "1000", "1002", "1003", "1005", "1006", "1004", "2004", "1049",
+        ] {
+            assert_eq!(
+                last_mode_switch(&replayed, mode),
+                Some(b'l'),
+                "a client replaying this ring ends with ?{mode} still on, which is \
+                 what types SGR reports into the restored shell (#850)"
+            );
+        }
     }
 
     /// The ConPTY constraint, from the daemon's side. A pane whose shell runs
