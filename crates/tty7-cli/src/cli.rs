@@ -358,6 +358,21 @@ pub struct CaptureArgs {
                 escapes, wrapped lines rejoined, overwrites and cursor moves applied"
     )]
     pub plain: bool,
+
+    // "How did the last command end?" is the common question, and answering it
+    // meant `| tail -n 5` — a pipe that only exists to throw most of the answer
+    // away, and one more thing a script has to have on PATH (Windows does not).
+    // The trim is the last thing that happens, after `--plain` has decided what
+    // a line even is: a wrapped line is one line to the grid and three to a
+    // byte counter, so trimming earlier would answer a different question than
+    // the one the flag composes with.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Keep only the last N lines of the answer, the way `tail -n N` would"
+    )]
+    pub tail: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -872,6 +887,32 @@ mod tests {
             panic!("capture did not parse");
         };
         assert!(args.plain && args.scrollback);
+    }
+
+    #[test]
+    fn capture_tail_takes_a_count_and_refuses_zero() {
+        let Some(Command::Capture(args)) = parse(&["tty7", "capture", "%3", "--tail", "5"]).command
+        else {
+            panic!("capture did not parse");
+        };
+        assert_eq!(args.tail, Some(5));
+
+        let Some(Command::Capture(args)) = parse(&["tty7", "capture", "%3"]).command else {
+            panic!("capture did not parse");
+        };
+        assert_eq!(args.tail, None, "the whole answer stays the default");
+
+        // A tail of nothing is a mistake, not a request for an empty string —
+        // and it would read as a blank pane, which is the very ambiguity #841
+        // is about.
+        for bad in [
+            vec!["tty7", "capture", "%3", "--tail", "0"],
+            vec!["tty7", "capture", "%3", "--tail", "-1"],
+            vec!["tty7", "capture", "%3", "--tail", "lots"],
+        ] {
+            let err = Cli::try_parse_from(&bad).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{bad:?} should be a usage error");
+        }
     }
 
     #[test]

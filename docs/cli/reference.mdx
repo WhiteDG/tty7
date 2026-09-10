@@ -130,21 +130,49 @@ raw-mode TUI reads a sequence as a sequence rather than as a paste.
 
 JSON: `{"pane","sent","enter","keys"}`.
 
-### `tty7 capture [%PANE] [--plain] [--scrollback]`
+### `tty7 capture [%PANE] [--plain] [--scrollback] [--tail N]`
 
-The pane's replay. Two independent choices:
+The pane's replay. Three independent choices:
 
 **How much** — the newest scrollback segment by default, the whole ring with
 `--scrollback`. The ring splits into segments on resize, so for a pane that was
 never resized the two are identical.
 
+<Warning>
+  The default form is bounded by the pane's last **resize**, which is an event in
+  the window rather than in the pane's output. A resize seals the segment holding
+  everything printed so far and opens a new one, and on Unix the shell answers
+  the SIGWINCH by repainting its prompt — so straight after a resize the newest
+  segment can hold that repaint and nothing else, while the command's output sits
+  in the segment behind it. Nothing in the byte stream tells a repaint apart from
+  real output, so `capture` cannot decide this for you. When you are reading a
+  pane whose window may have changed size — anything under the GUI — ask for
+  `--scrollback`, and reach for `--tail N` if you wanted the tail rather than the
+  ring.
+</Warning>
+
 **In what form** — without `--plain`, the stored bytes with ANSI escapes intact,
 decoded as UTF-8 (invalid bytes become U+FFFD). With `--plain`, those bytes
 replayed through a terminal grid and printed as the text they produced.
 
+**How many lines** — all of them by default, the last `N` with `--tail N`, which
+answers "how did the last command end?" without a pipe through `tail(1)` (a
+program Windows does not have). The trim happens last, after `--plain` has
+decided what a line is: a wrapped line is one line to the grid, so `--plain
+--tail 1` gives you the whole of the last line and not its final row. `N` must
+be at least 1 — a tail of nothing would read as a blank pane. The daemon still
+replays the ring in full; the saving is the pipe, not the wire.
+
 Either way it is a snapshot, not a stream: it collects the replay, settles for
 ~300 ms, and returns. Call it again for a newer one.
-JSON: `{"pane","text"}`.
+
+JSON: `{"pane","text","bytes"}` — `text` is what was printed, `--tail` included;
+`bytes` is how much the replay carried, counted before `--plain` rendered it or
+`--tail` trimmed it. It is what tells an empty `text` apart: `0` is a
+pane that has printed nothing, and a non-zero count with no text is a screen
+whose bytes produced nothing visible (a pane that was cleared, say). The same
+case also prints one line on stderr, so a script that never reads the JSON still
+sees it.
 
 ### `tty7 procs [%PANE]`
 
