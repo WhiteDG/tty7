@@ -2880,16 +2880,26 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// only thing this machine knows about the far shell (#840). Because of it,
 /// dedup has to compare what is actually emitted rather than the whole struct
 /// — two marks that used to collapse into one `Prompt` message must still
-/// collapse when only their unsuppressed twin tells them apart.
+/// collapse when only their unsuppressed twin tells them apart, and the
+/// survivor has to carry the *newest* twin: a whole turn can arrive in one read
+/// (`D`, the prompt's `A`/`B`, then the next command's `C`), and dropping the
+/// last entry's reading would hand the pane back a prompt it has already left.
 fn suppress_relayed_prompt_marks(shell: &mut Vec<ShellState>) {
     for s in shell.iter_mut() {
         s.at_prompt = false;
     }
     shell.dedup_by(|a, b| {
-        a.active == b.active
+        let same = a.active == b.active
             && a.at_prompt == b.at_prompt
             && a.last_exit_code == b.last_exit_code
-            && a.command == b.command
+            && a.command == b.command;
+        // `dedup_by` keeps `b`, the earlier of the pair, and drops `a`. Move
+        // the reading over first so the collapse costs a `Prompt` message and
+        // nothing else.
+        if same {
+            b.mark_at_prompt = a.mark_at_prompt;
+        }
+        same
     });
 }
 
@@ -4313,6 +4323,42 @@ mod tests {
             suppress_relayed_prompt_marks(&mut local.shell);
         }
         assert!(local.shell.last().unwrap().at_prompt);
+    }
+
+    /// The collapse that suppression performs must not hand the pane back a
+    /// prompt it has already left. A far shell's whole turn can arrive in one
+    /// read — the previous command's `D`, the prompt's `A`/`B`, then the next
+    /// command's `C` — and once `at_prompt` is cleared across the batch those
+    /// two entries differ only in the mark's own reading. The collapse keeps
+    /// the earlier entry, so that reading has to travel with it or freeness
+    /// answers `free` while a remote command is running (#840).
+    #[test]
+    fn suppression_collapses_a_batch_onto_its_newest_marks_reading() {
+        let mut s = OscSniffer::new();
+        // Bare `133;C`: nushell's integration emits it with no command name, as
+        // do several third-party ones, so `command` cannot tell the two entries
+        // apart either.
+        let mut turn = s.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        suppress_relayed_prompt_marks(&mut turn.shell);
+        assert_eq!(
+            turn.shell.len(),
+            1,
+            "still one `Prompt` message, exactly as before the mark was added"
+        );
+        assert!(
+            !turn.shell.last().unwrap().mark_at_prompt,
+            "the newest mark started a command, so the pane is not at a prompt"
+        );
+
+        // And the other order: a command that starts and finishes inside one
+        // read has to end at the prompt, not at the `C` that opened it.
+        let mut turn = s.feed(b"\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07");
+        suppress_relayed_prompt_marks(&mut turn.shell);
+        assert_eq!(turn.shell.len(), 1);
+        assert!(
+            turn.shell.last().unwrap().mark_at_prompt,
+            "the newest mark is the prompt the far shell just drew"
+        );
     }
 
     /// A prompt mark that arrives while the pane is pointed at a remote host
