@@ -79,6 +79,10 @@ fn main() {
             "capture_still_answers_after_a_resize",
             capture_still_answers_after_a_resize,
         ),
+        (
+            "capture_tail_trims_a_real_panes_answer",
+            capture_tail_trims_a_real_panes_answer,
+        ),
     ];
 
     let mut failed = 0;
@@ -904,4 +908,57 @@ fn capture_still_answers_after_a_resize(daemon: &Daemon) {
     }
 
     let _ = pane.detach();
+}
+
+/// `--tail` against a real pane, whose replay carries a shell prompt, escapes
+/// and CRLF rather than the tidy fixtures the unit tests craft.
+///
+/// The contract is only "the last N lines of what the command would have
+/// printed", so what is pinned is that the tail is a suffix of the whole answer,
+/// that it holds the marker the pane printed last, and that it is shorter than
+/// what it was cut from — not the exact line count, which depends on how the
+/// test machine's shell decorates its prompt.
+fn capture_tail_trims_a_real_panes_answer(daemon: &Daemon) {
+    let created = daemon.run_json(&["new", &workdir()]);
+    let pane = created["pane"].as_u64().expect("new prints the pane id");
+    let address = format!("%{pane}");
+
+    for n in 1..=6 {
+        let line = format!("echo tty7_e2e_tail_line_{n}");
+        daemon.run_ok(&["send", &address, &line, "--enter"]);
+    }
+
+    let deadline = Instant::now() + SETTLE_WITHIN;
+    loop {
+        let whole = daemon.run_ok(&["capture", &address, "--plain"]);
+        let tail = daemon.run_ok(&["capture", &address, "--plain", "--tail", "2"]);
+        let settled = whole.contains("tty7_e2e_tail_line_6")
+            && tail.contains("tty7_e2e_tail_line_6")
+            && whole.contains("tty7_e2e_tail_line_1");
+        if settled {
+            assert!(
+                whole.trim_end().ends_with(tail.trim_end()),
+                "a tail has to be the end of the answer it was cut from:\ntail: {tail:?}\nwhole: {whole:?}"
+            );
+            assert!(
+                !tail.contains("tty7_e2e_tail_line_1"),
+                "two lines cannot still hold the first of six:\n{tail:?}"
+            );
+            // The byte count stays the size of the replay, not of the tail —
+            // that is what says a tail was taken rather than a short capture.
+            let json = daemon.run_json(&["capture", &address, "--plain", "--tail", "2"]);
+            assert!(
+                json["bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n as usize > tail.len()),
+                "--tail must not shrink the reported replay size: {json}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the six echoes never settled; last capture was:\n{whole}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

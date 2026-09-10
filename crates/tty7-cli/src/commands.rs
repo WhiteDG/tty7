@@ -622,10 +622,35 @@ fn capture(args: CaptureArgs, ctx: &Context, backend: &mut dyn Backend) -> Resul
              capture that came back short"
         );
     }
+    // After the note, not before: a tail is a view of the answer, and whether
+    // the answer itself was blank is a fact about the pane either way.
+    let text = match args.tail {
+        Some(keep) => last_lines(&rendered, keep as usize),
+        None => rendered,
+    };
     report(
-        rendered.clone(),
-        json!({ "pane": pane, "text": rendered, "bytes": replayed }),
+        text.clone(),
+        json!({ "pane": pane, "text": text, "bytes": replayed }),
     )
+}
+
+/// The last `keep` lines of `text`, counted the way `tail -n` counts them.
+///
+/// A trailing newline terminates the last line rather than opening an empty
+/// one, so `tail -n 1` of `"a\nb\n"` is `"b\n"` and not `""`. Splitting on
+/// `\n` alone leaves the `\r` of a CRLF attached to the line it ended, which
+/// is what the raw form is supposed to hand back byte-for-byte.
+fn last_lines(text: &str, keep: usize) -> String {
+    let (body, trailer) = match text.strip_suffix('\n') {
+        Some(body) => (body, "\n"),
+        None => (text, ""),
+    };
+    let start = body
+        .rmatch_indices('\n')
+        .nth(keep.saturating_sub(1))
+        .map(|(at, _)| at + 1)
+        .unwrap_or(0);
+    format!("{}{trailer}", &body[start..])
 }
 
 fn procs(target: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -2604,6 +2629,67 @@ mod tests {
         ));
         assert_eq!(plain["text"], json!("red"));
         assert_eq!(plain["pane"], json!(2));
+    }
+
+    #[test]
+    fn capture_tail_keeps_the_last_lines_of_either_form() {
+        let mut backend = mock();
+        let replay = b"one\r\ntwo\r\nthree\r\nfour\r\n";
+        backend.capture_segments = vec![segment(replay)];
+
+        let plain = human(run_cli(
+            &["tty7", "capture", "%2", "--plain", "--tail", "2"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(plain, "three\nfour");
+
+        let raw = human(run_cli(
+            &["tty7", "capture", "%2", "--tail", "2"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(
+            raw, "three\r\nfour\r\n",
+            "the raw form still hands back the pane's own bytes, CR included"
+        );
+
+        // More lines asked for than exist is the whole answer, not an error —
+        // `tail -n 99` of a three-line file is the file.
+        let all = human(run_cli(
+            &["tty7", "capture", "%2", "--plain", "--tail", "99"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(all, "one\ntwo\nthree\nfour");
+
+        // And `--json` reports the tail it printed, over the byte count of the
+        // whole replay: the two together are what say a tail was taken.
+        let tailed = json_of(run_cli(
+            &["tty7", "capture", "%2", "--plain", "--tail", "1"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(tailed["text"], json!("four"));
+        assert_eq!(tailed["bytes"], json!(replay.len()));
+    }
+
+    #[test]
+    fn a_tail_counts_lines_the_way_tail_does() {
+        // A trailing newline ends the last line rather than opening an empty
+        // one, which is the difference between `tail -n 1` answering "b" and
+        // answering nothing at all.
+        assert_eq!(last_lines("a\nb\n", 1), "b\n");
+        assert_eq!(last_lines("a\nb", 1), "b");
+        assert_eq!(last_lines("a\nb\n", 2), "a\nb\n");
+        assert_eq!(last_lines("a\nb\n", 9), "a\nb\n");
+        assert_eq!(last_lines("", 3), "");
+        assert_eq!(last_lines("\n", 1), "\n");
+        assert_eq!(
+            last_lines("keep\n\n\n", 2),
+            "\n\n",
+            "blank lines are lines; a tail is not a filter"
+        );
     }
 
     #[test]
