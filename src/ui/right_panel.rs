@@ -8,7 +8,7 @@ use gpui_component::{
 use std::path::PathBuf;
 
 use crate::core::config::{Config, RightPanelTab};
-use crate::daemon::protocol::{ManagedForward, PaneProcs};
+use crate::daemon::protocol::{ManagedForward, PaneProcs, PortProbe};
 use crate::ui::app::{
     CONTENT_INSET, TILE_GLYPH_SM, TILE_GLYPH_XS, TILE_SIZE_SM, TILE_SIZE_XS, Tty7App,
     tile_trailing_inset, tile_trailing_inset_sm,
@@ -1149,9 +1149,12 @@ impl Tty7App {
     ) -> Option<AnyElement> {
         let ctx = ctx?;
         let pane_id = ctx.pane_id;
-        let ports = self
+        // No answer yet for this pane defaults to a probe that is fine, not a
+        // broken one: the panel has nothing to doubt until it has been told
+        // something.
+        let (ports, probe) = self
             .procs(Some(pane_id))
-            .map(|p| p.ports.clone())
+            .map(|p| (p.ports.clone(), p.probe.clone()))
             .unwrap_or_default();
         let forwards: Vec<ManagedForward> = self
             .loopback_panel
@@ -1163,7 +1166,13 @@ impl Tty7App {
         let form_open = self.loopback_panel.form_pane_id == Some(pane_id);
         // A pane that cannot hold a forward and is serving nothing has no
         // section: the heading alone would be an empty promise.
-        if ports.is_empty() && forwards.is_empty() && ctx.route.is_none() {
+        //
+        // Unless the reason it is serving nothing is that nobody managed to
+        // look. Then the heading and one muted line under it are the only
+        // place the panel can admit it does not know, and a silently absent
+        // section is the bug (#731): someone whose server is plainly up reads
+        // the missing section as tty7 saying there is no server.
+        if ports.is_empty() && forwards.is_empty() && ctx.route.is_none() && probe.is_ok() {
             return None;
         }
 
@@ -1324,22 +1333,26 @@ impl Tty7App {
                     |this| {
                         // "Nothing is listening" and "nobody could tell us"
                         // look identical on screen unless the panel says which
-                        // one it means — and the second is a fixable thing:
-                        // the far end is running a server too old to answer.
-                        let (text, tone) = match self.right_panel.procs_unsupported {
-                            true => (
-                                t(L10nKey::PanelPortsUnsupported),
-                                cx.theme().muted_foreground,
-                            ),
-                            false => (t(L10nKey::None), cx.theme().muted_foreground),
+                        // one it means — and every one of the second kind is a
+                        // fixable thing: a far end running a server too old to
+                        // answer, a probe that could not be run at all, a
+                        // server started under `sudo` whose sockets this user
+                        // is not allowed to see. Still one muted line in the
+                        // place the word "None" would have gone; the panel is
+                        // reporting what it knows, not raising an alarm.
+                        let key = match (self.right_panel.procs_unsupported, &probe) {
+                            (true, _) => L10nKey::PanelPortsUnsupported,
+                            (false, PortProbe::Unavailable(_)) => L10nKey::PanelPortsProbeFailed,
+                            (false, PortProbe::Restricted) => L10nKey::PanelPortsRestricted,
+                            (false, PortProbe::Ok) => L10nKey::None,
                         };
                         this.child(
                             div()
                                 .px(px(CONTENT_INSET))
                                 .py(px(2.))
                                 .text_size(rems(TEXT))
-                                .text_color(tone)
-                                .child(text),
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t(key)),
                         )
                     },
                 )

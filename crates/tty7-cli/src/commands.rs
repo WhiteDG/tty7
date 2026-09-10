@@ -3251,6 +3251,7 @@ mod tests {
         tty7_core::daemon::protocol::PaneProcs {
             procs: vec![proc_entry(100, "zsh", 0, true)],
             ports: Vec::new(),
+            probe: Default::default(),
         }
     }
 
@@ -3262,6 +3263,7 @@ mod tests {
                 proc_entry(101, "cargo", 1, true),
             ],
             ports: Vec::new(),
+            probe: Default::default(),
         }
     }
 
