@@ -2453,4 +2453,72 @@ mod proving_the_server_once_per_connection {
             "the next pane proves it again the long way"
         );
     }
+
+    /// What `restart_remote_daemon` and `replace_remote_server` do to the note:
+    /// drop it before they start, so that one which fails halfway leaves the
+    /// next pane looking instead of trusting a note written before the upheaval.
+    #[tokio::test]
+    async fn a_change_that_failed_halfway_leaves_no_note() {
+        use crate::daemon::ssh::test_support::{Exec, FakeSshd};
+
+        let sshd = FakeSshd::connect(Exec::Exits, None).await;
+        *sshd.conn.proved_server() = Some(ProvedServer {
+            binary: BINARY.to_string(),
+            mismatch: None,
+        });
+
+        let failed = while_changing_the_server(&sshd.conn, || {
+            Err(io::Error::other("the daemon would not stop"))
+        })
+        .expect_err("the change failed");
+        assert!(format!("{failed}").contains("would not stop"));
+        assert_eq!(
+            sshd.conn.remembered_server(),
+            None,
+            "the note went first, so the next pane proves it again"
+        );
+    }
+
+    /// And they hold the lock while they run: a pane that arrives in the middle
+    /// of a replace waits for it rather than proving a binary the replace is in
+    /// the middle of moving — and then keeping that answer for the life of the
+    /// connection.
+    #[tokio::test]
+    async fn a_pane_arriving_mid_change_waits_for_it() {
+        use crate::daemon::ssh::test_support::{Exec, FakeSshd};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sshd = FakeSshd::connect(Exec::Exits, None).await;
+        let proved = Arc::new(AtomicBool::new(false));
+        let mut pane = None;
+
+        while_changing_the_server(&sshd.conn, || {
+            let conn = sshd.conn.clone();
+            let raced = proved.clone();
+            pane = Some(std::thread::spawn(move || {
+                *conn.proved_server() = Some(ProvedServer {
+                    binary: "/home/me/.tty7/bin/proved-mid-change".to_string(),
+                    mismatch: None,
+                });
+                raced.store(true, Ordering::SeqCst);
+            }));
+            // Long enough for the other thread to reach the lock. It cannot
+            // pass it, so this can only fail if the lock is not being held.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !proved.load(Ordering::SeqCst),
+                "a pane must not write a note while the server is being changed"
+            );
+            Ok(())
+        })
+        .expect("the change itself succeeded");
+
+        pane.expect("the pane raced")
+            .join()
+            .expect("it got through");
+        assert!(
+            proved.load(Ordering::SeqCst),
+            "and it goes through as soon as the change is done"
+        );
+    }
 }
