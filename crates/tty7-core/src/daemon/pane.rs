@@ -2575,6 +2575,25 @@ impl ReplayRing {
         }
     }
 
+    /// The modes a replay of this ring switches on by itself — the same fold
+    /// the pane keeps, over the bytes that are actually left.
+    ///
+    /// Folded rather than remembered per mode because the front of the ring cuts
+    /// wherever the cap fell, possibly through a sequence: the client's emulator
+    /// will not act on half a `?1049h` either, and the answer here has to be the
+    /// one the emulator will reach.
+    fn modes(&self) -> TerminalModes {
+        let mut modes = TerminalModes::new();
+        for seg in &self.segments {
+            // Both halves of the deque, in order: `feed` carries a sequence
+            // across calls, so the split is invisible to the fold.
+            let (a, b) = seg.bytes.as_slices();
+            modes.feed(a);
+            modes.feed(b);
+        }
+        modes
+    }
+
     #[cfg(test)]
     fn flatten(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len);
@@ -2596,13 +2615,17 @@ fn record_output(st: &mut PaneState, bytes: &[u8]) {
 
 fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
     // Ahead of the ring, not after it: a client that is put into the alternate
-    // screen first paints the replayed frames into the buffer they belong to,
-    // and re-entering an alternate screen the ring turns out to still carry is
-    // a no-op in the emulator, so the two cannot fight. What the ring does
-    // carry always wins on its own terms — the fold is over every byte the
-    // pane ever wrote, so any mode the ring still toggles ends where the fold
-    // says it ends.
-    if let Some(modes) = st.modes.restore_bytes() {
+    // screen first paints the replayed frames into the buffer they belong to.
+    //
+    // Only the modes the ring cannot switch on itself, though. Re-entering an
+    // alternate screen the ring still carries is not a harmless duplicate —
+    // the emulator makes `?1049h` a no-op when the mode is already on, so the
+    // ring's own copy stops clearing the alternate screen, and everything the
+    // ring holds from *before* that sequence (the shell scrollback the user
+    // had behind the program) is painted into the alternate buffer, which has
+    // no history to keep it and is left behind when the program exits. What
+    // the ring carries always wins on its own terms.
+    if let Some(modes) = st.modes.restore_bytes_beyond(&st.ring.modes()) {
         let _ = subscriber.send(DaemonMsg::Snapshot(modes));
     }
     st.ring.replay(subscriber);
@@ -4844,6 +4867,50 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))));
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The other side of the same coin, and the common case: reconnect a minute
+    /// after opening `vim` and the ring still holds the whole session, prefix
+    /// included. Re-sending the prefix then would turn the ring's own `?1049h`
+    /// into a no-op, so the shell scrollback the ring holds ahead of it would be
+    /// painted into the alternate screen — which keeps no history and is thrown
+    /// away when the program exits, leaving the user back on a blank primary
+    /// buffer instead of the prompt they left behind.
+    #[test]
+    fn a_prefix_the_ring_still_carries_is_left_to_the_ring() {
+        let mut st = test_state(true);
+        record_output(&mut st, b"$ vim notes.md\r\n");
+        record_output(&mut st, b"\x1b[?1049h\x1b[?1002h\x1b[?1006hthe file\r\n");
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber(&mut st, tx);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Size(_))),
+            "the ring speaks for its own modes; nothing goes ahead of it"
+        );
+        assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A mode the ring half-carries is a mode the ring cannot set: the front
+    /// cuts wherever the cap fell, and the emulator will not act on the tail of
+    /// a sequence any more than the fold does.
+    #[test]
+    fn a_prefix_the_ring_cut_in_half_is_restored() {
+        let mut st = test_state(true);
+        record_output(&mut st, b"\x1b[?1049h");
+        // Four bytes over the cap, so the front eats exactly the `ESC [ ? 1`
+        // the sequence opens with and leaves the rest of it in place.
+        record_output(&mut st, &vec![b'.'; RING_CAP - 4]);
+        assert!(st.ring.flatten().starts_with(b"049h"));
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber(&mut st, tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h"),
+            "the bytes left in the ring put no client on the alternate screen"
+        );
     }
 
     /// An observer joins mid-session too, and reads the same pane state.

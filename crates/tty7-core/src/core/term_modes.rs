@@ -14,7 +14,8 @@
 //!
 //! So the daemon folds the same bytes into this tracker as they pass, and
 //! `replay_state` re-sends what is still on ahead of the ring — the same
-//! treatment cwd, the prompt state and the agent already get.
+//! treatment cwd, the prompt state and the agent already get. Only what the
+//! ring itself no longer carries, though: see [`TerminalModes::restore_bytes_beyond`].
 //!
 //! Only modes that change how input is routed or which buffer is on screen are
 //! tracked. Cursor visibility (`?25`) and autowrap (`?7`) are deliberately left
@@ -87,11 +88,40 @@ impl TerminalModes {
     /// The bytes that put a freshly reset terminal back into these modes, or
     /// `None` when there is nothing to restore.
     pub fn restore_bytes(&self) -> Option<Vec<u8>> {
-        if self.on.is_empty() {
+        Self::bytes_for(&self.on)
+    }
+
+    /// The same, minus every mode `replayed` switches on by itself.
+    ///
+    /// `replayed` is a fold over the bytes that are about to be sent after
+    /// these, and whatever it carries has to be left to it — a mode sequence in
+    /// a stream does more than set a bit. `?1049h` clears the alternate screen
+    /// and takes the cursor there, and the emulator makes it a *no-op* once the
+    /// mode is already on, so restoring such a mode ahead of a replay that
+    /// still contains it does not harmlessly double up: it paints everything
+    /// the replay wrote before its own `?1049h` into the alternate screen,
+    /// which has no scrollback to hold it, and leaves the primary buffer the
+    /// program's exit returns the client to empty.
+    ///
+    /// What is left over is exactly what the replay can no longer speak for,
+    /// and it is a prefix of `on`: the replay is a suffix of the stream, so any
+    /// mode it sets was set later than one it does not.
+    pub fn restore_bytes_beyond(&self, replayed: &TerminalModes) -> Option<Vec<u8>> {
+        let missing: Vec<u16> = self
+            .on
+            .iter()
+            .copied()
+            .filter(|mode| !replayed.on.contains(mode))
+            .collect();
+        Self::bytes_for(&missing)
+    }
+
+    fn bytes_for(modes: &[u16]) -> Option<Vec<u8>> {
+        if modes.is_empty() {
             return None;
         }
-        let mut out = Vec::with_capacity(self.on.len() * 8);
-        for mode in &self.on {
+        let mut out = Vec::with_capacity(modes.len() * 8);
+        for mode in modes {
             out.extend_from_slice(b"\x1b[?");
             out.extend_from_slice(mode.to_string().as_bytes());
             out.push(b'h');
@@ -264,6 +294,51 @@ mod tests {
         let mut modes = TerminalModes::new();
         modes.feed(b"\x1b]0;\x1b[?1049h\x07\x1b[?1002h");
         assert_eq!(modes.active(), &[1002]);
+    }
+
+    #[test]
+    fn modes_the_replay_still_carries_are_left_to_the_replay() {
+        let mut modes = TerminalModes::new();
+        modes.feed(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
+
+        // A ring that still holds the whole prefix speaks for all three, and
+        // has to: its own `?1049h` is what clears the alternate screen and
+        // decides which buffer the bytes around it are painted into.
+        let mut whole = TerminalModes::new();
+        whole.feed(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
+        assert!(modes.restore_bytes_beyond(&whole).is_none());
+
+        // One that holds only the tail speaks for the tail; the rest comes back
+        // ahead of it, in the order the application set it.
+        let mut tail = TerminalModes::new();
+        tail.feed(b"\x1b[?1006h");
+        assert_eq!(
+            modes.restore_bytes_beyond(&tail).unwrap(),
+            b"\x1b[?1049h\x1b[?1002h".to_vec()
+        );
+
+        // And a ring with nothing left of the prefix is the #774 case: all of
+        // it is re-sent.
+        assert_eq!(
+            modes.restore_bytes_beyond(&TerminalModes::new()).unwrap(),
+            modes.restore_bytes().unwrap()
+        );
+    }
+
+    /// A ring drops from its front mid-sequence, so its first bytes can be the
+    /// tail of a mode set. The emulator will not act on that, so neither does
+    /// the fold that stands in for it.
+    #[test]
+    fn a_mode_set_the_replay_only_half_carries_is_still_restored() {
+        let mut modes = TerminalModes::new();
+        modes.feed(b"\x1b[?1049h");
+
+        let mut replayed = TerminalModes::new();
+        replayed.feed(b"049h and the rest of the screen");
+        assert_eq!(
+            modes.restore_bytes_beyond(&replayed).unwrap(),
+            b"\x1b[?1049h".to_vec()
+        );
     }
 
     #[test]
