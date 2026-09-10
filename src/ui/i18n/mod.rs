@@ -788,6 +788,7 @@ l10n_keys! {
     PanelPortsUnsupported,
     PanelPortsProbeFailed,
     PanelPortsRestricted,
+    PanelLatency,
     PortAutoForwarded,
     PanelCwd,
     PanelShell,
