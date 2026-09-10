@@ -301,6 +301,18 @@ impl Backend for RealBackend {
 /// keeps `--scrollback` and the default describing the same bytes. The daemon
 /// keeps sending them — its trailing `Size` is how an attaching client learns
 /// the pane's current geometry, which is not ours to take away from here.
+///
+/// This makes the zero-byte answer impossible; it does not make the default
+/// form robust to a resize, and it cannot. On Unix a resize raises SIGWINCH and
+/// the shell repaints its prompt into the new segment, so the newest segment is
+/// no longer empty — it holds the repaint, and the output is still stranded in
+/// the segment sealed behind it. Nothing in the byte stream distinguishes a
+/// prompt repaint from output the pane meant, so no rule here can tell which
+/// side of the boundary the answer is on. The boundary itself is the flaw: the
+/// default form's unit is the last resize, an event in the window rather than
+/// in the pane. Moving it means redefining what the default returns — the last
+/// screenful of the whole ring, say — which would shrink what every caller with
+/// a never-resized pane gets today, so it is left alone and documented instead.
 fn what_was_asked_for(segments: Vec<CaptureSegment>, scrollback: bool) -> Vec<CaptureSegment> {
     let mut segments: Vec<CaptureSegment> = segments
         .into_iter()
