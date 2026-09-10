@@ -1687,6 +1687,14 @@ impl Tty7App {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        // The scrim covers the whole window, the tile that
+                        // opens the switcher included. Without this the press
+                        // dismissed here and then carried on down to that
+                        // tile, whose click toggled the switcher straight back
+                        // open — so clicking it a second time looked like it
+                        // did nothing. A dismissing click is spent on the
+                        // dismissal and reaches nothing beneath it.
+                        cx.stop_propagation();
                         this.close_switcher(window, cx)
                     }),
                 )
@@ -1840,11 +1848,7 @@ impl Tty7App {
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (muted, dim, border) = (
-            theme.muted_foreground,
-            theme.muted_foreground.opacity(0.7),
-            theme.border,
-        );
+        let (muted, border) = (theme.muted_foreground, theme.border);
         let hover = hover_fill(cx);
         let holding = self.switcher.as_ref().is_some_and(|sw| sw.hold.is_some());
         // With a query in the box, ← and → belong to the caret and Tab becomes
@@ -1874,7 +1878,7 @@ impl Tty7App {
                     .text_color(muted)
                     .child(glyph_col(
                         GUTTER,
-                        Icon::new(IconName::Plus).size(px(ICON)).text_color(dim),
+                        Icon::new(IconName::Plus).size(px(ICON)).text_color(muted),
                     ))
                     .child(t(L10nKey::AppMenuNewWorkspace))
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -1887,7 +1891,7 @@ impl Tty7App {
                     .gap(px(6.))
                     .pr(px(ROW_PAD))
                     .text_xs()
-                    .text_color(dim)
+                    .text_color(muted)
                     .when(!holding && filtering, |hint| {
                         hint.child(t(L10nKey::SwitcherTabToCrossColumns))
                     })
@@ -2301,12 +2305,7 @@ impl Tty7App {
         }
 
         let theme = cx.theme();
-        let (fg, muted, dim, warn) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.muted_foreground.opacity(0.7),
-            theme.warning,
-        );
+        let (fg, muted, warn) = (theme.foreground, theme.muted_foreground, theme.warning);
         let sf = rungs(cx);
         let hover = gpui::rgb(sf.hover);
         let rref = RowRef::of(group, row);
@@ -2341,10 +2340,6 @@ impl Tty7App {
         // the trailing pieces straight out over the divider. The second line
         // leads with the machine the workspace lives on — the flat list's only
         // grouping — with its link state as the dot's color.
-        let when_path = match row.path.is_empty() {
-            true => row.when.clone(),
-            false => format!("{} · {}", row.path, row.when),
-        };
         let host_dot: Option<gpui::Hsla> = match group.link {
             Link::Local => None,
             Link::Connected if group.preempted => Some(warn),
@@ -2369,7 +2364,7 @@ impl Tty7App {
             .rounded(px(6.))
             .overflow_hidden()
             .cursor_pointer()
-            .when(picked, |r| r.bg(gpui::rgb(sf.pressed)))
+            .when(picked, |r| r.bg(gpui::rgb(sf.cursor)))
             .anchor_scroll(self.switcher_anchor(Column::Left, picked))
             .hover(move |r| r.bg(hover))
             .child(crate::ui::tab_strip::workspace_avatar(
@@ -2397,7 +2392,7 @@ impl Tty7App {
                             .gap(px(5.))
                             .min_w_0()
                             .text_xs()
-                            .text_color(dim)
+                            .text_color(muted)
                             .child(match host_dot {
                                 Some(color) => div()
                                     .flex_shrink_0()
@@ -2409,7 +2404,7 @@ impl Tty7App {
                                     .path("icons/machine-local.svg")
                                     .flex_shrink_0()
                                     .size(px(10.))
-                                    .text_color(dim)
+                                    .text_color(muted)
                                     .into_any_element(),
                             })
                             .child(
@@ -2420,24 +2415,30 @@ impl Tty7App {
                                     .text_color(muted)
                                     .child(host_label),
                             )
-                            .when(!when_path.is_empty(), |line| {
+                            // The path gives way first and the timestamp
+                            // never does: with both in one truncating string
+                            // the row ended in `~/repo/025/tty7 · …` every
+                            // time, a dangling dot where the time had been.
+                            .when(!row.path.is_empty(), |line| {
                                 line.child(div().flex_shrink_0().child("·"))
-                                    .child(div().min_w_0().truncate().child(when_path))
+                                    .child(div().min_w_0().truncate().child(row.path.clone()))
+                            })
+                            .when(!row.when.is_empty(), |line| {
+                                line.child(div().flex_shrink_0().child("·"))
+                                    .child(div().flex_shrink_0().child(row.when.clone()))
                             }),
                     ),
             )
-            .children(badge.map(|(label, here)| {
+            // A word, not a chip: a filled pill reads as a button, and these
+            // are states. Only "taken over" keeps a colour — it is the one
+            // that warns.
+            .children(badge.map(|(label, _here)| {
                 div()
                     .flex_shrink_0()
-                    .px(px(6.))
-                    .py(px(1.))
-                    .rounded(px(4.))
                     .text_xs()
-                    .bg(gpui::rgb(sf.selected))
-                    .text_color(match (row.preempted, here) {
-                        (true, _) => warn,
-                        (_, true) => fg.opacity(0.85),
-                        _ => muted,
+                    .text_color(match row.preempted {
+                        true => warn,
+                        false => muted,
                     })
                     .child(label)
             }))
@@ -2505,13 +2506,9 @@ impl Tty7App {
     ) -> AnyElement {
         let theme = cx.theme();
         let (border, card_bg) = (theme.border, theme.popover);
-        let (fg, muted, dim) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.muted_foreground.opacity(0.7),
-        );
+        let (fg, muted) = (theme.foreground, theme.muted_foreground);
         let sf = rungs(cx);
-        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.pressed));
+        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.cursor));
         let viewport = window.viewport_size();
         let card_w = FORM_W
             .min(viewport.width.as_f32() - 2. * CARD_MARGIN)
@@ -2624,7 +2621,7 @@ impl Tty7App {
                 .child(
                     Icon::new(IconName::ChevronDown)
                         .size(px(ICON))
-                        .text_color(dim),
+                        .text_color(muted),
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.switcher_form_open_hosts(window, cx);
@@ -2695,7 +2692,7 @@ impl Tty7App {
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
-                                .text_color(dim)
+                                .text_color(muted)
                                 .child(host.detail.clone()),
                         )
                         .into_any_element()
@@ -2704,7 +2701,7 @@ impl Tty7App {
                         .border_t_1()
                         .border_color(border)
                         .rounded_none()
-                        .child(Icon::new(IconName::Plus).size(px(14.)).text_color(dim))
+                        .child(Icon::new(IconName::Plus).size(px(14.)).text_color(muted))
                         .child(
                             div()
                                 .text_sm()
@@ -2744,7 +2741,7 @@ impl Tty7App {
             .border_t_1()
             .border_color(border)
             .text_xs()
-            .text_color(dim)
+            .text_color(muted)
             .child(match form.open {
                 true => t(L10nKey::SwitcherFormPickHint),
                 false => t(L10nKey::SwitcherFormCreateHint),
@@ -2780,11 +2777,11 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let (fg, muted, dim) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.muted_foreground.opacity(0.7),
-        );
+        let (fg, muted) = (theme.foreground, theme.muted_foreground);
+        let added_ink =
+            crate::ui::presets::resting_ink(theme.success, theme.muted_foreground, theme.popover);
+        let removed_ink =
+            crate::ui::presets::resting_ink(theme.danger, theme.muted_foreground, theme.popover);
         let note = |text: String| {
             div()
                 .px(px(ROW_PAD))
@@ -2819,7 +2816,7 @@ impl Tty7App {
         }
 
         let sf = rungs(cx);
-        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.pressed));
+        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.cursor));
         let right_sel = self.switcher.as_ref().map(|sw| sw.right_sel).unwrap_or(0);
         let holding = self.switcher.as_ref().is_some_and(|sw| sw.hold.is_some());
         let ws = row.id;
@@ -2840,10 +2837,15 @@ impl Tty7App {
                         .text_color(muted)
                         .child(row.name.clone()),
                 )
-                .child(div().text_xs().text_color(dim).child(match row.tabs.len() {
-                    1 => t(L10nKey::SwitcherTabCountOne).to_string(),
-                    n => t_fmt(L10nKey::SwitcherTabCount, &[("n", &n.to_string())]),
-                })),
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(match row.tabs.len() {
+                            1 => t(L10nKey::SwitcherTabCountOne).to_string(),
+                            n => t_fmt(L10nKey::SwitcherTabCount, &[("n", &n.to_string())]),
+                        }),
+                ),
         );
 
         for (nth, i) in hits.iter().enumerate() {
@@ -2857,20 +2859,20 @@ impl Tty7App {
                     .items_center()
                     .gap(px(5.))
                     .text_xs()
-                    .text_color(dim)
+                    .text_color(muted)
                     .child(
                         gpui::svg()
                             .path("icons/git-branch.svg")
                             .flex_shrink_0()
                             .size(px(11.))
-                            .text_color(dim),
+                            .text_color(muted),
                     )
                     .child(div().min_w_0().truncate().child(g.branch.clone()))
                     .when(g.added > 0, |c| {
                         c.child(
                             div()
                                 .flex_shrink_0()
-                                .text_color(theme.success)
+                                .text_color(added_ink)
                                 .child(format!("+{}", g.added)),
                         )
                     })
@@ -2878,7 +2880,7 @@ impl Tty7App {
                         c.child(
                             div()
                                 .flex_shrink_0()
-                                .text_color(theme.danger)
+                                .text_color(removed_ink)
                                 .child(format!("−{}", g.removed)),
                         )
                     })
@@ -2889,7 +2891,7 @@ impl Tty7App {
                     div()
                         .text_xs()
                         .truncate()
-                        .text_color(dim)
+                        .text_color(muted)
                         .child(tab.path.clone())
                         .into_any_element(),
                 ),
@@ -2938,11 +2940,7 @@ impl Tty7App {
                         r.child(
                             div()
                                 .flex_shrink_0()
-                                .px(px(6.))
-                                .py(px(1.))
-                                .rounded(px(4.))
                                 .text_xs()
-                                .bg(gpui::rgb(sf.selected))
                                 .text_color(muted)
                                 .child(t(L10nKey::SwitcherActiveTab)),
                         )

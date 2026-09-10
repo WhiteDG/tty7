@@ -121,9 +121,9 @@ reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "1d217ee
 # `capture` output through the same grid.
 alacritty_terminal.workspace = true
 
-# Desktop notifications driven by OSC 9 / OSC 777 escape sequences. Cross-platform;
-# the macOS backend uses the deprecated NSUserNotification (weak — a completion
-# toast is fine, revisit mac-notification-sys if it proves unusable).
+# Desktop notifications driven by OSC 9 / OSC 777 escape sequences, on Linux and
+# Windows. On macOS only its `set_application` is used — never `show`; see
+# `terminal::remote::macos_notify` for why.
 notify-rust = "4"
 
 # Filesystem watcher for live config reload: watches `config.json` and reloads
@@ -220,11 +220,9 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSAppearance", "NSGraphics", "NSImage"] }
 # NSData feeds the runtime Dock icon for bare (non-bundled) binaries — see
 # `set_dock_icon_for_bare_binary` in main.rs.
-objc2-foundation = { version = "0.3", features = ["NSData"] }
-# Clickable desktop notifications on macOS. `notify-rust` already pulls this
-# crate transitively for basic display; we depend on it directly to use
-# wait_for_click / NotificationResponse::Click.
-mac-notification-sys = "0.6"
+# NSUserNotification is the click-to-reveal notification path — see
+# `terminal::remote::macos_notify` for why it is driven directly.
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSUserNotification"] }
 
 # Dictionary-based Chinese word segmentation for double-click selection
 # (`terminal::smart_select`), as a *fallback* where the OS has no tokenizer of
@@ -278,7 +276,7 @@ edition = "2024"
 # they must never drift apart. This is the line a release bump edits (and the
 # one nightly's `awk '/^version = /'` stamps: it is the first such line in the
 # file, since the package entries above are all `version.workspace = true`).
-version = "26.9.1"
+version = "26.9.2"
 
 [workspace.dependencies]
 # Our fork's `tty7` branch carries the local customizations tty7 relies on:

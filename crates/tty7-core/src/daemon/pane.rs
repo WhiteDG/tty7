@@ -1355,12 +1355,19 @@ pub fn retitle(title: &str) -> Vec<u8> {
 /// in the common case: the primary buffer still holds the pre-`vim` scrollback
 /// from earlier in the same snapshot.
 ///
+/// The same argument reaches further than the four resets it started with, and
+/// [`INPUT_MODE_RESETS`] is the rest of it: a snapshot that ends inside a
+/// full-screen program replays that program's `?1002h` and nothing to undo it,
+/// and the emulator then reports every pointer move into a shell that never
+/// asked (#850).
+///
 /// On Windows it ends by scrolling the restored screen out of the viewport
 /// ([`SCROLL_RESTORED_AWAY`]), which is a correctness requirement rather than a
 /// matter of taste — see that constant.
 pub fn restore_preamble(banner: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
+    out.extend_from_slice(INPUT_MODE_RESETS);
     if let Some(banner) = banner.map(str::trim).filter(|b| !b.is_empty()) {
         out.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 ");
         // A newline inside the banner would be a client writing multiple lines
@@ -1373,6 +1380,45 @@ pub fn restore_preamble(banner: Option<&str>) -> Vec<u8> {
     }
     out
 }
+
+/// Turn off every mode that makes a terminal *send* bytes on its own, or encode
+/// keys in a way the incoming shell cannot read.
+///
+/// A restored pane is a snapshot of a dead process replayed at a brand-new
+/// shell. The process that switched these on was killed by a hangup with no
+/// grace period, so it never emitted its own `l` counterparts, and the snapshot
+/// was photographed before it could have anyway. What is left is a byte stream
+/// whose last word on mouse reporting is "on", replayed verbatim into an
+/// emulator that obeys it: the pointer crossing the pane types SGR reports into
+/// the shell's line, and the line grows for as long as the pointer is there
+/// (#850).
+///
+/// Unconditional on purpose. The state to land in is not "whatever the dead
+/// program had" but a constant — the new shell asked for none of these, and it
+/// is not running yet, so there is nothing here to preserve. Switching off a
+/// mode that is already off is a no-op in every emulator, which makes the blunt
+/// version the one that cannot fail: a fold over the snapshot's bytes that
+/// misreads one sequence leaves the mode on and the bug exactly as it is today.
+///
+/// - `9`/`1000`/`1002`/`1003` are the mouse reporting level, `1005`/`1006`/
+///   `1015`/`1016` its encodings. Our own emulator knows `1000`, `1002`, `1003`,
+///   `1005` and `1006` and ignores the rest; `9`, `1015` and `1016` are here for
+///   the terminals downstream of a CLI consumer replaying the same ring, which
+///   do know them.
+/// - `1004` is focus reporting — the other mode that makes the terminal write
+///   into the pty unprompted, on every window activation.
+/// - `2004` is bracketed paste: a paste into a shell that does not know the
+///   protocol arrives with `ESC[200~` typed around it.
+/// - `1` is DECCKM, which sends the arrow keys as `ESC O A` instead of `ESC[A`.
+/// - `CSI = 0 ; 1 u` sets the kitty keyboard flags to none, the same reset
+///   `stale_mode_resets` in the client uses.
+///
+/// Deliberately absent: `1007` (alternate scroll), which this emulator has *on*
+/// by default, so clearing it would walk away from the default rather than back
+/// to it; and `2026` (synchronised update), which the client's processor closes
+/// out itself the moment a replayed frame ends inside one.
+pub const INPUT_MODE_RESETS: &[u8] = b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\
+\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b[=0;1u";
 
 /// Push the restored screen into the client's scrollback and put the cursor
 /// back at the top-left, so the incoming shell starts on a blank viewport.
@@ -2107,11 +2153,33 @@ impl DaemonPane {
         subscriber: Sender<DaemonMsg>,
         allow_remote_clipboard_write: bool,
     ) -> u64 {
+        // Asked before the state lock, not under it: the probe takes the pty
+        // master's lock, and every other caller that holds both takes them in
+        // this order.
+        let foreground_command = self.has_foreground_command();
         let mut st = self.state.lock().unwrap();
-        let epoch =
-            attach_subscriber_with_permissions(&mut st, subscriber, allow_remote_clipboard_write);
+        let epoch = attach_subscriber_with_permissions(
+            &mut st,
+            subscriber,
+            allow_remote_clipboard_write,
+            foreground_command,
+        );
         self.gate.reset();
         epoch
+    }
+
+    /// Whether something other than the pane's own shell owns the terminal.
+    ///
+    /// Answered by the kernel (`tcgetpgrp`), not by the pane's stored shell
+    /// state, which is why it can contradict `st.shell.at_prompt` — see
+    /// [`replayed_at_prompt`]. A pane with no pty to ask (native ssh, and
+    /// every pane on Windows, where the pty has no foreground process group)
+    /// answers "no", which is what the live suppression already assumes.
+    fn has_foreground_command(&self) -> bool {
+        match &self.backend {
+            PaneBackend::Pty(pty) => foreground_command_running(&pty.master, pty.shell_pid),
+            PaneBackend::NativeSsh(_) => false,
+        }
     }
 
     pub fn detach(&self, epoch: u64) -> bool {
@@ -2125,8 +2193,9 @@ impl DaemonPane {
     }
 
     pub fn observe(&self, observer: Sender<DaemonMsg>, gate: Arc<OutputGate>) -> u64 {
+        let foreground_command = self.has_foreground_command();
         let mut st = self.state.lock().unwrap();
-        observe_subscriber(&mut st, observer, gate)
+        observe_subscriber(&mut st, observer, gate, foreground_command)
     }
 
     pub fn unobserve(&self, observer_id: u64) {
@@ -2613,7 +2682,14 @@ fn record_output(st: &mut PaneState, bytes: &[u8]) {
     st.modes.feed(bytes);
 }
 
-fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
+/// Everything a client needs to rebuild the pane's screen and status, in the
+/// order it has to be applied.
+///
+/// `foreground_command` is the answer to "does a program other than the shell
+/// own the terminal right now?", asked of the pty rather than of the pane's
+/// stored state. It gates the prompt report, and that gate is not cosmetic —
+/// see [`replayed_at_prompt`].
+fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>, foreground_command: bool) {
     // Ahead of the ring, not after it: a client that is put into the alternate
     // screen first paints the replayed frames into the buffer they belong to.
     //
@@ -2635,7 +2711,7 @@ fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
     if st.shell.active {
         let _ = subscriber.send(DaemonMsg::Prompt {
             active: st.shell.active,
-            at_prompt: st.shell.at_prompt,
+            at_prompt: replayed_at_prompt(st, foreground_command),
             last_exit: st.shell.last_exit_code,
         });
     }
@@ -2653,9 +2729,39 @@ fn replay_state(st: &PaneState, subscriber: &Sender<DaemonMsg>) {
     }
 }
 
+/// Whether a replay may tell the client the pane is sitting at a shell prompt.
+///
+/// `st.shell.at_prompt` is only ever as fresh as the last OSC 133 mark the pane
+/// produced, and a mark can stay the last word for hours: a shell that printed
+/// its prompt (`133;B`) and then handed the terminal to a full-screen program
+/// which emits no `133;C` of its own leaves the flag set for as long as that
+/// program runs. The live path already declines to believe such a mark — the
+/// reader drops `at_prompt` from any prompt mark that arrives while a
+/// foreground command owns the pty — but the replay re-asserted the stored
+/// value with no check at all.
+///
+/// That gap is what #711 is. A client that hears "at a prompt" scrubs the TUI
+/// modes it finds in its grid, the alternate screen included, on the reasoning
+/// that no full-screen program can own a pane whose shell is prompting. On a
+/// replay the alternate screen it finds is the one the ring *just rebuilt*, so
+/// the scrub swaps it away and leaves the primary screen underneath: the shell
+/// banner and the command line the pane was born with. The program is still
+/// there, still painting differential updates, now into a grid that no longer
+/// holds what those updates are differences from — which is why the pane came
+/// back as a few fragments on an empty screen, and why only a resize (a real
+/// `SIGWINCH`, a real repaint) put it back.
+///
+/// Asking the pty closes the gap without costing the scrub its purpose: when
+/// the shell really is prompting, no command is in the foreground, the report
+/// goes out unchanged, and a genuinely stranded alt screen (an `ssh` that died
+/// mid-`vim`) still heals on reattach.
+fn replayed_at_prompt(st: &PaneState, foreground_command: bool) -> bool {
+    st.shell.at_prompt && !foreground_command
+}
+
 #[cfg(test)]
 fn attach_subscriber(st: &mut PaneState, subscriber: Sender<DaemonMsg>) -> u64 {
-    attach_subscriber_with_permissions(st, subscriber, false)
+    attach_subscriber_with_permissions(st, subscriber, false, false)
 }
 
 /// The one place a pane's clipboard permission is decided. A pane that carries
@@ -2669,10 +2775,11 @@ fn attach_subscriber_with_permissions(
     st: &mut PaneState,
     subscriber: Sender<DaemonMsg>,
     allow_remote_clipboard_write: bool,
+    foreground_command: bool,
 ) -> u64 {
     st.subscriber_epoch += 1;
     set_clipboard_permission(st, allow_remote_clipboard_write);
-    replay_state(st, &subscriber);
+    replay_state(st, &subscriber, foreground_command);
     st.subscriber = Some(subscriber);
     st.subscriber_epoch
 }
@@ -2681,9 +2788,10 @@ fn observe_subscriber(
     st: &mut PaneState,
     observer: Sender<DaemonMsg>,
     gate: Arc<OutputGate>,
+    foreground_command: bool,
 ) -> u64 {
     st.observer_seq += 1;
-    replay_state(st, &observer);
+    replay_state(st, &observer, foreground_command);
     // The replay just queued the whole ring into this channel. Charge it, or
     // the first budget check would read zero while a full scrollback is already
     // sitting there unread — an observer that never drains would be allowed a
@@ -3850,6 +3958,95 @@ mod tests {
         assert!(text.contains("\x1b[?7h"), "put autowrap back");
         assert!(text.contains("\x1b[0m"), "drop any colour left mid-run");
         assert!(text.contains("this shell is new"));
+
+        // #850: the same argument, for the modes that make the terminal talk
+        // back. The snapshot ends inside a program that enabled mouse
+        // reporting and was killed before it could disable it, so replaying it
+        // leaves the emulator reporting every pointer move into a shell that
+        // never asked — the line fills with SGR reports as long as the pointer
+        // is over the pane. Focus reporting writes unprompted for the same
+        // reason; bracketed paste and DECCKM mangle what the user types.
+        for (seq, what) in [
+            ("\x1b[?9l", "X10 mouse reporting"),
+            ("\x1b[?1000l", "click reporting"),
+            ("\x1b[?1002l", "cell-motion reporting"),
+            ("\x1b[?1003l", "all-motion reporting"),
+            ("\x1b[?1005l", "the UTF-8 mouse encoding"),
+            ("\x1b[?1006l", "the SGR mouse encoding"),
+            ("\x1b[?1015l", "the urxvt mouse encoding"),
+            ("\x1b[?1016l", "the SGR-pixel mouse encoding"),
+            ("\x1b[?1004l", "focus reporting"),
+            ("\x1b[?2004l", "bracketed paste"),
+            ("\x1b[?1l", "application cursor keys"),
+            ("\x1b[=0;1u", "the kitty keyboard flags"),
+        ] {
+            assert!(
+                text.contains(seq),
+                "the preamble has to turn {what} off: the process that turned it \
+                 on was killed by a hangup with no grace period and never sent \
+                 its own reset, so the replay's last word on it is `on`"
+            );
+        }
+
+        // Not reset: alternate scroll is on in a default terminal, so clearing
+        // it would leave the pane further from the default than it started.
+        assert!(
+            !text.contains("\x1b[?1007l"),
+            "?1007 defaults to on; resetting it walks away from the default"
+        );
+    }
+
+    /// Whether the stream's last word on a private mode is `h`, `l`, or
+    /// nothing — which is all a client's emulator ends up remembering of it.
+    fn last_mode_switch(stream: &[u8], mode: &str) -> Option<u8> {
+        let last = |needle: Vec<u8>| {
+            stream
+                .windows(needle.len())
+                .rposition(|w| w == needle.as_slice())
+        };
+        let on = last(format!("\x1b[?{mode}h").into_bytes());
+        let off = last(format!("\x1b[?{mode}l").into_bytes());
+        match (on, off) {
+            (Some(h), Some(l)) => Some(if h > l { b'h' } else { b'l' }),
+            (Some(_), None) => Some(b'h'),
+            (None, Some(_)) => Some(b'l'),
+            (None, None) => None,
+        }
+    }
+
+    /// Issue #850, along the whole chain rather than at the preamble alone: a
+    /// snapshot is a raw byte stream, it seeds the restored pane's ring
+    /// verbatim, and the client feeds it straight to its parser. So a snapshot
+    /// whose last word on mouse reporting is `h` puts the *client* into mouse
+    /// reporting, against a shell that never asked, and every pointer move
+    /// over the pane is typed into its line as an SGR report.
+    #[test]
+    fn a_ring_restored_from_a_full_screen_snapshot_ends_with_reporting_off() {
+        let size = ws(80, 24);
+        // What the photograph of a pane running `claude`, `vim` or `btop`
+        // actually holds. There is no epilogue: `DaemonPane::kill` is a hangup
+        // with no grace period, so the program never sent its own `?1002l`,
+        // and the snapshot was taken before it could have anyway.
+        let snapshot = crate::daemon::scrollback::Segment {
+            size,
+            bytes: b"\x1b[?1049h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\
+\x1b[?2004hframe one\x1b[Hframe two"
+                .to_vec(),
+        };
+        let mut ring = ReplayRing::seeded(vec![snapshot], size);
+        ring.append(&restore_preamble(Some("the shell below is new")));
+        let replayed = ring.flatten();
+
+        for mode in [
+            "1000", "1002", "1003", "1005", "1006", "1004", "2004", "1049",
+        ] {
+            assert_eq!(
+                last_mode_switch(&replayed, mode),
+                Some(b'l'),
+                "a client replaying this ring ends with ?{mode} still on, which is \
+                 what types SGR reports into the restored shell (#850)"
+            );
+        }
     }
 
     /// The ConPTY constraint, from the daemon's side. A pane whose shell runs
@@ -4808,6 +5005,90 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Issue #711. A pane whose shell printed its prompt and then handed the
+    /// terminal to a full-screen program keeps `at_prompt` set for as long as
+    /// that program runs — nothing clears the flag but a `133;C` the program
+    /// has no reason to send. The live path already refuses to believe a
+    /// prompt mark that arrives while a foreground command owns the pty; the
+    /// replay used to re-assert the stored value regardless.
+    ///
+    /// What the client does with "at a prompt" is scrub the TUI modes it finds
+    /// in its grid — the alternate screen first (`\x1b[?1049l`) — because a
+    /// prompting shell means no full-screen program can own the pane. On a
+    /// replay that alternate screen is the one the ring just rebuilt, so the
+    /// scrub swapped it away and left the primary screen underneath: the shell
+    /// banner and the command line the pane was born with, with the program
+    /// still painting differential updates into a grid that no longer holds
+    /// what they are differences from.
+    #[test]
+    fn a_replay_does_not_claim_a_prompt_while_a_program_owns_the_pane() {
+        let mut st = test_state(true);
+        // The shell prompted, then `claude` took the terminal and entered the
+        // alternate screen. No `133;C` ever arrived, so the flag still stands.
+        st.shell = ShellState {
+            active: true,
+            at_prompt: true,
+            last_exit_code: Some(0),
+            command: None,
+        };
+        st.ring.append(b"\x1b[?1049h\x1b[2Jthe agent's screen");
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber_with_permissions(&mut st, tx, false, true);
+
+        let replayed = drain(&rx);
+        let prompt = replayed
+            .iter()
+            .find_map(|msg| match msg {
+                DaemonMsg::Prompt {
+                    active, at_prompt, ..
+                } => Some((*active, *at_prompt)),
+                _ => None,
+            })
+            .expect("shell integration is on, so the replay reports the prompt state");
+        assert_eq!(
+            prompt,
+            (true, false),
+            "a pane with a program in the foreground is not at a prompt, whatever the last \
+             OSC 133 mark said; claiming otherwise costs the client the screen the ring just \
+             replayed"
+        );
+    }
+
+    /// The other half of the same gate, and the reason it is a gate rather
+    /// than a deletion: an `ssh` that died mid-`vim` leaves `?1049h` in the
+    /// ring with no `?1049l` behind it, and the host shell's next prompt is
+    /// the only thing that says the alternate screen is stale. With nothing in
+    /// the foreground the report goes out as it always did, and a re-attach
+    /// still heals that pane.
+    #[test]
+    fn a_replay_still_reports_a_prompt_when_the_shell_owns_the_pane() {
+        let mut st = test_state(true);
+        st.shell = ShellState {
+            active: true,
+            at_prompt: true,
+            last_exit_code: Some(0),
+            command: None,
+        };
+        st.ring.append(b"\x1b[?1049hstranded alt screen");
+
+        let (tx, rx) = mpsc::channel();
+        attach_subscriber_with_permissions(&mut st, tx, false, false);
+
+        assert!(
+            drain(&rx).iter().any(|msg| matches!(
+                msg,
+                DaemonMsg::Prompt {
+                    active: true,
+                    at_prompt: true,
+                    ..
+                }
+            )),
+            "with no foreground command the stored prompt state is the truth, and the client \
+             needs it to leave a stranded alternate screen"
+        );
+    }
+
     #[test]
     fn attach_replays_initial_cwd_even_before_shell_reports_osc7() {
         let mut st = test_state(true);
@@ -4921,7 +5202,7 @@ mod tests {
         record_output(&mut st, &vec![b'.'; RING_CAP]);
 
         let (tx, rx) = mpsc::channel();
-        observe_subscriber(&mut st, tx, Arc::new(OutputGate::new()));
+        observe_subscriber(&mut st, tx, Arc::new(OutputGate::new()), false);
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Snapshot(b)) if b == b"\x1b[?1049h"));
     }
 
@@ -4959,7 +5240,7 @@ mod tests {
         drain(&controller_rx);
 
         let (observer_tx, observer_rx) = mpsc::channel();
-        let id = observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+        let id = observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
         assert_eq!(
             st.subscriber_epoch, epoch,
             "observing must not bump the controller epoch"
@@ -4998,7 +5279,7 @@ mod tests {
         drain(&first_rx);
 
         let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
         drain(&observer_rx);
 
         let (second_tx, second_rx) = mpsc::channel();
@@ -5030,7 +5311,7 @@ mod tests {
     fn a_gone_observer_is_pruned_on_the_next_broadcast() {
         let mut st = test_state(true);
         let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
         drop(observer_rx);
 
         notify(&mut st, DaemonMsg::Output(b"x".to_vec()));
@@ -5048,7 +5329,7 @@ mod tests {
         drain(&controller_rx);
 
         let (observer_tx, observer_rx) = mpsc::channel();
-        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+        observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
         drain(&observer_rx);
 
         let pane_gate = OutputGate::new();
@@ -5087,7 +5368,7 @@ mod tests {
         let mut st = test_state(true);
         let (observer_tx, observer_rx) = mpsc::channel();
         let observer_gate = Arc::new(OutputGate::new());
-        observe_subscriber(&mut st, observer_tx, observer_gate.clone());
+        observe_subscriber(&mut st, observer_tx, observer_gate.clone(), false);
         drain(&observer_rx);
 
         let pane_gate = OutputGate::new();
@@ -5144,6 +5425,7 @@ mod tests {
             &mut with_observer_only.lock().unwrap(),
             observer_tx,
             Arc::new(OutputGate::new()),
+            false,
         );
         drain(&observer_rx);
         let (dead_tx, dead_rx) = mpsc::channel();
@@ -5164,7 +5446,7 @@ mod tests {
         {
             let mut st = with_both.lock().unwrap();
             attach_subscriber(&mut st, controller_tx);
-            observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+            observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
         }
         drain(&controller_rx);
         drain(&observer_rx);
@@ -5662,7 +5944,7 @@ mod tests {
         let mut st = test_state(true);
         st.clipboard_write_from_spec = Some(true);
         let (tx, _rx) = mpsc::channel();
-        attach_subscriber_with_permissions(&mut st, tx, false);
+        attach_subscriber_with_permissions(&mut st, tx, false, false);
         assert!(st.allow_remote_clipboard_write);
 
         // And a profile that says no is not something an attaching client can
@@ -5670,17 +5952,17 @@ mod tests {
         let mut st = test_state(true);
         st.clipboard_write_from_spec = Some(false);
         let (tx, _rx) = mpsc::channel();
-        attach_subscriber_with_permissions(&mut st, tx, true);
+        attach_subscriber_with_permissions(&mut st, tx, true, false);
         assert!(!st.allow_remote_clipboard_write);
 
         // A pane with no spec of its own — everything on a remote
         // `tty7-server` — is exactly as permitted as its controller says.
         let mut st = test_state(true);
         let (tx, _rx) = mpsc::channel();
-        attach_subscriber_with_permissions(&mut st, tx, true);
+        attach_subscriber_with_permissions(&mut st, tx, true, false);
         assert!(st.allow_remote_clipboard_write);
         let (tx, _rx) = mpsc::channel();
-        attach_subscriber_with_permissions(&mut st, tx, false);
+        attach_subscriber_with_permissions(&mut st, tx, false, false);
         assert!(!st.allow_remote_clipboard_write);
     }
 
@@ -5693,8 +5975,8 @@ mod tests {
         let (observer_tx, observer_rx) = mpsc::channel();
         {
             let mut st = state.lock().unwrap();
-            attach_subscriber_with_permissions(&mut st, controller_tx, true);
-            observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()));
+            attach_subscriber_with_permissions(&mut st, controller_tx, true, false);
+            observe_subscriber(&mut st, observer_tx, Arc::new(OutputGate::new()), false);
         }
         drain(&controller_rx);
         drain(&observer_rx);

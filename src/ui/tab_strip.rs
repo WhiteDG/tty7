@@ -593,6 +593,22 @@ pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> But
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
 }
 
+/// A chrome tile whose current state is said with a rule under it rather than
+/// with a fill: the ink still steps up to full strength, the pill never
+/// appears, and the caller draws the bar.
+///
+/// The fill is what an activity bar of three tiles cannot afford. It is the
+/// same grey block the hover state paints, so the lit tab and the tile under
+/// the pointer read as the same thing, and it sits in a title bar where every
+/// other tile is a bare glyph.
+pub(crate) fn chrome_tile_marked(button: Button, current: bool, cx: &gpui::App) -> Button {
+    button
+        .custom(chrome_tile_variant_for(current, cx))
+        .with_size(px(TILE_GLYPH / BUTTON_ICON_SCALE))
+        .w(px(TILE_SIZE))
+        .h(px(TILE_SIZE))
+}
+
 /// How wide the two chrome tiles at the trailing end of the title bar are, with
 /// the padding around them.
 pub(crate) fn trailing_chrome_tiles_w() -> f32 {
@@ -992,9 +1008,20 @@ impl Tty7App {
                     .custom(chrome_tile_variant(cx))
                     .child(
                         h_flex()
+                            .id("rail-workspace-head-ink")
                             .w_full()
+                            .h_full()
                             .items_center()
                             .gap(px(6.))
+                            // The tile's own hover is a fill the palette keeps
+                            // a hair off the surface, which on the rail is
+                            // barely a change at all — and the name and the
+                            // chevron pinned their own ink, so the pointer
+                            // landing on the one control at the top of the
+                            // column said nothing. Answer the way a group
+                            // header does: the ink steps up to full strength.
+                            .text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.text_color(cx.theme().foreground))
                             .child(
                                 div()
                                     .flex()
@@ -1009,6 +1036,11 @@ impl Tty7App {
                                     .child(monogram),
                             )
                             .child(
+                                // Chrome, not a row: the tile inherits the
+                                // rail's title ink, which now belongs to the
+                                // tabs. The workspace name reads at the group
+                                // headers' weight so the one dark line in
+                                // the column stays the tab in front.
                                 div()
                                     .flex_shrink(1.)
                                     .min_w_0()
@@ -1023,8 +1055,7 @@ impl Tty7App {
                                 Icon::empty()
                                     .path("icons/chevrons-up-down.svg")
                                     .size(px(11.))
-                                    .flex_shrink_0()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .flex_shrink_0(),
                             ),
                     )
                     .xsmall()
@@ -1158,46 +1189,68 @@ impl Tty7App {
         ]
         .into_iter()
         .map(|(tab, icon, label_key)| {
+            let current = active_tab == tab;
+            let tile = chrome_tile_marked(
+                Button::new(("right-panel-tab", tab as usize)).icon(icon),
+                current,
+                cx,
+            )
+            .rounded_lg()
+            .tooltip(match (tab, changed) {
+                (RightPanelTab::Scm, Some(n)) => {
+                    SharedString::from(format!("{} · {n}", t(label_key)))
+                }
+                _ => SharedString::from(t(label_key)),
+            })
+            // A tile for another tab switches to it; the lit one puts
+            // the panel away, the way an activity bar behaves
+            // everywhere else. Pressing it used to do nothing at all
+            // — a dead click on the one control in the row that looks
+            // like it should undo itself. (These tiles only exist
+            // while the panel is open, so `ToggleRightPanel` and the
+            // chrome tile beside them are still what brings it back.)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                match this.right_panel_open(cx) && this.right_panel_tab == tab {
+                    true => {
+                        this.toggle_right_panel(cx);
+                        // These tiles live inside the panel, so
+                        // closing from one destroys the element that
+                        // holds the focus and leaves it nowhere —
+                        // and a keymap whose bindings are scoped to a
+                        // focused thing goes quiet with it, so the
+                        // ⌘J that would undo this did nothing at all.
+                        // Hand the terminal back what it lost.
+                        this.focus_active(window, cx);
+                    }
+                    false => this.set_right_panel_tab(tab, cx),
+                }
+            }));
             div()
-                .occlude()
                 .flex_shrink_0()
-                .child(
-                    chrome_tile(
-                        Button::new(("right-panel-tab", tab as usize)).icon(icon),
-                        active_tab == tab,
-                        cx,
-                    )
-                    .rounded_lg()
-                    .tooltip(match (tab, changed) {
-                        (RightPanelTab::Scm, Some(n)) => {
-                            SharedString::from(format!("{} · {n}", t(label_key)))
-                        }
-                        _ => SharedString::from(t(label_key)),
-                    })
-                    // A tile for another tab switches to it; the lit one puts
-                    // the panel away, the way an activity bar behaves
-                    // everywhere else. Pressing it used to do nothing at all
-                    // — a dead click on the one control in the row that looks
-                    // like it should undo itself. (These tiles only exist
-                    // while the panel is open, so `ToggleRightPanel` and the
-                    // chrome tile beside them are still what brings it back.)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        match this.right_panel_open(cx) && this.right_panel_tab == tab {
-                            true => {
-                                this.toggle_right_panel(cx);
-                                // These tiles live inside the panel, so
-                                // closing from one destroys the element that
-                                // holds the focus and leaves it nowhere —
-                                // and a keymap whose bindings are scoped to a
-                                // focused thing goes quiet with it, so the
-                                // ⌘J that would undo this did nothing at all.
-                                // Hand the terminal back what it lost.
-                                this.focus_active(window, cx);
-                            }
-                            false => this.set_right_panel_tab(tab, cx),
-                        }
-                    })),
-                )
+                // Full height and `relative` so the bar below can be pinned to
+                // the row's own bottom edge, where it lands on the hairline
+                // that closes the row rather than floating under the glyph.
+                // The `occlude` that keeps a press from dragging the window
+                // stays on the tile: grown to the whole row it would take the
+                // few pixels above and below each glyph out of the drag
+                // region and hand them to nothing.
+                .h_full()
+                .relative()
+                .flex()
+                .items_center()
+                .child(div().occlude().flex_shrink_0().child(tile))
+                // Narrower than the tile so it reads as underlining the glyph
+                // rather than as the edge of a box around it.
+                .children(current.then(|| {
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(6.))
+                        .right(px(6.))
+                        .h(px(2.))
+                        .rounded_t(px(1.))
+                        .bg(cx.theme().foreground)
+                }))
                 .into_any_element()
         })
         .collect()
@@ -1274,13 +1327,22 @@ impl Tty7App {
         size: f32,
         cx: &App,
     ) -> gpui::AnyElement {
-        let base = div()
-            .id(id)
-            .flex_shrink_0()
-            .size(px(size))
-            .flex()
-            .items_center()
-            .justify_center();
+        // The wrapper positions; the disc below carries the radius.
+        // `status_dot` hangs itself off the edge with negative offsets — that
+        // overhang is what makes it a badge on the avatar rather than a notch
+        // in it — and as a child of the rounded element the overhang was
+        // clipped along the arc, leaving a crescent.
+        let base = div().id(id).flex_shrink_0().relative().size(px(size));
+        // Fill, hairline and mark all live here, so the radius only ever clips
+        // the disc's own paint.
+        let disc = || {
+            div()
+                .size(px(size))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+        };
         match agent {
             Some(agent) => {
                 let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
@@ -1293,41 +1355,47 @@ impl Tty7App {
                     Some(state) => format!("{} — {state}", agent.display_name()),
                     None => agent.display_name().to_string(),
                 };
-                base.relative()
-                    .rounded_full()
-                    .bg(gpui::rgb(agent.accent_rgb()))
-                    // Codex and Grok are both pure black, which is the window
-                    // fill on a dark theme — the disc dissolves and leaves the
-                    // glyph floating. A hairline keeps it a disc in any theme.
-                    .when(
-                        crate::ui::presets::needs_edge(agent.accent_rgb(), cx.theme().background),
-                        |d| d.border_1().border_color(cx.theme().border),
-                    )
-                    .child(
-                        gpui::svg()
-                            .path(agent.icon_path())
-                            .size(px(size * 0.54))
-                            // SVG assets render as a single-colour mask, so
-                            // the mark's colour comes from the agent rather
-                            // than from the file. The tray icon reads the same
-                            // answer.
-                            .text_color(gpui::rgb(agent.icon_rgb())),
-                    )
-                    .when_some(dot, |b, dot| b.child(dot))
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                    })
-                    .into_any_element()
+                // The disc is a solid fill of the agent's brand on every
+                // row, lit or not: a tint reads as a disabled tab, and the
+                // colour is how the eye tells one agent from another down a
+                // column of twenty.
+                let accent = agent.accent_rgb();
+                let surface = cx.theme().background;
+                base.child(
+                    disc()
+                        .bg(gpui::rgb(accent))
+                        // Codex and Grok are both pure black, which is the
+                        // window fill on a dark theme — the disc dissolves and
+                        // leaves the glyph floating. A hairline keeps it a disc
+                        // in any theme.
+                        .when(crate::ui::presets::needs_edge(accent, surface), |d| {
+                            d.border_1().border_color(cx.theme().border)
+                        })
+                        .child(
+                            gpui::svg()
+                                .path(agent.icon_path())
+                                .size(px(size * 0.54))
+                                // SVG assets render as a single-colour mask, so
+                                // the mark's colour comes from the agent rather
+                                // than from the file. The tray icon reads the
+                                // same answer.
+                                .text_color(gpui::rgb(agent.icon_rgb())),
+                        ),
+                )
+                .when_some(dot, |b, dot| b.child(dot))
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .into_any_element()
             }
             None => base
-                .relative()
-                .rounded_full()
-                .bg(cx.theme().muted)
                 .child(
-                    gpui::svg()
-                        .path("icons/terminal.svg")
-                        .size(px(size * 0.56))
-                        .text_color(cx.theme().foreground.opacity(0.65)),
+                    disc().bg(cx.theme().muted).child(
+                        gpui::svg()
+                            .path("icons/terminal.svg")
+                            .size(px(size * 0.56))
+                            .text_color(cx.theme().foreground.opacity(0.65)),
+                    ),
                 )
                 .when_some(ssh, |b, rgb| {
                     b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
@@ -2097,8 +2165,14 @@ impl Tty7App {
         });
 
         let panel_open = self.right_panel_open(cx);
+        // With the panel open these two tiles stand in the band above it, over
+        // the panel's own header — and that header's tab tiles are painted
+        // whenever the panel is, so a band that grew two buttons on hover read
+        // as a glitch beside them. Same bargain macOS struck when it moved
+        // these tiles into the panel's title bar: once the panel is open they
+        // are part of its chrome, not part of the strip's.
         let right_chrome = (!panel_open || !cfg!(target_os = "macos"))
-            .then(|| self.window_chrome(strip_chrome_shown, window, cx));
+            .then(|| self.window_chrome(strip_chrome_shown || panel_open, window, cx));
 
         h_flex()
             .id("tab-strip")

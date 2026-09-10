@@ -1063,13 +1063,6 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::PanelNoChanges => "No uncommitted changes.",
         L10nKey::PanelNoChangesHint => "The working tree is clean.",
         L10nKey::PanelSessionSubtitle => "Session",
-        L10nKey::PanelConversationSubtitle => "Conversation",
-        L10nKey::PanelTurnAltScreenNow => {
-            "Nowhere to jump while a full-screen program owns this pane."
-        }
-        L10nKey::PanelTurnNoScrollback => {
-            "This turn was drawn on the alternate screen, so the scrollback never kept it."
-        }
         L10nKey::PanelProcessesSubtitle => "Processes",
         L10nKey::PanelPortsSubtitle => "Ports",
         L10nKey::PanelPortsUnsupported => "That machine's tty7-server is too old to list ports.",

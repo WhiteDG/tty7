@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::core::config::{Config, SidebarGrouping};
 use crate::core::group_key::{GroupKey, collapse_key};
 use crate::terminal::git_status::GitStatusCache;
-use crate::ui::app::{TITLE_BAR_HEIGHT, Tty7App};
+use crate::ui::app::{TITLE_BAR_HEIGHT, Tab, Tty7App};
 use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
@@ -54,11 +54,84 @@ mod row_metrics {
     pub(super) const META_GAP: f32 = 6.;
     /// The branch icon.
     pub(super) const BRANCH_ICON: f32 = 11.;
+    /// `pl_2` + `pr_1p5` on a group header.
+    pub(super) const HEADER_PAD: f32 = 8. + 6.;
+    /// The chevron a header opens with, and the asterisk that marks a custom
+    /// group: both `xsmall` icons, which resolve to 12px.
+    pub(super) const HEADER_ICON: f32 = 12.;
 
     /// What a row can spend on text, before the badge is taken out.
     pub(super) const fn text_budget(width: f32) -> f32 {
         width - BORDER - 2. * LIST_PAD - 2. * ROW_PAD - AVATAR - GAP
     }
+
+    /// What a group header can spend on its name and the branch beside it,
+    /// with the chevron and its gap already taken out. The pin and the folded
+    /// row count come off at the call site, which knows whether they are drawn.
+    pub(super) const fn header_budget(width: f32) -> f32 {
+        width - BORDER - 2. * LIST_PAD - HEADER_PAD - HEADER_ICON - META_GAP
+    }
+}
+
+/// The narrowest a group's heading is allowed to get: three or four capitals
+/// and an ellipsis, which is still a name and not a stub.
+const HEADER_NAME_FLOOR: f32 = 40.;
+
+/// The narrowest a row's title is allowed to get before the working directory
+/// beside it stops taking room, and the narrowest that path may be drawn at:
+/// below this it is an ellipsis and a slash, which names no directory.
+const ROW_TITLE_FLOOR: f32 = 48.;
+const ROW_CWD_FLOOR: f32 = 24.;
+
+/// How a group header divides its line between the heading and the branch its
+/// rows share. The branch takes what it wants up to half the line, and the
+/// heading keeps the rest — so a long branch can no longer crush the name
+/// (flex used to hand the overflow to them in proportion to what each asked
+/// for, which gave the longer string the smaller cut), and a long custom name
+/// cannot crush the branch in return. `git_want` is `None` for a header with
+/// no shared branch on it, which then owns the whole line.
+fn header_name_avail(avail: f32, git_want: Option<f32>) -> f32 {
+    match git_want {
+        Some(want) => (avail - want.min(avail * 0.5)).max(HEADER_NAME_FLOOR),
+        None => avail,
+    }
+}
+
+/// What a diff's counts occupy on a line, measured against real glyphs: the
+/// two numbers, the gap between them when both are drawn, and the gap that
+/// separates them from the branch. They never wrap and never shrink, so this
+/// is the width a branch has to be elided around — on a row and on the group
+/// header that lifts the branch off its rows alike.
+fn counts_width(
+    ts: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    status: &crate::terminal::git_status::GitStatus,
+) -> f32 {
+    let mut w = 0.;
+    if status.added > 0 {
+        w += measure_text(ts, font, size, &format!("+{}", status.added));
+    }
+    if status.removed > 0 {
+        w += measure_text(ts, font, size, &format!("−{}", status.removed));
+    }
+    if status.added > 0 && status.removed > 0 {
+        w += row_metrics::META_GAP;
+    }
+    if w > 0. {
+        w += row_metrics::META_GAP;
+    }
+    w
+}
+
+/// The branch a whole group shares, lifted off its rows and onto its header.
+struct SharedGit {
+    status: crate::terminal::git_status::GitStatus,
+    /// Where a click on the counts opens the diff overlay, if the setting
+    /// allows one.
+    click: Option<(crate::ui::host_ops::HostId, PathBuf)>,
+    /// Every row the group counts, drawn or folded away.
+    rows: Vec<usize>,
 }
 
 /// What a sidebar row rendered, next to what it had to leave out, so the
@@ -248,6 +321,26 @@ impl Tty7App {
             ..font.clone()
         };
         let rem = window.rem_size().as_f32();
+        // A group header draws at a fixed 11px, its name semibold and the
+        // branch beside it regular. Resolved here so the header measures
+        // itself in the face it is about to be painted in, the way a row does.
+        let header_size = 11.;
+        let header_font = gpui::Font {
+            weight: FontWeight::SEMIBOLD,
+            ..font.clone()
+        };
+        // The diff counts in their resting weight: green still means added,
+        // but twelve of them down a column no longer outshout the titles.
+        let added_ink = crate::ui::presets::resting_ink(
+            cx.theme().success,
+            cx.theme().muted_foreground,
+            cx.theme().sidebar,
+        );
+        let removed_ink = crate::ui::presets::resting_ink(
+            cx.theme().danger,
+            cx.theme().muted_foreground,
+            cx.theme().sidebar,
+        );
         let rendered = |ix: &usize| !visible_by_section[*ix].is_empty();
         // Every section that owns a key — a repo root or a custom name — draws
         // a header, and a header is what there is to grab, so these are the
@@ -328,6 +421,41 @@ impl Tty7App {
                 visible.len(),
                 pointer,
             );
+            // A group whose rows all sit on the same branch with the same
+            // diff says so once, on its header, instead of once per row.
+            // Four copies of `pr-818 +94 −26` under one heading describe the
+            // repo, not the tabs, and being the only coloured text in the
+            // column they were also the loudest thing in it. Read off every
+            // row the group counts rather than the ones it draws, so a folded
+            // group still names its branch.
+            //
+            // A lone row is no exception. Its branch describes the same repo
+            // the heading above it names, and leaving it down there gave a
+            // one-tab group a shape no other group in the column has: a
+            // bare heading over a two-line row. It lifts like any other.
+            let shared_git: Option<SharedGit> = section.name.as_ref().and_then(|_| {
+                let rows = &visible_by_section[group_ix];
+                if rows.is_empty() {
+                    return None;
+                }
+                // Only rows that *have* a status get a vote. A tab that was
+                // just opened has none until its shell reports a directory
+                // and the poll comes back; counting it as a disagreement
+                // pulled the branch off the header and grew a branch line
+                // under every sibling for the half second it took, then
+                // folded them all back — the column jumped twice for every
+                // ⌘T. Unknown is not different; it is not yet known.
+                let mut known = rows
+                    .iter()
+                    .filter_map(|&i| Some((i, self.tabs[i].git_status(Some(window), cx)?)));
+                let (first, status) = known.next()?;
+                let same = known.all(|(_, other)| other == status);
+                same.then(|| SharedGit {
+                    status,
+                    click: git_click(&self.tabs[first], window, cx),
+                    rows: rows.clone(),
+                })
+            });
             for (slot, i) in visible.into_iter().enumerate() {
                 let badge_pos = badge_pos[i];
                 let tab = &self.tabs[i];
@@ -336,14 +464,7 @@ impl Tty7App {
                 let agent = tab.agent(cx);
                 let agent_status = tab.agent_status(cx);
                 let agent_unread = tab.agent_unread_count(cx);
-                let git_cwd = diff_click_cwd(
-                    cx.global::<Config>(),
-                    tab.pane.focused_or_first(window, cx).and_then(|leaf| {
-                        let view = leaf.read(cx);
-                        let cwd = view.git_status_cwd()?.to_path_buf();
-                        Some((view.host_id(), cwd))
-                    }),
-                );
+                let git_cwd = git_click(tab, window, cx);
                 let badge_extra = if show_badges && badge_pos < 9 {
                     row_metrics::BADGE + row_metrics::GAP
                 } else {
@@ -362,29 +483,23 @@ impl Tty7App {
                 let title_size = 0.875 * rem;
                 let meta_size = 0.75 * rem;
                 let title_font = if is_active { &title_font_active } else { &font };
-                // Title: elide the *full* label against the row budget, so a
-                // wide sidebar shows the whole thing and a narrow one keeps
-                // whichever end identifies it — the tail for a path, both
-                // edges for anything else. A fixed segment cap
+                // Title: the *full* label, elided further down once the
+                // working directory beside it has said how much of the line
+                // it wants. A wide sidebar shows the whole thing and a narrow
+                // one keeps whichever end identifies it — the tail for a
+                // path, both edges for anything else. A fixed segment cap
                 // (`short_title`) would elide even when the row has room, so
                 // only the width may decide here.
                 //
                 // `full_title` is the unelided string the card can expand
                 // back to; `None` means the row is showing a placeholder that
                 // no card can improve on.
-                let (shown_title, full_title) =
+                let (title_text, full_title) =
                     if let Some(name) = tab.name.as_ref().filter(|n| !n.trim().is_empty()) {
                         // A renamed tab is elided like anything else — and so
                         // the card has to be able to spell the name back out.
                         let full = SharedString::from(name.trim().to_string());
-                        let shown = elide_label(
-                            &window.text_system(),
-                            title_font,
-                            title_size,
-                            &full,
-                            label_avail,
-                        );
-                        (shown, Some(full))
+                        (full.clone(), Some(full))
                     } else {
                         // The ladder the strip and the switcher climb, read
                         // here for the name and not for the shortening: this
@@ -414,19 +529,16 @@ impl Tty7App {
                             (placeholder, None)
                         } else {
                             let full = SharedString::from(raw);
-                            let shown = elide_label(
-                                &window.text_system(),
-                                title_font,
-                                title_size,
-                                &full,
-                                label_avail,
-                            );
-                            (shown, Some(full))
+                            (full.clone(), Some(full))
                         }
                     };
                 let mut branch_shown: Option<(SharedString, SharedString, u32, u32)> = None;
                 let mut cwd_shown: Option<(SharedString, SharedString)> = None;
-                let git_line = tab.git_status(Some(window), cx).map(|g| {
+                let git_line = match shared_git.is_some() {
+                    true => None,
+                    false => tab.git_status(Some(window), cx),
+                }
+                .map(|g| {
                     let mut line = h_flex()
                         .id(("sidebar-git", i))
                         .w_full()
@@ -441,36 +553,7 @@ impl Tty7App {
                                 .size(px(row_metrics::BRANCH_ICON))
                                 .text_color(cx.theme().muted_foreground),
                         );
-                    // The diff counts are measured against real glyphs so the
-                    // branch can be elided to exactly the space they leave;
-                    // the counts themselves never wrap or shrink. They render
-                    // as two children of a `gap_1p5` row, so the gap between
-                    // them is measured rather than a space that stands in for
-                    // it.
-                    let mut counts_w = 0.;
-                    if g.added > 0 {
-                        counts_w += measure_text(
-                            &window.text_system(),
-                            &font,
-                            meta_size,
-                            &format!("+{}", g.added),
-                        );
-                    }
-                    if g.removed > 0 {
-                        counts_w += measure_text(
-                            &window.text_system(),
-                            &font,
-                            meta_size,
-                            &format!("−{}", g.removed),
-                        );
-                    }
-                    if g.added > 0 && g.removed > 0 {
-                        counts_w += row_metrics::META_GAP;
-                    }
-                    if counts_w > 0. {
-                        // The gap between the branch and the counts.
-                        counts_w += row_metrics::META_GAP;
-                    }
+                    let counts_w = counts_width(&window.text_system(), &font, meta_size, &g);
                     // Branch: keep both ends (`window-…backdrop`) so its
                     // identifying tail survives a narrow sidebar.
                     let branch_avail =
@@ -521,16 +604,13 @@ impl Tty7App {
                                     )
                             });
                         if g.added > 0 {
-                            counts = counts.child(
-                                div()
-                                    .text_color(cx.theme().success)
-                                    .child(format!("+{}", g.added)),
-                            );
+                            counts = counts
+                                .child(div().text_color(added_ink).child(format!("+{}", g.added)));
                         }
                         if g.removed > 0 {
                             counts = counts.child(
                                 div()
-                                    .text_color(cx.theme().danger)
+                                    .text_color(removed_ink)
                                     .child(format!("−{}", g.removed)),
                             );
                         }
@@ -538,11 +618,17 @@ impl Tty7App {
                     }
                     line
                 });
-                // Outside a repo there is no branch line; the second line then
-                // carries the compressed cwd with its root marker, so a tab
-                // whose title is just a shell name still says where it lives.
-                if git_line.is_none() {
-                    cwd_shown = tab
+                // Outside a repo there is no branch line, and the working
+                // directory rides on the title's own line rather than growing
+                // a second one under it: a group of plain shells was a column
+                // of two-line rows describing paths that mostly agree, which
+                // is twice the height for a line of small grey text nobody
+                // was reading. A row keeps its second line only for a branch.
+                let cwd_full: Option<SharedString> = match git_line.is_none()
+                    && shared_git.is_none()
+                {
+                    false => None,
+                    true => tab
                         .pane
                         .focused_or_first(window, cx)
                         .and_then(|leaf| {
@@ -551,21 +637,55 @@ impl Tty7App {
                         })
                         .map(|(cwd, home)| {
                             let text = cwd.display().to_string();
-                            let full = SharedString::from(
-                                abbreviate_home(&text, home.as_deref()).into_owned(),
-                            );
-                            let shown = elide_path_keep_tail(
-                                &window.text_system(),
-                                &font,
-                                meta_size,
-                                &full,
-                                label_avail,
-                            );
-                            (shown, full)
+                            SharedString::from(abbreviate_home(&text, home.as_deref()).into_owned())
                         })
                         // The title already carries the whole path; a second
                         // copy adds noise, not information.
-                        .filter(|(shown, _)| shown.as_ref() != shown_title.as_ref());
+                        .filter(|full| full.as_ref() != title_text.as_ref()),
+                };
+                // The path takes what it needs up to half the line and the
+                // title keeps the rest — the same split a group header makes
+                // with the branch beside its heading. Flex would hand the
+                // overflow to the two of them in proportion to what each
+                // asked for, which cuts the longer string hardest.
+                let cwd_want = cwd_full.as_ref().map(|full| {
+                    row_metrics::META_GAP
+                        + measure_text(&window.text_system(), &font, meta_size, full)
+                });
+                let title_avail = match cwd_want {
+                    Some(want) => (label_avail - want.min(label_avail * 0.5)).max(ROW_TITLE_FLOOR),
+                    None => label_avail,
+                };
+                let shown_title = elide_label(
+                    &window.text_system(),
+                    title_font,
+                    title_size,
+                    &title_text,
+                    title_avail,
+                );
+                if let Some(full) = cwd_full {
+                    // Measured against what the title actually took, not what
+                    // it was allowed to: a short title hands the slack back
+                    // instead of leaving the path elided around a gap.
+                    let avail = (label_avail
+                        - measure_text(
+                            &window.text_system(),
+                            title_font,
+                            title_size,
+                            &shown_title,
+                        )
+                        - row_metrics::META_GAP)
+                        .max(0.);
+                    if avail >= ROW_CWD_FLOOR {
+                        let shown = elide_path_keep_tail(
+                            &window.text_system(),
+                            &font,
+                            meta_size,
+                            &full,
+                            avail,
+                        );
+                        cwd_shown = Some((shown, full));
+                    }
                 }
                 let rename_input = self
                     .renaming
@@ -582,8 +702,8 @@ impl Tty7App {
                 // Colors are captured by value so the tooltip builder (which
                 // borrows no app state) can style the card on its own.
                 let muted = cx.theme().muted_foreground;
-                let success = cx.theme().success;
-                let danger = cx.theme().danger;
+                let success = added_ink;
+                let danger = removed_ink;
 
                 let label_region = match rename_input {
                     Some(input) => div()
@@ -691,26 +811,34 @@ impl Tty7App {
                             })
                         })
                         .child(
-                            div()
+                            h_flex()
                                 .w_full()
-                                .truncate()
-                                .text_sm()
-                                .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(shown_title),
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
+                                        .child(shown_title),
+                                )
+                                // The path is elided to the room the title
+                                // left, so it may not shrink again here — a
+                                // second cut would come out of its tail, the
+                                // half that says which directory this is.
+                                .when_some(cwd_shown.map(|(cwd, _)| cwd), |line, cwd| {
+                                    line.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(cwd),
+                                    )
+                                }),
                         )
                         .children(git_line)
-                        .when_some(cwd_shown, |col, (cwd, _)| {
-                            col.child(
-                                h_flex()
-                                    .id(("sidebar-cwd", i))
-                                    .w_full()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground.opacity(0.8))
-                                    .child(div().flex_1().min_w_0().truncate().child(cwd)),
-                            )
-                        })
                         .into_any_element(),
                 };
 
@@ -943,7 +1071,48 @@ impl Tty7App {
                 .filter(|r| Some(&r.key) == group_key.as_ref())
                 .map(|r| r.input.clone());
             let header = section.name.clone().map(|name| {
-                let label: SharedString = name.to_uppercase().into();
+                // The header packs a heading and the branch its whole group
+                // shares onto one 11px line, and the branch is the unbounded
+                // half of it: beside `fix/rpc-proxy-and-error-classification`,
+                // `DELTA-NEUTRAL-BOT` came out as `DEL…`. Flex splits an
+                // overflow between the two in proportion to how much room each
+                // asked for, which is backwards here — the name is what the
+                // group *is*, the branch only what it happens to be sitting
+                // on. So both are measured against the header's real chrome:
+                // the branch gets what it needs up to half the line, the name
+                // keeps the rest, and each is elided into its share the way a
+                // row already elides its own.
+                let ts = window.text_system();
+                let mut avail = row_metrics::header_budget(width);
+                if pinned {
+                    avail -= row_metrics::HEADER_ICON + row_metrics::META_GAP;
+                }
+                let count_label = row_count.to_string();
+                if folded {
+                    avail -=
+                        measure_text(&ts, &font, header_size, &count_label) + row_metrics::META_GAP;
+                }
+                let avail = avail.max(HEADER_NAME_FLOOR);
+                // What the shared branch would take if nothing were in its
+                // way: the icon, the gap after it, the branch itself, the
+                // counts, and the two gaps the spacer between the name and
+                // the branch sits in.
+                let git_want = shared_git.as_ref().map(|shared| {
+                    let counts = counts_width(&ts, &font, header_size, &shared.status);
+                    row_metrics::BRANCH_ICON
+                        + 3. * row_metrics::META_GAP
+                        + measure_text(&ts, &font, header_size, &shared.status.branch)
+                        + counts
+                });
+                let name_avail = header_name_avail(avail, git_want);
+                let label = elide_label(
+                    &ts,
+                    &header_font,
+                    header_size,
+                    &name.to_uppercase(),
+                    name_avail,
+                );
+                let name_w = measure_text(&ts, &header_font, header_size, &label);
                 let bar = h_flex()
                     .id(("sidebar-group", group_ix))
                     .w_full()
@@ -951,7 +1120,10 @@ impl Tty7App {
                     .gap_1p5()
                     .pl_2()
                     .pr_1p5()
-                    .pt_1p5()
+                    // More above a heading than below it: the 12px is the
+                    // generous interval in a column whose rows sit 2px apart,
+                    // and it is what makes a group a group without a box.
+                    .pt(px(12.))
                     .pb_0p5()
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
@@ -1007,20 +1179,105 @@ impl Tty7App {
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .child(Input::new(&input).appearance(false))
                             .into_any_element(),
+                        // Elided above, so the truncation here is only the
+                        // backstop for a face that measures wider than it
+                        // paints; the name no longer gives room to the branch.
                         None => div()
-                            .flex_shrink(1.)
+                            .flex_shrink_0()
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(label)
                             .into_any_element(),
                     })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_color(cx.theme().muted_foreground.opacity(0.7))
-                            .child(row_count.to_string()),
-                    );
+                    .when_some(shared_git, |bar, shared| {
+                        let SharedGit {
+                            status,
+                            click,
+                            rows,
+                        } = shared;
+                        let branch_avail = (avail
+                            - name_w
+                            - row_metrics::BRANCH_ICON
+                            - 3. * row_metrics::META_GAP
+                            - counts_width(&ts, &font, header_size, &status))
+                        .max(0.);
+                        // Both ends, like a row's: the tail is what tells two
+                        // branches off the same prefix apart.
+                        let branch =
+                            elide_keep_edges(&ts, &font, header_size, &status.branch, branch_avail);
+                        let mut line = h_flex()
+                            .id(("sidebar-group-git", group_ix))
+                            .flex_shrink(1.)
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                gpui::svg()
+                                    .path("icons/git-branch.svg")
+                                    .flex_shrink_0()
+                                    .size(px(row_metrics::BRANCH_ICON))
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(div().min_w_0().truncate().child(branch));
+                        if status.added > 0 || status.removed > 0 {
+                            let mut counts = h_flex()
+                                .id(("sidebar-group-diff", group_ix))
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap_1p5()
+                                .when_some(click, |counts, (host, cwd)| {
+                                    counts
+                                        .cursor_pointer()
+                                        .hover(|s| s.underline())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, _: &MouseDownEvent, window, cx| {
+                                                    cx.stop_propagation();
+                                                    // The overlay opens over the
+                                                    // active tab; make sure that
+                                                    // is one of this group's,
+                                                    // the same way a row's counts
+                                                    // activate their row first.
+                                                    if !rows.contains(&this.active)
+                                                        && let Some(&first) = rows.first()
+                                                    {
+                                                        this.activate(first, window, cx);
+                                                    }
+                                                    this.toggle_diff_overlay(
+                                                        host,
+                                                        cwd.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        )
+                                });
+                            if status.added > 0 {
+                                counts = counts.child(
+                                    div()
+                                        .text_color(added_ink)
+                                        .child(format!("+{}", status.added)),
+                                );
+                            }
+                            if status.removed > 0 {
+                                counts = counts.child(
+                                    div()
+                                        .text_color(removed_ink)
+                                        .child(format!("−{}", status.removed)),
+                                );
+                            }
+                            line = line.child(counts);
+                        }
+                        bar.child(div().flex_1()).child(line)
+                    })
+                    // The count is redundant while the rows are on screen; it
+                    // is what a shut group has instead of them.
+                    .when(folded, |bar| {
+                        bar.child(div().flex_shrink_0().child(count_label))
+                    });
                 // Renaming is offered on a menu rather than a double click:
                 // the first click of a double would fold the group, so the
                 // name would be edited on a box that just shut. A repo group
@@ -1901,6 +2158,23 @@ fn group_names(roots: &[&PathBuf]) -> Vec<String> {
     }
 }
 
+/// Where a click on a tab's diff counts opens the overlay: the focused pane's
+/// repo, when the setting allows a preview at all.
+fn git_click(
+    tab: &Tab,
+    window: &Window,
+    cx: &gpui::App,
+) -> Option<(crate::ui::host_ops::HostId, PathBuf)> {
+    diff_click_cwd(
+        cx.global::<Config>(),
+        tab.pane.focused_or_first(window, cx).and_then(|leaf| {
+            let view = leaf.read(cx);
+            let cwd = view.git_status_cwd()?.to_path_buf();
+            Some((view.host_id(), cwd))
+        }),
+    )
+}
+
 /// Whether a `+N −M` is a button, and what it opens if it is.
 ///
 /// One function because the setting is one setting: the sidebar's counts and
@@ -2647,5 +2921,29 @@ mod tests {
         let (short, long) = (p("/app"), p("/x/app"));
         let names = group_names(&[&short, &long]);
         assert_eq!(names, vec!["app", "x/app"]);
+    }
+
+    /// A header with a long branch on it used to leave the heading as `DEL…`
+    /// while the branch kept thirty characters. The name is the group; the
+    /// branch is what it happens to be sitting on, and it may take at most
+    /// half the line before the heading starts paying for it.
+    #[test]
+    fn a_long_branch_takes_half_the_header_and_no_more() {
+        let avail = 200.;
+        assert_eq!(header_name_avail(avail, Some(400.)), 100.);
+        assert_eq!(header_name_avail(avail, Some(100.)), 100.);
+    }
+
+    #[test]
+    fn a_short_branch_leaves_the_heading_the_rest_of_the_header() {
+        assert_eq!(header_name_avail(200., Some(40.)), 160.);
+        assert_eq!(header_name_avail(200., None), 200.);
+    }
+
+    /// Even a header narrow enough that the branch's half swallows the line
+    /// keeps a readable stub of the name, rather than eliding it away.
+    #[test]
+    fn the_heading_keeps_a_floor_on_a_narrow_sidebar() {
+        assert_eq!(header_name_avail(60., Some(400.)), HEADER_NAME_FLOOR);
     }
 }

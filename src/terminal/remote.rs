@@ -12,7 +12,6 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
-use crate::terminal::agent_marks::{AgentTurnScanner, AgentTurns, TurnCut};
 use crate::terminal::parked_cursor::{CursorCut, ParkedCursorRepair, ParkedCursorScanner};
 
 use std::collections::VecDeque;
@@ -65,16 +64,6 @@ struct ShellState {
     cycle: u64,
 }
 
-/// A point in a batch of pty output where the emulator has to stop, because
-/// something wants to read the state the sequence there left behind — the cell
-/// a repaint hid the cursor on, or the row an agent turn began at. Both are
-/// positions, and a position is only knowable by parsing up to it and no
-/// further.
-enum Cut {
-    Cursor(CursorCut),
-    Turn(TurnCut),
-}
-
 struct ReaderSignals {
     cwd: Arc<Mutex<Option<PathBuf>>>,
     shell: Arc<Mutex<ShellState>>,
@@ -94,10 +83,6 @@ struct ReaderSignals {
     images: crate::terminal::images::ImageStore,
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     clipboard_write_busy: Arc<AtomicBool>,
-    /// Where each agent turn started, anchored to the grid the same way — see
-    /// [`crate::terminal::agent_marks`]. The daemon reads the same events for
-    /// the status dot, but only the client holds the rows they point into.
-    turns: AgentTurns,
     /// Whether this pane's pty is one a conhost renders into, and so whether
     /// the reader puts back the cursor a repaint parked. Decided per pane from
     /// its [`PtySource`], and shared rather than copied because the reader can
@@ -594,9 +579,6 @@ pub struct RemoteTerminal {
     images: crate::terminal::images::ImageStore,
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
     clipboard_write_busy: Arc<AtomicBool>,
-    /// The conversation's shape, for the outline in the Info panel: one entry
-    /// per agent turn, anchored to the scrollback row it began on.
-    turns: AgentTurns,
     route: PaneRoute,
     proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
@@ -895,10 +877,6 @@ impl RemoteTerminal {
         // Drop them; the daemon does not replay out-of-band image frames, so a
         // browser redraws on its next transmit (see issue #213's reattach note).
         self.images.clear();
-        // Turn anchors point into the same grid. The replay that follows
-        // carries the agent's events with it, so the outline rebuilds itself
-        // from the bytes rather than being kept across the reset.
-        self.turns.clear();
 
         let quit = Arc::new(AtomicBool::new(false));
         let reader = Self::spawn_reader(
@@ -923,7 +901,6 @@ impl RemoteTerminal {
                 images: self.images.clone(),
                 clipboard_writes: self.clipboard_writes.clone(),
                 clipboard_write_busy: self.clipboard_write_busy.clone(),
-                turns: self.turns.clone(),
                 // Deliberately the pane's existing answer rather than one
                 // rebuilt from `route`: the pty on the far side is the same pty
                 // it was before the link dropped, and only this value still
@@ -990,7 +967,6 @@ impl RemoteTerminal {
         let images = crate::terminal::images::ImageStore::new();
         let clipboard_writes = Arc::new(Mutex::new(VecDeque::new()));
         let clipboard_write_busy = Arc::new(AtomicBool::new(false));
-        let turns = AgentTurns::new();
 
         let reader_quit = Arc::new(AtomicBool::new(false));
         let repair_cursor = Arc::new(AtomicBool::new(pty.repairs_parked_cursor()));
@@ -1016,7 +992,6 @@ impl RemoteTerminal {
                 images: images.clone(),
                 clipboard_writes: clipboard_writes.clone(),
                 clipboard_write_busy: clipboard_write_busy.clone(),
-                turns: turns.clone(),
                 repair_cursor: repair_cursor.clone(),
             },
         );
@@ -1053,7 +1028,6 @@ impl RemoteTerminal {
             images,
             clipboard_writes,
             clipboard_write_busy,
-            turns,
             route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
@@ -1128,7 +1102,6 @@ impl RemoteTerminal {
                     images,
                     clipboard_writes,
                     clipboard_write_busy,
-                    turns,
                     repair_cursor,
                 } = signals;
                 crate::core::threads::promote_to_user_interactive();
@@ -1139,7 +1112,6 @@ impl RemoteTerminal {
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
                 let mut cursor_scan = ParkedCursorScanner::new();
                 let mut parked_cursor = ParkedCursorRepair::default();
-                let mut turn_scan = AgentTurnScanner::new();
                 let mut pending: Vec<u8> = buffered;
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1190,25 +1162,14 @@ impl RemoteTerminal {
                     macro_rules! flush_batch {
                         () => {
                             if !out_batch.is_empty() {
-                                // Each scanner reports an offset one past the
-                                // sequence it matched, in ascending order, so the
-                                // batch splits at each of them: advance the
+                                // The scanner reports an offset one past each
+                                // sequence it matched, in ascending order, so
+                                // the batch splits at each of them: advance the
                                 // emulator to the cut, act on the state that
                                 // sequence left behind, carry on.
-                                let mut cuts: Vec<(usize, Cut)> = Vec::new();
+                                let mut cuts: Vec<(usize, CursorCut)> = Vec::new();
                                 if repair_cursor.load(Ordering::Relaxed) {
-                                    cursor_scan
-                                        .feed(&out_batch, |off, c| cuts.push((off, Cut::Cursor(c))));
-                                }
-                                // Two ascending runs concatenated are not one
-                                // ascending run, and a cut out of order would
-                                // advance the emulator backwards — but only a
-                                // batch carrying both kinds pays for the sort,
-                                // and agent events are a handful per turn.
-                                let cursor_cuts = cuts.len();
-                                turn_scan.feed(&out_batch, |off, c| cuts.push((off, Cut::Turn(c))));
-                                if cursor_cuts > 0 && cuts.len() > cursor_cuts {
-                                    cuts.sort_by_key(|(off, _)| *off);
+                                    cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
                                 }
                                 {
                                     let t0 = trace.then(std::time::Instant::now);
@@ -1224,10 +1185,7 @@ impl RemoteTerminal {
                                         for (off, cut) in cuts {
                                             processor.advance(&mut *term, &out_batch[at..off]);
                                             at = off;
-                                            match cut {
-                                                Cut::Cursor(c) => parked_cursor.apply(&mut term, c),
-                                                Cut::Turn(t) => turns.apply(&term, t),
-                                            }
+                                            parked_cursor.apply(&mut term, cut);
                                         }
                                         processor.advance(&mut *term, &out_batch[at..]);
                                     }
@@ -1346,27 +1304,13 @@ impl RemoteTerminal {
                                 flush_batch!();
                                 cursor_scan.reset();
                                 parked_cursor.reset();
-                                turn_scan.reset();
                                 proxy.replaying.store(true, Ordering::Relaxed);
-                                // A replayed ring is the pane's own history
-                                // coming back, agent events and all, so cut it
-                                // the same way live output is cut: the outline
-                                // of a conversation is rebuilt by reattaching
-                                // to the pane, not lost with the old client.
-                                let mut turn_cuts: Vec<(usize, TurnCut)> = Vec::new();
-                                turn_scan.feed(&bytes, |off, c| turn_cuts.push((off, c)));
                                 {
                                     let mut term = term.lock();
                                     if quit.load(Ordering::SeqCst) {
                                         return;
                                     }
-                                    let mut at = 0usize;
-                                    for (off, cut) in turn_cuts {
-                                        processor.advance(&mut *term, &bytes[at..off]);
-                                        at = off;
-                                        turns.apply(&term, cut);
-                                    }
-                                    processor.advance(&mut *term, &bytes[at..]);
+                                    processor.advance(&mut *term, &bytes);
                                     if processor.sync_timeout().sync_timeout().is_some() {
                                         processor.stop_sync(&mut *term);
                                     }
@@ -1786,12 +1730,6 @@ impl RemoteTerminal {
 
     pub fn agent_session(&self) -> Option<AgentSessionState> {
         self.agent_session.lock().ok().and_then(|g| g.clone())
-    }
-
-    /// This pane's agent turns, anchored to the scrollback. Same cheap handle
-    /// clone as [`images`](Self::images), shared with the reader thread.
-    pub fn agent_turns(&self) -> AgentTurns {
-        self.turns.clone()
     }
 
     pub fn zle_reading(&self) -> bool {
@@ -2478,35 +2416,41 @@ pub(crate) fn notify_desktop(title: Option<&str>, body: &str) {
 /// `u64` here is what lets a caller hand over a `pane_id` — a different number,
 /// assigned by the daemon — and get a notification that reveals nothing.
 ///
-/// Every other case (no pane, unsupported platform, no room left to wait for a
-/// click) falls back to the plain `notify-rust` path below, which is why
+/// macOS always goes through `macos_notify`, clickable or not. Elsewhere, every
+/// other case (no pane, unsupported platform, Windows toast queue full) falls
+/// back to the plain `notify-rust` path below, which is why
 /// `try_clickable_notification` reports whether it took the job.
 pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Option<EntityId>) {
     let summary = sanitize_notification_text(title.unwrap_or("tty7"), NOTIFY_TITLE_MAX);
     let body = sanitize_notification_text(body, NOTIFY_BODY_MAX);
 
-    if let Some(pane) = pane
-        && try_clickable_notification(&summary, &body, pane.as_u64())
+    #[cfg(target_os = "macos")]
     {
-        return;
+        macos_notify::deliver(summary, body, pane.map(|p| p.as_u64()));
     }
-
-    std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        ensure_notification_app();
-        let mut notif = notify_rust::Notification::new();
-        notif.summary(&summary).body(&body);
-        // Without our own AUMID, the Windows backend falls back to
-        // PowerShell's — icon and name included. Only set ours once the shell
-        // has indexed a shortcut carrying it: for an AUMID it does not know,
-        // `show()` reports success and drops the toast, so the ugly fallback
-        // beats the branded one every time we are not sure.
-        #[cfg(target_os = "windows")]
-        if let Some(app_id) = crate::core::aumid::toast_app_id() {
-            notif.app_id(app_id);
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(pane) = pane
+            && try_clickable_notification(&summary, &body, pane.as_u64())
+        {
+            return;
         }
-        let _ = notif.show();
-    });
+
+        std::thread::spawn(move || {
+            let mut notif = notify_rust::Notification::new();
+            notif.summary(&summary).body(&body);
+            // Without our own AUMID, the Windows backend falls back to
+            // PowerShell's — icon and name included. Only set ours once the
+            // shell has indexed a shortcut carrying it: for an AUMID it does
+            // not know, `show()` reports success and drops the toast, so the
+            // ugly fallback beats the branded one every time we are not sure.
+            #[cfg(target_os = "windows")]
+            if let Some(app_id) = crate::core::aumid::toast_app_id() {
+                notif.app_id(app_id);
+            }
+            let _ = notif.show();
+        });
+    }
 }
 
 /// Longest title / body we hand to a notification backend.
@@ -2537,58 +2481,152 @@ fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// Deliver a click-to-reveal notification, reporting whether it was taken.
-/// `false` means the caller should fall back to the plain notification path.
-#[cfg(all(target_os = "macos", not(test)))]
-fn try_clickable_notification(title: &str, body: &str, leaf_id: u64) -> bool {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+/// What a click on a macOS notification has to carry back: the pane to reveal.
+///
+/// It rides in the notification's `identifier`, which is the one field the
+/// center hands back verbatim on activation without a dictionary round trip.
+/// Shape: `tty7-pane-<pid>-<leaf>-<seq>`.
+///
+/// The pid is what makes a stale identifier fail closed. Notifications outlive
+/// the process that sent them, and the center hands a click on one of those to
+/// whatever process now owns the bundle id — a relaunched tty7, or a second
+/// instance running alongside. A leaf id is a gpui entity id, which a fresh
+/// process hands out again in the same order, so without the pid that click
+/// would reveal an unrelated pane. The sequence number keeps two notifications
+/// for the same pane apart — the center treats a repeated identifier as
+/// "replace the earlier one".
+#[cfg(any(target_os = "macos", test))]
+const NOTIFICATION_ID_PREFIX: &str = "tty7-pane-";
 
-    // `mac-notification-sys` blocks the calling thread until the user acts on
-    // the notification, and its wait has no timeout: a banner nobody touches —
-    // the common case, since unclicked ones just pile up in Notification
-    // Center — parks its thread for the rest of the session. Cap how many can
-    // be outstanding and let the rest through as fire-and-forget, so a chatty
-    // agent cannot turn a session's notifications into a thread leak.
-    const MAX_PENDING_CLICKS: usize = 8;
-    static PENDING: AtomicUsize = AtomicUsize::new(0);
-
-    if PENDING
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_PENDING_CLICKS).then_some(n + 1)
-        })
-        .is_err()
-    {
-        return false;
-    }
-
-    let (title, body) = (title.to_string(), body.to_string());
-    std::thread::spawn(move || {
-        show_macos_toast(&title, &body, leaf_id);
-        PENDING.fetch_sub(1, Ordering::AcqRel);
-    });
-    true
+#[cfg(any(target_os = "macos", test))]
+fn notification_identifier(leaf_id: u64) -> String {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    format!("{NOTIFICATION_ID_PREFIX}{pid}-{leaf_id}-{seq}")
 }
 
-#[cfg(all(target_os = "macos", not(test)))]
-fn show_macos_toast(title: &str, body: &str, leaf_id: u64) {
-    use mac_notification_sys::{Notification, NotificationResponse};
+#[cfg(any(target_os = "macos", test))]
+fn leaf_id_in_identifier(identifier: &str) -> Option<u64> {
+    let rest = identifier.strip_prefix(NOTIFICATION_ID_PREFIX)?;
+    let (pid, rest) = rest.split_once('-')?;
+    if pid.parse::<u32>().ok()? != std::process::id() {
+        return None;
+    }
+    let (leaf_id, _seq) = rest.split_once('-')?;
+    leaf_id.parse().ok()
+}
 
-    // `send` sets the delivering application on first use and keeps it under a
-    // `Once`, so whoever notifies first decides the name and icon for the whole
-    // session. Without this the default wins — `com.apple.Finder` — and every
-    // later notification, this path or `notify-rust`'s, claims to be Finder.
-    ensure_notification_app();
+/// macOS notifications, straight to `NSUserNotificationCenter`.
+///
+/// This used to go through `mac-notification-sys` with `wait_for_click`, so a
+/// click could reveal the pane. The way that crate notices a click is to park
+/// the sending thread and, for every notification outstanding, add a repeating
+/// 0.5 s timer to the *main* run loop that calls `deliveredNotifications` — a
+/// synchronous XPC round trip — to see whether the banner is still there. A
+/// banner nobody clicks stays in Notification Center, so its timer never goes
+/// away. Sampled with nine outstanding: a fifth of the UI thread inside that
+/// XPC, every window juddering, and each agent turn adding one more timer.
+///
+/// Here the click arrives through the center's delegate, which is what the
+/// API is for: no parked thread, no timer, nothing on the main thread until
+/// the user actually clicks. The pane rides in the notification's identifier.
+///
+/// Nothing else may touch the center on this platform. `mac-notification-sys`
+/// installs a delegate of its own the first time it sends, the last
+/// `setDelegate:` wins, and `notify-rust` is that crate on macOS — so its
+/// `show` is never called here, only its `set_application`, which does not
+/// install one (that is what names a bare `cargo run` binary to the center).
+#[cfg(target_os = "macos")]
+#[allow(
+    deprecated,
+    reason = "UNUserNotificationCenter needs a signed, entitled bundle; NSUserNotification is what a bare binary can use"
+)]
+mod macos_notify {
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::runtime::ProtocolObject;
+    use objc2::{AnyThread, define_class, msg_send};
+    use objc2_foundation::{
+        NSObject, NSObjectProtocol, NSString, NSUserNotification, NSUserNotificationCenter,
+        NSUserNotificationCenterDelegate,
+    };
 
-    let response = Notification::new()
-        .title(title)
-        .message(body)
-        .wait_for_click(true)
-        .send();
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; `Delegate` has no
+        // ivars and no `Drop`.
+        #[unsafe(super = NSObject)]
+        #[name = "Tty7NotificationDelegate"]
+        struct Delegate;
 
-    match response {
-        Ok(NotificationResponse::Click) => reveal_pane(leaf_id),
-        Ok(_) => {}
-        Err(e) => log::warn!("failed to show macOS notification: {e}"),
+        // SAFETY: `NSObjectProtocol` has no safety requirements.
+        unsafe impl NSObjectProtocol for Delegate {}
+
+        // SAFETY: `NSUserNotificationCenterDelegate` has no safety requirements.
+        unsafe impl NSUserNotificationCenterDelegate for Delegate {
+            /// Runs on the main thread, when the user clicks the banner or the
+            /// entry in Notification Center. A channel push, then the clicked
+            /// entry is dropped from the center — a one-way message, unlike the
+            /// `deliveredNotifications` round trip this module exists to avoid.
+            #[unsafe(method(userNotificationCenter:didActivateNotification:))]
+            fn did_activate(
+                &self,
+                center: &NSUserNotificationCenter,
+                notification: &NSUserNotification,
+            ) {
+                if let Some(leaf_id) = notification
+                    .identifier()
+                    .and_then(|id| super::leaf_id_in_identifier(&id.to_string()))
+                {
+                    super::reveal_pane(leaf_id);
+                }
+                center.removeDeliveredNotification(notification);
+            }
+        }
+    );
+
+    fn install_delegate() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Name the delivering application to the center before it is first
+            // touched: the center drops requests from a process with no bundle
+            // identity, which is what a bare `cargo run` binary is. This
+            // swizzles `-[NSBundle bundleIdentifier]` for the main bundle to
+            // `com.github.tty7` when LaunchServices knows that id (a bundled
+            // tty7.app, or a machine that has one installed); when it does not,
+            // the swizzle's own default, `com.apple.Terminal`, is what the
+            // center sees. It can only be called once per process, so there is
+            // no second chance to pass a different name.
+            let _ = notify_rust::set_application("com.github.tty7");
+            // SAFETY: `NSObject`'s `init` takes nothing and returns the object.
+            let delegate: Retained<Delegate> = unsafe { msg_send![Delegate::alloc(), init] };
+            let center = NSUserNotificationCenter::defaultUserNotificationCenter();
+            // SAFETY: `delegate` is a `Delegate`, which conforms to the protocol.
+            unsafe { center.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+            // The center holds its delegate unretained. Ours lives as long as
+            // the process, so it is simply never released.
+            std::mem::forget(delegate);
+        });
+    }
+
+    /// Hands the notification to the center and returns. `deliverNotification:`
+    /// is an XPC message, so it goes out on a short-lived thread rather than
+    /// from wherever the OSC sequence was parsed — never the UI thread.
+    pub(super) fn deliver(title: String, body: String, leaf_id: Option<u64>) {
+        std::thread::spawn(move || {
+            autoreleasepool(|_| {
+                install_delegate();
+                let notification = NSUserNotification::new();
+                notification.setTitle(Some(&NSString::from_str(&title)));
+                notification.setInformativeText(Some(&NSString::from_str(&body)));
+                if let Some(leaf_id) = leaf_id {
+                    let id = super::notification_identifier(leaf_id);
+                    notification.setIdentifier(Some(&NSString::from_str(&id)));
+                }
+                NSUserNotificationCenter::defaultUserNotificationCenter()
+                    .deliverNotification(&notification);
+            });
+        });
     }
 }
 
@@ -2738,17 +2776,14 @@ fn show_windows_toast(
 
 /// Ask the tray dispatch loop to bring `leaf_id` to the front. Runs on whatever
 /// thread the platform hands the activation to, so it only touches the channel.
-#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
+#[cfg(any(target_os = "macos", all(target_os = "windows", not(test))))]
 fn reveal_pane(leaf_id: u64) {
     if let Some(tx) = crate::ui::tray::sender() {
         let _ = tx.try_send(crate::ui::tray::TrayAction::RevealPane { leaf_id });
     }
 }
 
-#[cfg(not(any(
-    all(target_os = "macos", not(test)),
-    all(target_os = "windows", not(test))
-)))]
+#[cfg(not(any(target_os = "macos", all(target_os = "windows", not(test)))))]
 fn try_clickable_notification(_title: &str, _body: &str, _leaf_id: u64) -> bool {
     // Linux notifications go through notify-rust; click-to-reveal would need a
     // D-Bus action listener of its own.
@@ -2767,6 +2802,45 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    #[test]
+    fn a_notification_identifier_carries_its_pane_back_out() {
+        let id = notification_identifier(42);
+        assert_eq!(leaf_id_in_identifier(&id), Some(42));
+    }
+
+    #[test]
+    fn two_notifications_for_one_pane_do_not_replace_each_other() {
+        // The center replaces a delivered notification whose identifier repeats.
+        assert_ne!(notification_identifier(7), notification_identifier(7));
+    }
+
+    #[test]
+    fn a_foreign_identifier_reveals_nothing() {
+        let pid = std::process::id();
+        for id in [
+            String::new(),
+            "tty7-pane-".into(),
+            "tty7-pane-x-1".into(),
+            "tty7-pane-42".into(),
+            "other-42-1".into(),
+            format!("tty7-pane-{pid}"),
+            format!("tty7-pane-{pid}-42"),
+            format!("tty7-pane-{pid}-x-1"),
+        ] {
+            assert_eq!(leaf_id_in_identifier(&id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn a_notification_from_another_process_reveals_nothing() {
+        // Notifications outlive the process that sent them, and gpui hands out
+        // the same entity ids again in a fresh process. A stale click must not
+        // land on whatever pane holds that id now.
+        let other_pid = std::process::id().wrapping_add(1);
+        let stale = format!("{NOTIFICATION_ID_PREFIX}{other_pid}-42-0");
+        assert_eq!(leaf_id_in_identifier(&stale), None);
+    }
 
     #[test]
     fn sanitizing_drops_control_bytes_but_keeps_line_breaks() {
@@ -2792,17 +2866,6 @@ mod notification_tests {
             "a &amp; b &lt; c &gt; &quot;d&quot; &apos;e&apos;"
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_notification_app() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if notify_rust::set_application("com.github.tty7").is_err() {
-            let _ = notify_rust::set_application("com.apple.Terminal");
-        }
-    });
 }
 
 struct OscNotifyScanner {
@@ -3250,6 +3313,90 @@ mod replay_tests {
             "the replay the handshake swallowed never reached the grid"
         );
         drop(daemon);
+    }
+
+    /// Issue #711: what a prompt report costs a replay that ended inside the
+    /// alternate screen.
+    ///
+    /// A re-attach replays the pane's ring and then the pane's *state*, and
+    /// the state ends with the shell's prompt status. `active && at_prompt`
+    /// makes the reader scrub the TUI modes it finds in the grid, alternate
+    /// screen first — see `prompt_report_scrubs_stale_tui_modes`, which is the
+    /// case that is meant to reach it: a program that died without its
+    /// `?1049l` leaves the grid stranded on a screen nothing owns, and the
+    /// shell's next prompt is what proves it stale.
+    ///
+    /// On a replay the alternate screen the scrub finds is the one the ring
+    /// just rebuilt, and `?1049l` does not undo it — it swaps it away. The
+    /// grid is left holding the primary screen underneath: the banner and the
+    /// command line the pane was born with, which is exactly what #711's
+    /// reporter photographed. The client cannot tell the two apart from the
+    /// frame, so the daemon decides — it declines to claim a prompt while a
+    /// foreground command owns the pty (`daemon::pane::replayed_at_prompt`).
+    /// Both halves of that contract are pinned here, from the side that pays
+    /// for it.
+    #[test]
+    fn a_replayed_prompt_report_decides_whether_the_alternate_screen_survives() {
+        crate::core::config::pin_test_config_dir();
+
+        // A re-attach, as the daemon writes one: the shell's banner on the
+        // primary screen, the agent's alternate screen drawn over it, then the
+        // pane's stored state. The trailing `Output` is a barrier — frames are
+        // applied in order, so a grid that holds it has already been through
+        // the prompt report, and neither half can pass on a race.
+        let replayed_pane = |at_prompt: bool| {
+            let (client_side, mut daemon) = socket_pair();
+            let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
+            DaemonMsg::Size(ws(80, 24)).encode(&mut daemon).unwrap();
+            DaemonMsg::Snapshot(
+                b"BIRTH-BANNER\r\nMac:Accounts joe$ claude --resume --fork-session\r\n".to_vec(),
+            )
+            .encode(&mut daemon)
+            .unwrap();
+            DaemonMsg::Snapshot(b"\x1b[?1049h\x1b[2J\x1b[HAGENT-SCREEN\r\n".to_vec())
+                .encode(&mut daemon)
+                .unwrap();
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt,
+                last_exit: Some(0),
+            }
+            .encode(&mut daemon)
+            .unwrap();
+            DaemonMsg::Output(b"REPORT-APPLIED\r\n".to_vec())
+                .encode(&mut daemon)
+                .unwrap();
+            let text = settled(&term, &["REPORT-APPLIED"]);
+            drop(daemon);
+            text
+        };
+
+        // A program owns the pane, so the replay reports no prompt and the
+        // screen the ring rebuilt is the screen the pane shows.
+        let text = replayed_pane(false);
+        assert!(
+            text.contains("REPORT-APPLIED"),
+            "the barrier never arrived, so nothing below is tested; grid held:\n{text}"
+        );
+        assert!(
+            text.contains("AGENT-SCREEN"),
+            "a replay that does not claim a prompt must leave the alternate screen it \
+             rebuilt alone; grid held:\n{text}"
+        );
+
+        // The same replay under the stale claim: the scrub swaps the agent's
+        // screen away, and what the pane comes back showing is the banner it
+        // was born with. That is #711.
+        let text = replayed_pane(true);
+        assert!(
+            !text.contains("AGENT-SCREEN"),
+            "a prompt report still has to scrub a stranded alternate screen, or the daemon's \
+             gate is load-bearing for nothing; grid held:\n{text}"
+        );
+        assert!(
+            text.contains("BIRTH-BANNER"),
+            "what the scrub leaves is the primary screen underneath; grid held:\n{text}"
+        );
     }
 
     // ---- The switch, end to end, with a real daemon pane ----------------
@@ -5660,75 +5807,6 @@ mod tests {
             .unwrap();
         daemon_side.flush().unwrap();
         assert!(poll(""), "an unnamed command start does not inherit a name");
-    }
-
-    /// A `prompt-submit` the hook wrote into the middle of a batch of output.
-    fn prompt_event(prompt: &str) -> Vec<u8> {
-        format!(
-            "\x1b]777;notify;{};{{\"v\":1,\"agent\":\"claude\",\
-             \"event\":\"prompt-submit\",\"prompt\":\"{prompt}\"}}\x07",
-            crate::core::cli_agent::AGENT_EVENT_SENTINEL
-        )
-        .into_bytes()
-    }
-
-    fn poll_turns(term: &RemoteTerminal) -> Vec<crate::terminal::agent_marks::AgentTurn> {
-        for _ in 0..200 {
-            let turns = term.agent_turns().list();
-            if !turns.is_empty() {
-                return turns;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        Vec::new()
-    }
-
-    #[test]
-    fn an_agent_turn_anchors_where_its_event_sits_in_the_batch() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // One frame, so one batch: the event's row is only reachable by
-        // splitting the batch at it. Reading the cursor after the whole batch
-        // has been parsed would answer 5.
-        let mut out = b"a\r\nb\r\n".to_vec();
-        out.extend_from_slice(&prompt_event("restore the outline"));
-        out.extend_from_slice(b"c\r\nd\r\ne\r\n");
-        DaemonMsg::Output(out).encode(&mut daemon_side).unwrap();
-        daemon_side.flush().unwrap();
-
-        let turns = poll_turns(&term);
-        assert_eq!(turns.len(), 1, "one prompt, one turn");
-        assert_eq!(
-            turns[0].row,
-            Some(2),
-            "the anchor is the row the event arrived on, not the end of the batch"
-        );
-        assert_eq!(turns[0].text, "restore the outline");
-        assert!(!turns[0].done, "no stop yet");
-    }
-
-    #[test]
-    fn a_replayed_ring_brings_the_conversation_back_with_it() {
-        crate::core::config::pin_test_config_dir();
-        let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
-        let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
-
-        // What reattaching to a pane looks like: its history arrives as a
-        // snapshot, agent events and all. The outline has to be rebuilt from
-        // those bytes — nothing else carries it across a client restart.
-        let mut snapshot = b"older output\r\n".to_vec();
-        snapshot.extend_from_slice(&prompt_event("what did we decide"));
-        DaemonMsg::Snapshot(snapshot)
-            .encode(&mut daemon_side)
-            .unwrap();
-        daemon_side.flush().unwrap();
-
-        let turns = poll_turns(&term);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].row, Some(1));
-        assert_eq!(turns[0].text, "what did we decide");
     }
 
     #[test]

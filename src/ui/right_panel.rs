@@ -429,8 +429,14 @@ impl Tty7App {
                         .id("right-panel-titlebar-drag")
                         .flex_none()
                         .h(px(crate::ui::app::TITLE_BAR_HEIGHT))
+                        // `sidebar_border`, the lighter of the two hairline
+                        // tiers and the one the panel's own left edge is drawn
+                        // in. It rules the tiles off from the content below,
+                        // which on macOS starts directly under them: the title
+                        // row that carries this line on other platforms is not
+                        // drawn here.
                         .border_b_1()
-                        .border_color(cx.theme().transparent);
+                        .border_color(cx.theme().sidebar_border);
                     crate::ui::app::window_move_gesture(
                         row,
                         "right-panel-titlebar-drag",
@@ -444,12 +450,18 @@ impl Tty7App {
                     .relative()
                     .children(self.right_panel_tabs(cx))
                     .child(div().flex_1())
-                    .child(self.window_chrome(self.panel_chrome_hover.get(), window, cx))
-                    .child(crate::ui::app::hover_sheet(
-                        "panel-chrome-hover",
-                        &self.panel_chrome_hover,
-                    ))
+                    // Always painted, unlike the sidebar's and the strip's:
+                    // the tab tiles beside them are already there whenever the
+                    // panel is open, so hiding just these two left a row that
+                    // grew two buttons on hover and read as a glitch.
+                    .child(self.window_chrome(true, window, cx))
                 }))
+                // Air under the rule, so the first row of content is not
+                // sitting on the line. On the other platforms the title row
+                // holds this line and its own text keeps that distance; here
+                // the tiles are in the window's title bar and the content
+                // would start against the hairline.
+                .children(cfg!(target_os = "macos").then(|| div().flex_none().h(px(8.))))
                 .child(body)
                 .children(self.sftp_transfers_footer(cx))
                 .child(handle)
@@ -627,6 +639,12 @@ impl Tty7App {
                 this.child(
                     h_flex()
                         .flex_shrink_0()
+                        // Full height, so the current tile's underline — pinned
+                        // to the bottom of its own box — lands on the rule that
+                        // closes this row, the way it does on macOS. Without it
+                        // the tiles are only as tall as a glyph and the bar
+                        // floats a few pixels above the line.
+                        .h_full()
                         .items_center()
                         .gap(px(2.))
                         .when(has_trailing, |this| this.ml(px(6.)))
@@ -723,9 +741,6 @@ impl Tty7App {
         // off in both places rather than in one of them.
         let mut diff_target: Option<(crate::ui::host_ops::HostId, PathBuf)> = None;
         let mut git: Option<crate::terminal::git_status::GitStatus> = None;
-        // The leaf the CONVERSATION section reads its turns off — the same one
-        // every row above describes.
-        let mut detail_pane = None;
 
         if let Some(tab) = self.tabs.get(self.active) {
             if let Some(leaf) = tab.detail_pane(window, cx) {
@@ -767,7 +782,6 @@ impl Tty7App {
                     rows.push(InfoRow::text(t(L10nKey::PanelSsh), ssh.host.clone()).copyable());
                 }
                 git = view.git_status(cx);
-                detail_pane = Some(leaf);
             }
             // Read off the same pane the rows above describe, rather than off
             // `Tab::git_status`, which resolves a split tab to its *first* leaf
@@ -817,7 +831,6 @@ impl Tty7App {
         let inner = v_flex()
             .child(self.panel_subtitle(t(L10nKey::PanelSessionSubtitle), false, None, cx))
             .child(list)
-            .children(self.turns_section(detail_pane.as_ref(), cx))
             .children(self.procs_section(pane_id, cx))
             .children(self.ports_section(ctx.as_ref(), cx))
             .into_any_element();
@@ -1071,118 +1084,6 @@ impl Tty7App {
             )
             .when_some(trailing, |this, t| this.child(t))
             .into_any_element()
-    }
-
-    /// The agent's conversation, one row per turn, each a way back to where
-    /// that turn started in the scrollback — when there is one to go back to.
-    ///
-    /// It sits under the session facts rather than in a tab of its own: this is
-    /// something *this pane* is, like its shell and its cwd, and the tab strip
-    /// has no room for a fourth tile at 260px.
-    fn turns_section(
-        &self,
-        leaf: Option<&gpui::Entity<crate::terminal::view::TerminalView>>,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let leaf = leaf?;
-        let turns = leaf.read(cx).agent_turns();
-        // A turn the hook announced but could not name is a row with nothing on
-        // it. The status dot already says a turn is running.
-        let turns: Vec<_> = turns
-            .into_iter()
-            .filter(|t| !t.text.trim().is_empty())
-            .collect();
-        if turns.is_empty() {
-            return None;
-        }
-        // A full-screen program owns the whole drawing surface, so there is no
-        // scrollback under it to land in — while one is up every jump is a
-        // no-op, whatever anchor the turn is carrying. An agent that renders
-        // that way (Claude Code's `/tui fullscreen`, Codex) puts every row in
-        // this section here.
-        let alt_now = leaf.read(cx).on_alt_screen();
-        let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
-        let count = turns.len().to_string();
-        let mut list = v_flex().px(px(CONTENT_INSET - 4.)).py(px(1.)).gap(px(1.));
-        for turn in turns {
-            let id = turn.id;
-            let jumpable = turn_is_jumpable(turn.row, alt_now);
-            let dot = {
-                let d = div().flex_none().size(px(7.)).rounded_full();
-                if turn.done {
-                    d.border_1()
-                        .border_color(cx.theme().muted_foreground.opacity(0.55))
-                } else {
-                    d.bg(cx.theme().muted_foreground)
-                }
-            };
-            list = list.child(
-                h_flex()
-                    .id(gpui::SharedString::from(format!("panel-turn-{id}")))
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(4.))
-                    .py(px(3.))
-                    .rounded(px(5.))
-                    .when(jumpable, |this| {
-                        let leaf = leaf.clone();
-                        let turn = turn.clone();
-                        this.cursor_pointer()
-                            .hover(|s| s.bg(gpui::rgb(sf.hover)))
-                            .on_click(cx.listener(move |_this, _, _window, cx| {
-                                leaf.update(cx, |view, cx| {
-                                    view.scroll_to_agent_turn(&turn, cx);
-                                });
-                            }))
-                    })
-                    // A row that goes nowhere says why on hover. Muted text is
-                    // the whole of what it says otherwise, and grey reads as
-                    // "less important" long before it reads as "not a link".
-                    .when(!jumpable, |this| {
-                        let tip = t(match alt_now {
-                            true => L10nKey::PanelTurnAltScreenNow,
-                            false => L10nKey::PanelTurnNoScrollback,
-                        });
-                        this.tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(tip).build(window, cx)
-                        })
-                    })
-                    .child(dot)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(rems(TEXT))
-                            .text_color(if jumpable {
-                                cx.theme().foreground
-                            } else {
-                                cx.theme().muted_foreground
-                            })
-                            .child(turn.text),
-                    ),
-            );
-        }
-        Some(
-            v_flex()
-                .child(
-                    self.panel_subtitle(
-                        t(L10nKey::PanelConversationSubtitle),
-                        true,
-                        Some(
-                            div()
-                                .text_size(rems(META_MONO))
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_color(cx.theme().muted_foreground.opacity(0.75))
-                                .child(count)
-                                .into_any_element(),
-                        ),
-                        cx,
-                    ),
-                )
-                .child(list)
-                .into_any_element(),
-        )
     }
 
     fn procs_section(&self, pane_id: Option<u64>, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1897,19 +1798,9 @@ fn compact_path(path: &std::path::Path, home: Option<&std::path::Path>) -> Strin
     crate::ui::path_display::abbreviate_home(&path.to_string_lossy(), home).into_owned()
 }
 
-/// Whether a turn's row is a link back into the scrollback, or only a label.
-///
-/// Both halves have to hold, and they are the same two conditions
-/// [`TerminalView::scroll_to_agent_turn`](crate::terminal::view::TerminalView)
-/// refuses on — deliberately, because a row that draws as a link and then does
-/// nothing is worse than one that never offered. Keep the two in step.
-fn turn_is_jumpable(row: Option<i64>, alt_now: bool) -> bool {
-    row.is_some() && !alt_now
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{InfoRow, InfoValue, forwards_port, turn_is_jumpable};
+    use super::{InfoRow, InfoValue, forwards_port};
     use crate::daemon::protocol::{ForwardStatus, ManagedForward, SshForwardKind};
 
     fn forward(kind: SshForwardKind, target_host: &str, target_port: u16) -> ManagedForward {
@@ -1993,25 +1884,6 @@ mod tests {
             }
             .interactive(),
             "so is Reveal, even with nothing else on the row"
-        );
-    }
-
-    #[test]
-    fn a_turn_offers_the_jump_only_where_the_jump_would_land() {
-        assert!(
-            turn_is_jumpable(Some(42), false),
-            "a turn anchored in the scrollback of a pane on the normal screen"
-        );
-        assert!(
-            !turn_is_jumpable(None, false),
-            "a turn that began on the alt screen was never written down"
-        );
-        // The one this pair exists for: the anchor survives the switch into a
-        // full-screen renderer, and the row it points at does not. Before, the
-        // row kept its pointer and its hover fill and swallowed every click.
-        assert!(
-            !turn_is_jumpable(Some(42), true),
-            "and an anchor is no use while a full-screen program owns the pane"
         );
     }
 
