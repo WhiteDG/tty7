@@ -59,6 +59,10 @@ struct FakeRemote {
     /// a login shell that could not read the script, which is the shape the
     /// no-`/proc` bug took on every Mac.
     stop_fails: bool,
+    /// SFTP metadata reads — the realpath behind `home_dir` and every `stat`.
+    /// The journal carries commands and writes; these are the other half of
+    /// what a probe spends on the wire, and #695 is a count of both.
+    sftp_reads: Mutex<usize>,
 }
 
 impl FakeRemote {
@@ -87,6 +91,7 @@ impl FakeRemote {
             speaks: Mutex::new(HashMap::new()),
             installed_speaks: Some(ours()),
             stop_fails: false,
+            sftp_reads: Mutex::new(0),
         }
     }
 
@@ -183,10 +188,28 @@ impl FakeRemote {
             .filter(|j| !matches!(j, Journal::Exec(_)))
             .collect()
     }
+
+    /// The commands this remote was asked to run, in order.
+    fn execs(&self) -> Vec<String> {
+        self.journal()
+            .into_iter()
+            .filter_map(|j| match j {
+                Journal::Exec(cmd) => Some(cmd),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Everything that would have crossed the wire: commands, SFTP metadata
+    /// reads, and the writes an install makes.
+    fn round_trips(&self) -> usize {
+        self.journal().len() + *self.sftp_reads.lock().unwrap()
+    }
 }
 
 impl RemoteOps for FakeRemote {
     fn home_dir(&self) -> Result<String, String> {
+        *self.sftp_reads.lock().unwrap() += 1;
         Ok(HOME.to_string())
     }
 
@@ -290,6 +313,7 @@ impl RemoteOps for FakeRemote {
     }
 
     fn stat(&self, path: &str) -> Result<Option<RemoteStat>, String> {
+        *self.sftp_reads.lock().unwrap() += 1;
         Ok(self.file(path).map(|f| RemoteStat {
             size: f.bytes.len() as u64,
             mode: f.mode,
@@ -2255,4 +2279,246 @@ fn replacing_overwrites_a_published_binary_that_does_not_serve_us() {
         remote.writes()
     );
     assert!(!release.fetched().is_empty(), "which means downloading it");
+}
+
+/// The probe every pane used to pay for, and the note that spares the second
+/// one — issue #695. See [`ProvedServer`].
+mod proving_the_server_once_per_connection {
+    use super::*;
+
+    /// A warm machine: this build's server is installed and already serving.
+    /// Every pane after the first on a connection to it finds exactly this.
+    fn warm() -> FakeRemote {
+        FakeRemote::new().with_previous_install().serving(BINARY)
+    }
+
+    fn prove(remote: &FakeRemote, user: &FakeUser, host: &str) -> io::Result<ProvedServer> {
+        let release = FakeRelease::new();
+        Ok(ProvedServer::from_report(
+            installer(remote, &release, user, host).run()?,
+        ))
+    }
+
+    /// The measurement the issue asks for, from the fake's own books: what the
+    /// first pane on a connection spends, and what the second one spends after
+    /// it. The chain is asserted by name rather than by count so that a probe
+    /// growing a step is a failure here and not a slow tab somewhere.
+    #[test]
+    fn the_second_pane_on_a_connection_spends_nothing() {
+        let remote = warm();
+        let user = FakeUser::approving();
+        let mut slot = None;
+
+        let first = proved_or_prove(&mut slot, || prove(&remote, &user, "me@warm-box:22"))
+            .expect("the server is there and serving");
+        assert_eq!(first, BINARY);
+        assert_eq!(
+            remote.execs(),
+            vec![
+                "uname -sm".to_string(),
+                format!("{} --stdio --bridge < /dev/null", shell_quote(BINARY)),
+                RUNNING_EXE_COMMAND.to_string(),
+            ],
+            "the probe: what to install, is a daemon answering, and what build is serving"
+        );
+        assert_eq!(
+            remote.round_trips(),
+            5,
+            "three commands and two SFTP reads — the realpath for $HOME and the stat"
+        );
+
+        let paid = remote.round_trips();
+        let second = proved_or_prove(&mut slot, || {
+            panic!("the second pane must not probe again");
+        })
+        .expect("the note answers");
+        assert_eq!(second, BINARY);
+        assert_eq!(
+            remote.round_trips(),
+            paid,
+            "the second pane pays nothing for what the first one proved"
+        );
+    }
+
+    /// A transient failure must not pin every later pane on the connection into
+    /// the same failure. Nothing is written to the note unless the probe got
+    /// all the way through, so the next pane goes and asks again.
+    #[test]
+    fn a_probe_that_failed_is_not_remembered() {
+        let remote = FakeRemote::new();
+        let user = FakeUser::declining();
+        let mut slot = None;
+
+        let refused = proved_or_prove(&mut slot, || prove(&remote, &user, "me@shy-box:22"))
+            .expect_err("the user said no");
+        assert!(
+            format!("{refused}").contains("was not confirmed"),
+            "the refusal is the install prompt's, not something else: {refused}"
+        );
+        assert_eq!(slot, None, "a failure leaves the slot exactly as it was");
+        assert_eq!(user.asked().len(), 1);
+
+        let _ = proved_or_prove(&mut slot, || prove(&remote, &user, "me@shy-box:22"));
+        assert_eq!(
+            user.asked().len(),
+            2,
+            "the pane after a refusal asks again rather than inheriting the refusal"
+        );
+    }
+
+    /// The one thing memoizing could quietly cancel: the version check. The
+    /// probe is what notices that a different build is serving the machine, and
+    /// the note has to keep filing that warning for the panes that never run
+    /// the probe — each route drains its own sink, so a warning filed only once
+    /// would reach only the first pane's client.
+    #[test]
+    fn a_remembered_mismatch_is_filed_again_for_every_pane() {
+        let (remote, legacy) = FakeRemote::new().with_legacy_install("26.7.4");
+        let remote = remote.serving(&legacy).speaking(
+            &legacy,
+            RemoteProtocol {
+                control: CONTROL - 1,
+                protocol: PROTOCOL,
+                build: "26.7.4".to_string(),
+            },
+        );
+        let user = FakeUser::approving();
+        let mut slot = None;
+
+        let first_route: Arc<Mutex<Vec<MismatchedRemoteDaemon>>> = Arc::new(Mutex::new(Vec::new()));
+        with_mismatch_sink(first_route.clone(), || {
+            proved_or_prove(&mut slot, || prove(&remote, &user, "me@old-box:22"))
+                .expect("an old daemon is kept, not a failure")
+        });
+        assert_eq!(
+            first_route.lock().unwrap().len(),
+            1,
+            "the probe found the mismatch"
+        );
+
+        let spent = remote.round_trips();
+        let second_route: Arc<Mutex<Vec<MismatchedRemoteDaemon>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        with_mismatch_sink(second_route.clone(), || {
+            proved_or_prove(&mut slot, || panic!("the note answers this one")).expect("remembered")
+        });
+
+        let filed = second_route.lock().unwrap().clone();
+        assert_eq!(filed.len(), 1, "the second pane's client hears it too");
+        assert_eq!(filed[0].running_version.as_deref(), Some("26.7.4"));
+        assert_eq!(filed[0].wanted_version, VERSION);
+        assert_eq!(
+            remote.round_trips(),
+            spent,
+            "and hears it without a round trip"
+        );
+    }
+
+    /// The wiring, over a real SSH connection: `ensure_remote_server` reads the
+    /// note off the connection it was handed, and `forget_remote_server` takes
+    /// it away again. The fake sshd counts session channels, so "no round trip"
+    /// is measured here rather than argued.
+    #[tokio::test]
+    async fn a_proved_connection_answers_the_next_pane_off_the_wire() {
+        use crate::daemon::ssh::test_support::{Exec, FakeSshd};
+
+        let sshd = FakeSshd::connect(Exec::Exits, None).await;
+        assert_eq!(
+            sshd.conn.remembered_server(),
+            None,
+            "a new link knows nothing"
+        );
+
+        *sshd.conn.proved_server() = Some(ProvedServer {
+            binary: BINARY.to_string(),
+            mismatch: None,
+        });
+        assert_eq!(
+            ensure_remote_server(&sshd.conn).expect("the note answers"),
+            BINARY
+        );
+        assert_eq!(
+            sshd.opened(),
+            0,
+            "a proved connection opens no channel for the next pane"
+        );
+        assert_eq!(sshd.conn.remembered_server().as_deref(), Some(BINARY));
+
+        // What `replace_remote_server`, `restart_remote_daemon` and a routed
+        // link that closed without answering all do before they act.
+        forget_remote_server(&sshd.conn);
+        assert_eq!(
+            sshd.conn.remembered_server(),
+            None,
+            "the next pane proves it again the long way"
+        );
+    }
+
+    /// What `restart_remote_daemon` and `replace_remote_server` do to the note:
+    /// drop it before they start, so that one which fails halfway leaves the
+    /// next pane looking instead of trusting a note written before the upheaval.
+    #[tokio::test]
+    async fn a_change_that_failed_halfway_leaves_no_note() {
+        use crate::daemon::ssh::test_support::{Exec, FakeSshd};
+
+        let sshd = FakeSshd::connect(Exec::Exits, None).await;
+        *sshd.conn.proved_server() = Some(ProvedServer {
+            binary: BINARY.to_string(),
+            mismatch: None,
+        });
+
+        let failed = while_changing_the_server(&sshd.conn, || {
+            Err(io::Error::other("the daemon would not stop"))
+        })
+        .expect_err("the change failed");
+        assert!(format!("{failed}").contains("would not stop"));
+        assert_eq!(
+            sshd.conn.remembered_server(),
+            None,
+            "the note went first, so the next pane proves it again"
+        );
+    }
+
+    /// And they hold the lock while they run: a pane that arrives in the middle
+    /// of a replace waits for it rather than proving a binary the replace is in
+    /// the middle of moving — and then keeping that answer for the life of the
+    /// connection.
+    #[tokio::test]
+    async fn a_pane_arriving_mid_change_waits_for_it() {
+        use crate::daemon::ssh::test_support::{Exec, FakeSshd};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sshd = FakeSshd::connect(Exec::Exits, None).await;
+        let proved = Arc::new(AtomicBool::new(false));
+        let mut pane = None;
+
+        while_changing_the_server(&sshd.conn, || {
+            let conn = sshd.conn.clone();
+            let raced = proved.clone();
+            pane = Some(std::thread::spawn(move || {
+                *conn.proved_server() = Some(ProvedServer {
+                    binary: "/home/me/.tty7/bin/proved-mid-change".to_string(),
+                    mismatch: None,
+                });
+                raced.store(true, Ordering::SeqCst);
+            }));
+            // Long enough for the other thread to reach the lock. It cannot
+            // pass it, so this can only fail if the lock is not being held.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !proved.load(Ordering::SeqCst),
+                "a pane must not write a note while the server is being changed"
+            );
+            Ok(())
+        })
+        .expect("the change itself succeeded");
+
+        pane.expect("the pane raced")
+            .join()
+            .expect("it got through");
+        assert!(
+            proved.load(Ordering::SeqCst),
+            "and it goes through as soon as the change is done"
+        );
+    }
 }

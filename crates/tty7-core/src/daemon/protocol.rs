@@ -464,10 +464,46 @@ impl PortEntry {
     }
 }
 
+/// Whether the answer in `PaneProcs::ports` can be believed.
+///
+/// An empty port list used to mean two very different things at once: nothing
+/// in this pane is listening, or the thing that looks for listeners never got
+/// to say. On unix that look is an `lsof` subprocess, and every way it can go
+/// wrong — absent from the daemon's `PATH`, killed, hung on a wedged mount,
+/// pointed at sockets it has no permission to read — arrived as the same empty
+/// vector as a genuinely quiet pane. Whoever reads the list gets to know which
+/// one it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum PortProbe {
+    /// The probe ran and the list is its whole answer.
+    #[default]
+    Ok,
+    /// The probe ran, but at least one process in this pane belongs to another
+    /// user — `sudo go run`, a root-owned server on a low port — and a probe
+    /// running as this user cannot see that process's sockets. The list holds
+    /// what could be seen, which may be nothing.
+    Restricted,
+    /// The probe could not be run at all. The string is for a log line or for
+    /// `tty7 procs`, not for the panel: it names the tool and what went wrong.
+    Unavailable(String),
+}
+
+impl PortProbe {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, PortProbe::Ok)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneProcs {
     pub procs: Vec<ProcEntry>,
     pub ports: Vec<PortEntry>,
+    /// `serde(default)` because a daemon from before this field existed
+    /// answers `QueryProcs` without it, and its silence is read the way that
+    /// daemon's callers read every answer it gives: as a complete one.
+    #[serde(default)]
+    pub probe: PortProbe,
     /// What the pane can say about itself that the process list cannot — see
     /// [`PaneContext`]. `None` from a daemon built before the field existed,
     /// which reads as "this daemon cannot say", never as a set of falses.
@@ -2230,6 +2266,35 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         let mut empty2 = std::io::Cursor::new(Vec::<u8>::new());
         assert!(ClientMsg::read(&mut empty2).is_err());
+    }
+
+    /// The port probe's verdict travels over the same wire as the ports, and
+    /// the two ends of that wire are regularly different builds: a remote
+    /// workspace's panes are answered for by whatever `tty7-server` is
+    /// installed on the peer. An older one says nothing about the probe, and
+    /// its silence has to read as "this list is the whole answer" rather than
+    /// failing the frame or, worse, arriving as a doubt the panel then shows.
+    #[test]
+    fn a_procs_answer_without_a_probe_verdict_is_a_complete_one() {
+        let old = r#"{"procs":[],"ports":[{"port":3000,"pid":7,"name":"node"}]}"#;
+        let procs: PaneProcs = serde_json::from_str(old).unwrap();
+        assert_eq!(procs.probe, PortProbe::Ok);
+        assert!(procs.probe.is_ok());
+        assert_eq!(procs.ports[0].addr, "");
+
+        for probe in [
+            PortProbe::Ok,
+            PortProbe::Restricted,
+            PortProbe::Unavailable("lsof: not found".into()),
+        ] {
+            let wire = serde_json::to_string(&PaneProcs {
+                probe: probe.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let back: PaneProcs = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back.probe, probe, "round trip through {wire}");
+        }
     }
 
     #[test]

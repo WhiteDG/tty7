@@ -1130,6 +1130,12 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::PanelProcessesSubtitle => "プロセス",
         L10nKey::PanelPortsSubtitle => "ポート",
         L10nKey::PanelPortsUnsupported => "リモートの tty7-server が古く、ポートを列挙できません。",
+        L10nKey::PanelPortsProbeFailed => {
+            "このペインが何をリッスンしているか確認できませんでした。"
+        }
+        L10nKey::PanelPortsRestricted => {
+            "他のユーザーで動いているプロセスがあり、そのポートは見えません。"
+        }
         L10nKey::PortAutoForwarded => "リモートの :{port} は http://localhost:{local} で開けます",
         L10nKey::PanelCwd => "作業ディレクトリ",
         L10nKey::PanelShell => "シェル",

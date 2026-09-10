@@ -326,9 +326,21 @@ resolve it immediately before use. A full tab UUID also works: `@<uuid>`.
 |---|---|---|
 | `tab ls [WORKSPACE]` | Tabs of a workspace | `{"workspace","tabs":[{"ordinal","id","name","label","agent","group","panes":[…]}]}` |
 | `tab new [WORKSPACE] [--cwd DIR]` | Add a tab with a fresh shell | `{"tab","pane"}` |
+| `tab new [WORKSPACE] --pane %PANE` | Add a tab around a pane already running | `{"tab","pane"}` |
 | `tab close @TAB` | Close the tab and every pane in it | `{"closed"}` |
 | `tab rename @TAB NAME` | Name or rename | `{"tab","name"}` |
 | `tab move @TAB INDEX` | Reposition within its workspace | `{"tab","to"}` |
+
+`--pane` re-homes instead of spawning: it builds the tab around a pane the
+server is already running, which is how an orphan gets back on screen. Only a
+pane no tab holds is accepted — use `pane split` to add to a tab that exists.
+With no `WORKSPACE` and no `TTY7_WS`, the pane goes back to the workspace it was
+spawned for, which is the `owner` that `pane ls --all` prints. The seed is
+rebuilt from the pane registry, so the tab gets the pane's recorded cwd (unless
+`--cwd` overrides it) but not the shell or SSH spec the pane started with: the
+tree drops a pane's record when the tab holding it closes, and the registry is
+what is left. That only matters if the shell later dies, since a restore would
+then have nothing to restore from.
 
 `GROUP` is the heading the GUI's sidebar files the tab under, shown by its last
 segment. Read-only from here: with the default repo grouping the GUI recomputes
@@ -354,6 +366,11 @@ a stand-in.
 of the workspace that may attach to the pane (absent when none may), and
 `orphan: true` means no workspace holds it. An interrupted `run` leaves orphans
 here, as does a `ws rm` that reported panes it could not hang up.
+
+An orphan is not necessarily rubbish — its shell may still be doing real work —
+so there are two ways out of the list. `tab new --pane %<id>` puts one back into
+a tab, which is the recovery path when the panes came out from under a workspace
+rather than out of an interrupted `run`. `pane close` is the other.
 
 `--orphans` is the reaper for exactly those. It closes what `pane ls --all`
 lists as orphaned and nothing else — panes a workspace holds are untouched —
