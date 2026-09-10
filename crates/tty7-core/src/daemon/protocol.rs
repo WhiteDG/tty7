@@ -504,6 +504,46 @@ pub struct PaneProcs {
     /// daemon's callers read every answer it gives: as a complete one.
     #[serde(default)]
     pub probe: PortProbe,
+    /// What the pane can say about itself that the process list cannot — see
+    /// [`PaneContext`]. `None` from a daemon built before the field existed,
+    /// which reads as "this daemon cannot say", never as a set of falses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<PaneContext>,
+}
+
+/// Where a pane's session actually lives, and what its shell says about itself.
+///
+/// The process list beside it is always *this* machine's: it starts at the
+/// pty's own child and walks down. For a pane that is only the near end of a
+/// connection — an `ssh` the shell is running, a native-SSH pane whose pty is
+/// on another host — that list describes the tunnel, not the work. This is the
+/// part of the answer that can still speak for the far side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneContext {
+    /// The host the pane is pointed at, when it is not this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteContext>,
+    /// Whether this machine holds the pane's pty at all. `false` for a
+    /// native-SSH pane, whose `procs` is empty because there is nothing here
+    /// to walk — not because the walk failed.
+    pub local_pty: bool,
+    /// What the pane's shell integration last said, `None` until it emits its
+    /// first OSC 133 mark.
+    ///
+    /// This is the mark's own reading, taken before the suppression that keeps
+    /// a foreground program's prompt marks from engaging the local line editor.
+    /// That suppression is right for the editor and wrong here: on a pane
+    /// running `ssh` the marks are the *far* shell's, and they are the only
+    /// thing on this side that knows whether the far shell is busy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_prompt: Option<bool>,
+    /// Whether a prompt mark has arrived while the pane was pointed at
+    /// `remote`. Only the far shell can be at a prompt while the near one is
+    /// occupied by the connection, so this is the proof that the far side's
+    /// shell integration is loaded and reporting. Without it, "not at a
+    /// prompt" on a remote pane means nothing: the newest mark is then the
+    /// near shell's own "I started `ssh`", and it will never be replaced.
+    pub remote_prompt_seen: bool,
 }
 
 fn default_term() -> String {

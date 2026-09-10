@@ -88,6 +88,9 @@ fn finish(mut procs: Vec<ProcEntry>, ports: Vec<PortEntry>, probe: PortProbe) ->
         procs,
         ports,
         probe,
+        // The caller fills `context`: only the pane knows where its session
+        // lives, and this module only ever walks *this* machine's table.
+        context: None,
     }
 }
 

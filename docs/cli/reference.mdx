@@ -180,9 +180,17 @@ The process tree inside the pane, indented by depth, `*` on the foreground
 process — then a second table of ports those processes are listening on. Prints
 `nothing running in this pane` when both are empty.
 
-JSON: `{"procs":[{"pid","name","depth","foreground"}],"ports":[{"port","pid","name","addr"}]}` —
+JSON: `{"procs":[{"pid","name","depth","foreground"}],"ports":[{"port","pid","name","addr"}],"context":{...}}` —
 `addr` is the address the socket is bound to (`*`, `0.0.0.0`, `127.0.0.1`,
 `[::1]`, or a specific interface).
+
+`context` says how much of the pane the process list actually covers:
+`{"remote","local_pty","at_prompt","remote_prompt_seen"}`. The tree is always
+*this* machine's, so on a pane that is the near end of a connection it lists the
+tunnel rather than the work — `local_pty` is `false` for a pane routed to a
+remote daemon (nothing here to walk), and `remote` names the host otherwise.
+`at_prompt` is the pane's own shell integration talking, absent until it emits
+its first mark. Older servers omit `context` entirely.
 
 ### `tty7 agents`
 
@@ -210,8 +218,9 @@ by its [hooks](/agents/status); the last three are facts about the pane:
 |---|---|
 | `idle` `working` `waiting` `done` | The agent's status |
 | `no-agent` | Nothing is reporting status here — a plain shell, or an agent whose hooks are not installed |
-| `free` | The foreground command has exited; the pane is back to its bare shell |
+| `free` | Nothing is running in front of the pane's shell — it will take input now |
 | `exit` | The pane itself is gone. Ends every wait whether it was asked for or not |
+| `unknown` | Only ever reported, never awaited: freeness could not be determined at all. See below |
 
 `free` is how you wait for a **command** rather than an agent, and it is the
 one state that costs a second request per poll — so it is only checked when you
@@ -220,13 +229,32 @@ With `--changed` it means "something ran and then finished", which is what you
 want directly after a `send`; a command quick enough to finish inside one
 `--interval` is never seen running, and the timeout says so.
 
+Two things answer it. On a pane whose shell is on this machine it is the process
+tree: nothing deeper than the shell means free. On a **remote or SSH pane** that
+tree describes the near end of the connection — the `ssh` itself, busy for as
+long as you are logged in, or nothing at all for a pane routed to a remote
+daemon — so there it is the far shell's own
+[prompt marks](/reference/shell-integration) that decide. A prompt mark on such a
+pane can only have come from the far side, because the near shell cannot be at a
+prompt while the connection holds its pty. Marks outrank a deeper process on a
+local pane too, which is why `free` means "will take input" rather than strictly
+"back to the bare shell": a pane sitting at a nested shell's prompt is free.
+
+When the far host has no shell integration loaded there is nothing on this side
+that can tell an idle remote prompt from a running remote command. `wait` says
+so — `status: unknown`, exit `1`, and a `free_unknown` string naming the host —
+rather than polling to the end of `--timeout`. It gives one poll of grace first,
+for a handshake still in flight, and it only gives up when `free` was the only
+state that could still answer: `--until done,free` keeps waiting on `done`.
+
 The reply carries the agent's message and native session id. The JSON's `stale`
 flag says whether the answer might belong to the previous turn.
 
 JSON: `{"pane","status","matched","stale","activity","message","session_id"}`.
 A timeout exits `124` with the same object plus `"timed_out": true` —
 `matched` is `false` there, and `stale` still says whether the pane moved
-while you watched.
+while you watched, and `free_unknown` carries the reason when `free` was asked
+for and never resolved.
 [Orchestration →](/agents/orchestration)
 
 ### `tty7 events`

@@ -582,6 +582,7 @@ mod tests {
                 name: "node".into(),
             }],
             probe: PortProbe::Ok,
+            context: None,
         };
         let rendered = procs_tables(&procs);
         assert!(
@@ -613,6 +614,7 @@ mod tests {
             }],
             ports: Vec::new(),
             probe: PortProbe::Unavailable("lsof: program not found".into()),
+            context: None,
         };
         let rendered = procs_tables(&procs);
         assert!(

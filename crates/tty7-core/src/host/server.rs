@@ -1712,6 +1712,7 @@ mod aggregate_tests {
                     addr: "*".into(),
                 }],
                 probe: Default::default(),
+                context: None,
             }
         }
 

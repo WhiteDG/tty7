@@ -83,6 +83,10 @@ fn main() {
             "capture_tail_trims_a_real_panes_answer",
             capture_tail_trims_a_real_panes_answer,
         ),
+        (
+            "procs_says_where_the_panes_session_lives",
+            procs_says_where_the_panes_session_lives,
+        ),
     ];
 
     let mut failed = 0;
@@ -224,6 +228,14 @@ impl Daemon {
             .env(DAEMON_ENV, "1")
             .env("TTY7_CONFIG_DIR", dir.path())
             .env("TTY7_DATA_DIR", dir.path())
+            // The shell integration's re-entrancy guard. A test run started
+            // from inside a tty7 pane would otherwise hand it to every pane
+            // this daemon spawns, and each of them would skip its own setup —
+            // no prompt marks anywhere, and any assertion about them green for
+            // the wrong reason. The injection blanks it per pane too; this is
+            // the belt to that's braces, and it also covers the panes the
+            // injection declines to touch.
+            .env_remove("TTY7_SHELL_INTEGRATION")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -404,6 +416,31 @@ fn new_builds_a_workspace_with_a_live_pane(daemon: &Daemon) {
 
     let panes = daemon.run_ok(&["pane", "ls"]);
     assert!(panes.contains(&format!("%{pane}")), "{panes}");
+}
+
+/// `wait --until free` reads freeness off this object, and its whole point is
+/// that a process list alone cannot say whether it covers the pane. A real
+/// daemon, a real pty: the context has to come back filled, and say this
+/// machine holds the pane (#840).
+fn procs_says_where_the_panes_session_lives(daemon: &Daemon) {
+    let created = daemon.run_json(&["new", &workdir()]);
+    let pane = created["pane"].as_u64().expect("new prints the pane id");
+
+    let procs = daemon.run_json(&["procs", &format!("%{pane}")]);
+    let context = &procs["context"];
+    assert!(
+        context.is_object(),
+        "a current server always answers with a context: {procs}"
+    );
+    assert_eq!(
+        context["local_pty"].as_bool(),
+        Some(true),
+        "a pane this daemon spawned itself is backed by a pty here: {procs}"
+    );
+    assert!(
+        context.get("remote").is_none(),
+        "and it is not the near end of anything: {procs}"
+    );
 }
 
 fn tab_close_terminates_every_pane_in_the_tab(daemon: &Daemon) {
