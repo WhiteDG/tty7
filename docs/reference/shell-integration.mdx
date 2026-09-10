@@ -90,8 +90,9 @@ To get integration into that shell, make it the shell tty7 starts:
   does *not* — those lines are typed into the session after the shell is
   already up, so they nest like anything else. Neither does `exec zsh` from
   your `.bashrc`: it replaces the process tty7 set up.
-- **A local pane.** Set `shell` in [config](/reference/configuration), and
-  leave `args` out — arguments you write turn the injection off.
+- **A local pane.** Set **Settings → Terminal → Shell → Program** (or `shell`
+  in [config](/reference/configuration)), and leave **Arguments** empty —
+  arguments you write turn the injection off.
 
 [If the Files panel stopped following a nested shell →](/reference/troubleshooting#the-directory-stopped-following-my-shell)
 
