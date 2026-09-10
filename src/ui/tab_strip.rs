@@ -1008,9 +1008,20 @@ impl Tty7App {
                     .custom(chrome_tile_variant(cx))
                     .child(
                         h_flex()
+                            .id("rail-workspace-head-ink")
                             .w_full()
+                            .h_full()
                             .items_center()
                             .gap(px(6.))
+                            // The tile's own hover is a fill the palette keeps
+                            // a hair off the surface, which on the rail is
+                            // barely a change at all — and the name and the
+                            // chevron pinned their own ink, so the pointer
+                            // landing on the one control at the top of the
+                            // column said nothing. Answer the way a group
+                            // header does: the ink steps up to full strength.
+                            .text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.text_color(cx.theme().foreground))
                             .child(
                                 div()
                                     .flex()
@@ -1022,7 +1033,6 @@ impl Tty7App {
                                     .bg(cx.theme().secondary)
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(cx.theme().muted_foreground)
                                     .child(monogram),
                             )
                             .child(
@@ -1037,7 +1047,6 @@ impl Tty7App {
                                     .truncate()
                                     .text_size(px(12.5))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(cx.theme().muted_foreground)
                                     .child(SharedString::from(current.clone())),
                             )
                             .child(
@@ -1046,8 +1055,7 @@ impl Tty7App {
                                 Icon::empty()
                                     .path("icons/chevrons-up-down.svg")
                                     .size(px(11.))
-                                    .flex_shrink_0()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .flex_shrink_0(),
                             ),
                     )
                     .xsmall()
