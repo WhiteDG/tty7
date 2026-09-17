@@ -2965,7 +2965,10 @@ impl TerminalView {
     }
 
     pub(super) fn key_flags(&self) -> super::input::KeyFlags {
-        super::input::KeyFlags::from_mode(self.terminal.term.lock().mode())
+        super::input::KeyFlags::from_mode_with_local_conpty(
+            self.terminal.term.lock().mode(),
+            self.terminal.is_local_conpty(),
+        )
     }
 
     fn tab_bytes(&self, shift: bool) -> Vec<u8> {
@@ -4497,7 +4500,7 @@ impl TerminalView {
         {
             cx.propagate();
         } else {
-            self.send_shortcut_bytes(b"\n", "enter", cx);
+            self.send_shortcut_bytes(self.key_flags().legacy_newline_bytes(), "enter", cx);
         }
     }
 
@@ -9894,9 +9897,22 @@ mod gpui_tests {
     use super::*;
     use crate::daemon::protocol::{ClientMsg, DaemonMsg};
     use crate::daemon::transport::Stream;
+    use crate::terminal::remote::PtySource;
     use gpui::{Entity, TestAppContext, point};
 
     fn harness(cx: &mut TestAppContext) -> (gpui::WindowHandle<TerminalView>, Stream) {
+        let pty = if cfg!(windows) {
+            PtySource::LocalConpty
+        } else {
+            PtySource::Raw
+        };
+        harness_on(cx, pty)
+    }
+
+    fn harness_on(
+        cx: &mut TestAppContext,
+        pty: PtySource,
+    ) -> (gpui::WindowHandle<TerminalView>, Stream) {
         // Building a view reads the config. Whether that hit the real user
         // directory used to come down to which test happened to pin the
         // scratch dir first.
@@ -9908,8 +9924,13 @@ mod gpui_tests {
             cx.set_global(Config::default());
         });
         let window = cx.add_window(|window, cx| {
-            let terminal = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24))
-                .expect("socketpair-backed terminal");
+            let terminal = RemoteTerminal::from_stream_with(
+                client_side,
+                TermSize::new(80, 24),
+                Vec::new(),
+                pty,
+            )
+            .expect("socketpair-backed terminal");
             TerminalView::with_terminal(terminal, 1, window, cx)
         });
         (window, daemon_side)
@@ -12516,7 +12537,7 @@ mod gpui_tests {
     #[gpui::test]
     fn shift_enter_reaches_a_foreground_tui_with_kitty_encoding(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, mut daemon) = harness_on(cx, PtySource::LocalConpty);
         cx.update(|cx| crate::ui::keymap::init(cx));
         DaemonMsg::Output(b"\x1b[>1u".to_vec())
             .encode(&mut daemon)
@@ -12546,12 +12567,18 @@ mod gpui_tests {
             next_input_until_timeout(&mut daemon),
             Some(b"\x1b[13;2u".to_vec())
         );
+
+        vcx.simulate_keystrokes("ctrl-j");
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"\x1b[106;5u".to_vec())
+        );
     }
 
     #[gpui::test]
     fn shift_enter_reaches_a_foreground_tui_as_lf_without_kitty(cx: &mut TestAppContext) {
         crate::core::config::pin_test_config_dir();
-        let (window, mut daemon) = harness(cx);
+        let (window, mut daemon) = harness_on(cx, PtySource::Raw);
         cx.update(|cx| crate::ui::keymap::init(cx));
         window
             .update(cx, |view, window, cx| {
@@ -12565,6 +12592,32 @@ mod gpui_tests {
         vcx.simulate_keystrokes("shift-enter");
 
         assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\n".to_vec()));
+
+        vcx.simulate_keystrokes("ctrl-j");
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\n".to_vec()));
+    }
+
+    #[gpui::test]
+    fn newline_chords_reach_conpty_as_ctrl_j_without_kitty(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness_on(cx, PtySource::LocalConpty);
+        cx.update(|cx| crate::ui::keymap::init(cx));
+        window
+            .update(cx, |view, window, cx| {
+                assert!(!view.input_active());
+                window.activate_window();
+                view.focus_handle.focus(window, cx);
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        for chord in ["shift-enter", "ctrl-j"] {
+            vcx.simulate_keystrokes(chord);
+            assert_eq!(
+                next_input_until_timeout(&mut daemon),
+                Some(b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_".to_vec()),
+                "{chord} must preserve Ctrl+J for native console readers"
+            );
+        }
     }
 
     #[gpui::test]

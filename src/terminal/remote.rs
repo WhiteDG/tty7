@@ -110,7 +110,7 @@ struct ReaderSignals {
     /// the reader puts back the cursor a repaint parked. Decided per pane from
     /// its [`PtySource`], and shared rather than copied because the reader can
     /// learn better mid-stream — see the `RemoteContext` arm.
-    repair_cursor: Arc<AtomicBool>,
+    local_conpty: Arc<AtomicBool>,
 }
 
 /// What kind of pty is at the far end of a pane's link, which is what decides
@@ -145,20 +145,6 @@ impl PtySource {
             PaneRoute::Local | PaneRoute::Unroutable(_) if cfg!(windows) => PtySource::LocalConpty,
             _ => PtySource::Raw,
         }
-    }
-
-    /// Whether the cursor a repaint parked has to be put back — see
-    /// [`crate::terminal::parked_cursor`].
-    ///
-    /// Only conhost parks one. On a raw pty the application owns the cursor and
-    /// is free to end a repaint on the text it just wrote and then echo the
-    /// next keystroke straight after it, with no positioning of its own: vim
-    /// opens its command line that way, and putting the cursor back on the cell
-    /// the repaint hid it on drops the `wq!` typed next onto the row being
-    /// edited (#430, and #774 for the Windows client that reached a Linux host
-    /// and was repaired anyway).
-    fn repairs_parked_cursor(self) -> bool {
-        self == PtySource::LocalConpty
     }
 }
 
@@ -613,12 +599,12 @@ pub struct RemoteTerminal {
     /// flag under the term lock before every grid mutation, so once it is set
     /// the abandoned thread can only exit, never write.
     reader_quit: Arc<AtomicBool>,
-    /// Whether this pane's pty is a ConPTY, and so whether the reader repairs
+    /// Whether this pane's pty is a ConPTY, for input encoding and repairing
     /// the cursor a repaint parks. Held here so a relink hands the same answer
     /// to the reader it starts: a pane's pty does not change kind when the link
     /// to it is rebuilt, and the route a relink carries cannot tell a
     /// native-SSH pane from a local shell.
-    repair_cursor: Arc<AtomicBool>,
+    local_conpty: Arc<AtomicBool>,
 }
 
 /// The workspace id a spawn carries, so the pane's shell gets `$TTY7_WS` and a
@@ -944,7 +930,7 @@ impl RemoteTerminal {
                 // rebuilt from `route`: the pty on the far side is the same pty
                 // it was before the link dropped, and only this value still
                 // remembers what a `RemoteContext` taught the old reader.
-                repair_cursor: self.repair_cursor.clone(),
+                local_conpty: self.local_conpty.clone(),
             },
         );
         self.reader_thread = Some(reader);
@@ -1038,7 +1024,7 @@ impl RemoteTerminal {
         let clipboard_write_busy = Arc::new(AtomicBool::new(false));
 
         let reader_quit = Arc::new(AtomicBool::new(false));
-        let repair_cursor = Arc::new(AtomicBool::new(pty.repairs_parked_cursor()));
+        let local_conpty = Arc::new(AtomicBool::new(pty == PtySource::LocalConpty));
         let reader_thread = Self::spawn_reader(
             term.clone(),
             proxy.clone(),
@@ -1062,7 +1048,7 @@ impl RemoteTerminal {
                 images: images.clone(),
                 clipboard_writes: clipboard_writes.clone(),
                 clipboard_write_busy: clipboard_write_busy.clone(),
-                repair_cursor: repair_cursor.clone(),
+                local_conpty: local_conpty.clone(),
             },
         );
 
@@ -1102,7 +1088,7 @@ impl RemoteTerminal {
             proxy,
             reader_thread: Some(reader_thread),
             reader_quit,
-            repair_cursor,
+            local_conpty,
         })
     }
 
@@ -1173,7 +1159,7 @@ impl RemoteTerminal {
                     images,
                     clipboard_writes,
                     clipboard_write_busy,
-                    repair_cursor,
+                    local_conpty,
                 } = signals;
                 let mut awaiting_replay = awaiting_replay;
                 crate::core::threads::promote_to_user_interactive();
@@ -1240,7 +1226,7 @@ impl RemoteTerminal {
                                 // emulator to the cut, act on the state that
                                 // sequence left behind, carry on.
                                 let mut cuts: Vec<(usize, CursorCut)> = Vec::new();
-                                if repair_cursor.load(Ordering::Relaxed) {
+                                if local_conpty.load(Ordering::Relaxed) {
                                     cursor_scan.feed(&out_batch, |off, c| cuts.push((off, c)));
                                 }
                                 {
@@ -1561,7 +1547,7 @@ impl RemoteTerminal {
                                     .as_ref()
                                     .is_some_and(|c| c.kind == RemoteKind::NativeSsh)
                                 {
-                                    repair_cursor.store(false, Ordering::Relaxed);
+                                    local_conpty.store(false, Ordering::Relaxed);
                                 }
                                 if let Ok(mut guard) = remote.lock() {
                                     *guard = ctx;
@@ -1690,6 +1676,10 @@ impl RemoteTerminal {
 
     pub fn child_exited(&self) -> bool {
         self.child_exited.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn is_local_conpty(&self) -> bool {
+        self.local_conpty.load(Ordering::Relaxed)
     }
 
     /// Queues a keystroke — or a paste, or a mouse report — for the link.
@@ -4084,6 +4074,7 @@ mod parked_cursor_tests {
         let (client_side, daemon_side) = socket_pair();
         let term = RemoteTerminal::from_stream_with(client_side, size, Vec::new(), pty)
             .expect("a terminal over a socket pair");
+        assert_eq!(term.is_local_conpty(), pty == PtySource::LocalConpty);
         (term, daemon_side)
     }
 
@@ -4127,8 +4118,6 @@ mod parked_cursor_tests {
                 PtySource::Raw
             },
         );
-        assert!(PtySource::LocalConpty.repairs_parked_cursor());
-        assert!(!PtySource::Raw.repairs_parked_cursor());
     }
 
     #[test]
@@ -4280,6 +4269,7 @@ mod parked_cursor_tests {
             term.remote_context().is_some(),
             "the reader never applied the context"
         );
+        assert!(!term.is_local_conpty());
 
         DaemonMsg::Output(b"\x1b[6;4H".to_vec())
             .encode(&mut daemon_side)
